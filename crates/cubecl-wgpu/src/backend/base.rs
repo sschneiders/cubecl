@@ -374,17 +374,6 @@ fn refused(object: &str, entrypoint_name: &str, err: wgpu::Error) -> Compilation
     }
 }
 
-/// Request a device, panicking if device creation fails.
-#[allow(
-    dead_code,
-    reason = "Retain the infallible counterpart to try_request_device"
-)]
-pub async fn request_device(adapter: &Adapter) -> (Device, Queue) {
-    try_request_device(adapter)
-        .await
-        .expect("Unable to request wgpu device")
-}
-
 /// Request a device, returning device creation failures.
 pub async fn try_request_device(
     adapter: &Adapter,

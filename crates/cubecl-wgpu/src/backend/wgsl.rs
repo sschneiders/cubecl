@@ -31,17 +31,6 @@ pub fn bindings(
     (bindings, 0)
 }
 
-/// Request a WGSL device, panicking if device creation fails.
-#[allow(
-    dead_code,
-    reason = "Retain the infallible counterpart to try_request_device"
-)]
-pub async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
-    try_request_device(adapter)
-        .await
-        .expect("Unable to request WGSL device")
-}
-
 /// Request a WGSL device, returning device creation failures.
 pub async fn try_request_device(
     adapter: &wgpu::Adapter,
