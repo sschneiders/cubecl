@@ -481,6 +481,9 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
         stream.mem_manage.memory_cleanup(true);
+        // Cached bind groups retain the buffers they bind; an explicit
+        // cleanup should give that memory back.
+        stream.clear_cached_bind_groups();
     }
 
     fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId) {
