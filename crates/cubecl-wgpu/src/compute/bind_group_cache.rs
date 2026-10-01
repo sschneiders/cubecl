@@ -16,6 +16,11 @@ use crate::WgpuResource;
 /// case for inference and training loops - settle well below this.
 const DEFAULT_CAPACITY: usize = 1024;
 
+/// log2 of the number of direct-mapped fast slots (see [`BindGroupCache::fast`]).
+const FAST_SLOT_BITS: u32 = 8;
+/// Number of direct-mapped fast slots in front of the hash map.
+const FAST_SLOTS: usize = 1 << FAST_SLOT_BITS;
+
 /// Cache of [`BindGroup`]s keyed by full binding identity.
 ///
 /// Every kernel launch binds the same pipeline to a list of buffer slices,
@@ -33,6 +38,9 @@ const DEFAULT_CAPACITY: usize = 1024;
 /// and equal descriptors produce equal bind groups.
 #[derive(Debug)]
 pub(super) struct BindGroupCache {
+    /// Direct-mapped identity-verified slots in front of `entries`, so the
+    /// common replay case never builds or hashes a key at all.
+    fast: Vec<Option<FastEntry>>,
     entries: HashMap<BindGroupKey, CacheEntry>,
     /// Monotonic counter of lookups, used to approximate recency. A `u64`
     /// counter incremented once per launch cannot wrap in any realistic
@@ -49,6 +57,27 @@ pub(super) struct BindGroupCache {
 struct CacheEntry {
     group: BindGroup,
     last_used: u64,
+}
+
+/// The last binding set that hashed to one fast slot, with its bind group.
+///
+/// A slot lookup only accepts the entry after comparing object identity -
+/// `Arc::ptr_eq` on the pipeline, then each buffer by identity plus its
+/// offset and padded size (see [`BufferBindingKey`]). The entry owns strong
+/// references to everything it describes, so while it lives nothing it
+/// refers to can be freed, and wgpu never reuses a freed object's identity:
+/// a hit therefore binds exactly what `create_bind_group` would build from
+/// the same arguments. That verification-by-identity is what makes the fast
+/// path sound without any invalidation hook on buffer free - the price is a
+/// handful of integer compares, paid instead of cloning every buffer into a
+/// fresh key and hashing it.
+#[derive(Debug)]
+struct FastEntry {
+    /// The pipeline the group was created for; the slot is selected from its
+    /// address, and `Arc::ptr_eq` against it is the first verification step.
+    pipeline: Arc<ComputePipeline>,
+    bindings: SmallVec<[BufferBindingKey; 8]>,
+    group: BindGroup,
 }
 
 /// Everything that determines the bind group of a launch.
@@ -81,9 +110,37 @@ struct BufferBindingKey {
     size: Option<NonZeroU64>,
 }
 
+/// The key form of a launch's bindings.
+fn binding_keys(resources: &[WgpuResource]) -> SmallVec<[BufferBindingKey; 8]> {
+    resources
+        .iter()
+        .map(|resource| BufferBindingKey {
+            buffer: resource.buffer.clone(),
+            offset: resource.offset,
+            size: resource.binding_size(),
+        })
+        .collect()
+}
+
+impl FastEntry {
+    /// Whether `resources` is exactly the binding set this slot was created
+    /// from. Buffers compare by object identity (`wgpu` implements `Eq` on
+    /// its handle types that way), so this is a chain of integer compares -
+    /// no clones, no hashing.
+    fn matches(&self, resources: &[WgpuResource]) -> bool {
+        self.bindings.len() == resources.len()
+            && self.bindings.iter().zip(resources).all(|(key, resource)| {
+                key.buffer == resource.buffer
+                    && key.offset == resource.offset
+                    && key.size == resource.binding_size()
+            })
+    }
+}
+
 impl BindGroupCache {
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
+            fast: (0..FAST_SLOTS).map(|_| None).collect(),
             entries: HashMap::new(),
             tick: 0,
             capacity: capacity.max(1),
@@ -109,7 +166,20 @@ impl BindGroupCache {
     /// memory. Only needed when memory is at a premium - the entries rebuild
     /// on demand.
     pub(super) fn clear(&mut self) {
+        self.fast.clear();
+        self.fast.resize_with(FAST_SLOTS, || None);
         self.entries.clear();
+    }
+
+    /// Direct-mapped slot of a pipeline.
+    ///
+    /// The `Arc` allocation address is stable for the lifetime of the
+    /// pipeline and unique per pipeline object, so a multiply-shift hash of
+    /// it (Fibonacci hashing, spreading allocator-local address clusters)
+    /// distributes distinct pipelines over the slots.
+    fn slot_of(pipeline: &Arc<ComputePipeline>) -> usize {
+        let address = Arc::as_ptr(pipeline) as usize;
+        address.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - FAST_SLOT_BITS)
     }
 
     /// Return the bind group binding `resources` to `pipeline`, creating and
@@ -119,24 +189,28 @@ impl BindGroupCache {
         device: &wgpu::Device,
         pipeline: &Arc<ComputePipeline>,
         resources: &[WgpuResource],
-    ) -> BindGroup {
+    ) -> &BindGroup {
         self.tick = self.tick.wrapping_add(1);
+
+        // Fast path: one direct-mapped slot, verified by identity. A hit
+        // costs a few compares and no clones; a miss falls through to the
+        // hash map below, exactly as before.
+        let slot = Self::slot_of(pipeline);
+        if let Some(entry) = self.fast.get(slot).and_then(|entry| entry.as_ref())
+            && Arc::ptr_eq(&entry.pipeline, pipeline)
+            && entry.matches(resources)
+        {
+            return &entry.group;
+        }
 
         let key = BindGroupKey {
             pipeline: pipeline.clone(),
-            bindings: resources
-                .iter()
-                .map(|resource| BufferBindingKey {
-                    buffer: resource.buffer.clone(),
-                    offset: resource.offset,
-                    size: resource.binding_size(),
-                })
-                .collect(),
+            bindings: binding_keys(resources),
         };
 
         if let Some(entry) = self.entries.get_mut(&key) {
             entry.last_used = self.tick;
-            return entry.group.clone();
+            return &entry.group;
         }
 
         self.evict_if_full();
@@ -163,9 +237,16 @@ impl BindGroupCache {
                 last_used: self.tick,
             },
         );
+        // Mirror the fresh group into its fast slot; a colliding pipeline
+        // simply keeps using the hash map.
+        self.fast[slot] = Some(FastEntry {
+            pipeline: pipeline.clone(),
+            bindings: binding_keys(resources),
+            group,
+        });
         self.created += 1;
 
-        group
+        &self.fast[slot].as_ref().expect("just written").group
     }
 
     /// Make room for one new entry once the cache is at capacity.
