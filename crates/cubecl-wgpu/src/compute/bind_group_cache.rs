@@ -184,6 +184,17 @@ impl BindGroupCache {
 
     /// Return the bind group binding `resources` to `pipeline`, creating and
     /// caching it on the first request.
+    ///
+    /// Borrow structure (stable-borrowck safe, the 1.98 fleet nodes): the
+    /// returned reference keeps `self` borrowed for the caller, so this
+    /// function must end with EXACTLY ONE tail expression per source and no
+    /// mutation after any borrow — multiple `return &entry.group` sites with
+    /// later `insert`/slot writes is the classic pre-Polonius NLL rejection.
+    /// Hence the three phases: DETECT (immutable borrows end immediately),
+    /// MUTATE (tick / LRU stamp / insert / mirror), then a single tail match
+    /// that re-borrows the chosen slot. The map path pays one extra hash
+    /// lookup (`contains_key` before `get_mut`); it is the cold path — the
+    /// fast slot serves the launch loop.
     pub(super) fn get_or_create(
         &mut self,
         device: &wgpu::Device,
@@ -192,61 +203,98 @@ impl BindGroupCache {
     ) -> &BindGroup {
         self.tick = self.tick.wrapping_add(1);
 
-        // Fast path: one direct-mapped slot, verified by identity. A hit
-        // costs a few compares and no clones; a miss falls through to the
-        // hash map below, exactly as before.
+        // Phase 1 — DETECT. One direct-mapped slot, verified by identity: a
+        // hit costs a few compares and no clones. A miss falls through to
+        // the hash map, exactly as before.
         let slot = Self::slot_of(pipeline);
-        if let Some(entry) = self.fast.get(slot).and_then(|entry| entry.as_ref())
-            && Arc::ptr_eq(&entry.pipeline, pipeline)
-            && entry.matches(resources)
-        {
-            return &entry.group;
+        let fast_hit = self
+            .fast
+            .get(slot)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|entry| Arc::ptr_eq(&entry.pipeline, pipeline) && entry.matches(resources));
+
+        // Where the tail expression reads the group from.
+        enum Source {
+            FastSlot,
+            Map,
         }
 
-        let key = BindGroupKey {
-            pipeline: pipeline.clone(),
-            bindings: binding_keys(resources),
-        };
-
-        if let Some(entry) = self.entries.get_mut(&key) {
-            entry.last_used = self.tick;
-            return &entry.group;
-        }
-
-        self.evict_if_full();
-
-        let entries = resources
-            .iter()
-            .enumerate()
-            .map(|(i, resource)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: resource.as_wgpu_bind_resource(),
+        let key = if fast_hit {
+            None
+        } else {
+            Some(BindGroupKey {
+                pipeline: pipeline.clone(),
+                bindings: binding_keys(resources),
             })
-            .collect::<Vec<_>>();
-        let group_layout = pipeline.get_bind_group_layout(0);
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &group_layout,
-            entries: &entries,
-        });
+        };
+        let source = if fast_hit {
+            Source::FastSlot
+        } else {
+            let key = key.as_ref().expect("built on the non-fast path");
+            if self.entries.contains_key(key) {
+                Source::Map
+            } else {
+                // Phase 2 — MUTATE (miss): evict, create, insert, mirror into
+                // the fast slot; the tail then reads the mirrored slot.
+                self.evict_if_full();
 
-        self.entries.insert(
-            key,
-            CacheEntry {
-                group: group.clone(),
-                last_used: self.tick,
-            },
-        );
-        // Mirror the fresh group into its fast slot; a colliding pipeline
-        // simply keeps using the hash map.
-        self.fast[slot] = Some(FastEntry {
-            pipeline: pipeline.clone(),
-            bindings: binding_keys(resources),
-            group,
-        });
-        self.created += 1;
+                let entries = resources
+                    .iter()
+                    .enumerate()
+                    .map(|(i, resource)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: resource.as_wgpu_bind_resource(),
+                    })
+                    .collect::<Vec<_>>();
+                let group_layout = pipeline.get_bind_group_layout(0);
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &group_layout,
+                    entries: &entries,
+                });
 
-        &self.fast[slot].as_ref().expect("just written").group
+                self.entries.insert(
+                    key.clone(),
+                    CacheEntry {
+                        group: group.clone(),
+                        last_used: self.tick,
+                    },
+                );
+                // Mirror the fresh group into its fast slot; a colliding
+                // pipeline simply keeps using the hash map.
+                self.fast[slot] = Some(FastEntry {
+                    pipeline: pipeline.clone(),
+                    bindings: binding_keys(resources),
+                    group,
+                });
+                self.created += 1;
+                Source::FastSlot
+            }
+        };
+        // Map hit: stamp LRU inside phase 2's shape (no borrow escapes — the
+        // assignment ends the `get_mut` borrow).
+        if let Source::Map = source {
+            let entry = self
+                .entries
+                .get_mut(key.as_ref().expect("built on the non-fast path"))
+                .expect("contains_key checked above");
+            entry.last_used = self.tick;
+        }
+
+        // Phase 3 — the single tail: one borrow per source, nothing after.
+        match source {
+            Source::FastSlot => &self
+                .fast
+                .get(slot)
+                .and_then(|entry| entry.as_ref())
+                .expect("fast slot written on the fast/mirror paths")
+                .group,
+            Source::Map => &self
+                .entries
+                .get(key.as_ref().expect("built on the non-fast path"))
+                .expect("contains_key checked above")
+                .group,
+        }
     }
 
     /// Make room for one new entry once the cache is at capacity.
