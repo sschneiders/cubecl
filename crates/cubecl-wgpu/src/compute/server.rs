@@ -10,7 +10,7 @@ use cubecl_common::{
     profile::{ProfileDuration, TimingMethod},
 };
 use cubecl_core::server::{Binding, StreamErrorMode};
-use cubecl_core::zspace::Shape;
+use cubecl_core::zspace::{Shape, SmallVec};
 use cubecl_core::{
     MemoryConfiguration, WgpuCompilationOptions,
     prelude::*,
@@ -159,7 +159,8 @@ impl<C: WgpuCompiler> WgpuServer<C> {
     ) -> Result<BindingsResource, IoError> {
         // Store all the resources we'll be using. This could be eliminated if
         // there was a way to tie the lifetime of the resource to the memory handle.
-        let mut resources = Vec::with_capacity(bindings.buffers.len());
+        // Inlined up to four bindings, so the common launch allocates nothing here.
+        let mut resources = SmallVec::with_capacity(bindings.buffers.len());
 
         for b in bindings.buffers.into_iter() {
             let stream = self.scheduler.stream(&b.stream);

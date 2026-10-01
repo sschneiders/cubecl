@@ -7,7 +7,7 @@ use cubecl_common::{bytes::Bytes, pool::LeaseHandle, profile::TimingMethod};
 use cubecl_core::{
     CubeCount, MemoryConfiguration,
     server::{MetadataBindingInfo, StreamErrorMode},
-    zspace::SmallVec,
+    zspace::{SmallVec, smallvec},
 };
 use cubecl_ir::MemoryDeviceProperties;
 use cubecl_runtime::{
@@ -17,6 +17,10 @@ use cubecl_runtime::{
 };
 
 /// Defines tasks that can be scheduled on a WGPU stream.
+// The `Execute` variant carries the inlined binding list (see
+// `BindingsResource::resources`), which the launch path trades for a larger
+// task over a per-launch heap allocation.
+#[allow(clippy::large_enum_variant)]
 pub enum ScheduleTask {
     /// Represents a task to write data to a buffer.
     Write {
@@ -61,7 +65,12 @@ impl core::fmt::Debug for ScheduleTask {
 #[derive(Debug)]
 pub struct BindingsResource {
     /// List of WGPU resources used in the task.
-    pub resources: Vec<WgpuResource>,
+    ///
+    /// Inlined up to four entries - the common launch binds a metadata
+    /// buffer, its inputs and one output - so the enqueue path holds no
+    /// per-launch heap allocation; wider binding sets spill exactly like the
+    /// `Vec` this used to be.
+    pub resources: SmallVec<[WgpuResource; 4]>,
     /// Metadata for uniform bindings.
     pub info: MetadataBindingInfo,
     /// Which compiler was used. This determines the passing strategy of params.
@@ -180,7 +189,11 @@ impl BindingsResource {
     pub fn into_resources(
         mut self,
         stream: &mut WgpuStream,
-    ) -> (Vec<WgpuResource>, Vec<WgpuResource>, Option<Addresses>) {
+    ) -> (
+        SmallVec<[WgpuResource; 4]>,
+        SmallVec<[WgpuResource; 4]>,
+        Option<Addresses>,
+    ) {
         let info = (!self.info.data.is_empty())
             .then(|| stream.create_uniform(bytemuck::cast_slice(&self.info.data)));
         match self.compiler_info {
@@ -195,11 +208,11 @@ impl BindingsResource {
                     self.resources.push(info);
                 }
                 match params_transfer {
-                    ParamsTransfer::Immediate => (vec![], self.resources, Some(addresses)),
+                    ParamsTransfer::Immediate => (SmallVec::new(), self.resources, Some(addresses)),
                     ParamsTransfer::Uniform => {
                         let address_buffer =
                             stream.create_uniform(bytemuck::cast_slice(&addresses));
-                        (vec![address_buffer], self.resources, None)
+                        (smallvec![address_buffer], self.resources, None)
                     }
                 }
             }
@@ -207,7 +220,7 @@ impl BindingsResource {
                 if let Some(info) = info {
                     self.resources.push(info);
                 }
-                (self.resources, vec![], None)
+                (self.resources, SmallVec::new(), None)
             }
         }
     }
