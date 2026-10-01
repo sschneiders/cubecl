@@ -668,7 +668,7 @@ impl WgpuStream {
                 .bind_groups
                 .get_or_create(&self.device, &pipeline, resources);
 
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, bind_group, &[]);
         }
 
         if let Some(addresses) = addresses {
@@ -715,6 +715,38 @@ impl WgpuStream {
 
 #[cfg(not(target_family = "wasm"))]
 mod __submission_load {
+    /// Cumulative-submission poll threshold, overridable via the
+    /// `CUBECL_WGPU_MAX_TOTAL_TASKS` environment variable.
+    ///
+    /// Once this many tasks have been submitted (cumulatively, across
+    /// submissions) without a blocking wait, the next submission waits for
+    /// the GPU to catch up (see [`SubmissionLoad::regulate`]). Each wait is a
+    /// drain-absorption point on the enqueue side, so workloads that enqueue
+    /// many small kernels per step - a training loop can launch thousands -
+    /// may want a larger threshold (or `usize::MAX` to disable the periodic
+    /// wait entirely and rely on the per-stream `tasks_max` submit cadence
+    /// alone). The default matches the historical hard-coded behavior.
+    const DEFAULT_MAX_TOTAL_TASKS: usize = 512;
+
+    /// The threshold, parsed from the environment once per process.
+    fn max_total_tasks() -> usize {
+        static MAX_TOTAL_TASKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+        *MAX_TOTAL_TASKS.get_or_init(|| match std::env::var("CUBECL_WGPU_MAX_TOTAL_TASKS") {
+            Ok(value) => match value.parse::<usize>() {
+                Ok(max) => max,
+                Err(_) => {
+                    log::warn!(
+                        "wgpu: CUBECL_WGPU_MAX_TOTAL_TASKS={value} is not a positive \
+                             integer; keeping {DEFAULT_MAX_TOTAL_TASKS}"
+                    );
+                    DEFAULT_MAX_TOTAL_TASKS
+                }
+            },
+            Err(_) => DEFAULT_MAX_TOTAL_TASKS,
+        })
+    }
+
     #[derive(Default, Debug)]
     pub enum SubmissionLoad {
         Init {
@@ -745,9 +777,8 @@ mod __submission_load {
                     // - Too little and GPU utilization is really bad.
                     //
                     // TODO: Could be smarter and dynamic based on stats.
-                    const MAX_TOTAL_TASKS: usize = 512;
 
-                    if *tasks_count_submitted >= MAX_TOTAL_TASKS {
+                    if *tasks_count_submitted >= max_total_tasks() {
                         core::mem::swap(last_index, &mut index);
                         if let Err(e) = device.poll(wgpu::PollType::Wait {
                             submission_index: Some(index),
