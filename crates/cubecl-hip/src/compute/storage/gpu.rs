@@ -1,7 +1,7 @@
+use crate::compute::status::checked;
 use cubecl_core::server::IoError;
 use cubecl_environment::backtrace::BackTrace;
-use cubecl_hip_sys::HIP_SUCCESS;
-use cubecl_runtime::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
+use cubecl_server::storage::{ComputeStorage, StorageHandle, StorageId, StorageUtilization};
 use std::collections::HashMap;
 
 use crate::AMD_MAX_BINDINGS;
@@ -12,7 +12,9 @@ use crate::AMD_MAX_BINDINGS;
 /// for launching kernels.
 pub struct GpuStorage {
     mem_alignment: usize,
-    memory: HashMap<StorageId, cubecl_hip_sys::hipDeviceptr_t>,
+    memory: HashMap<StorageId, (cubecl_hip_sys::hipDeviceptr_t, u64)>,
+    /// The bytes `memory` holds.
+    allocated: u64,
     deallocations: Vec<StorageId>,
     ptr_bindings: PtrBindings,
 }
@@ -38,6 +40,7 @@ impl GpuStorage {
         Self {
             mem_alignment,
             memory: HashMap::new(),
+            allocated: 0,
             deallocations: Vec::new(),
             ptr_bindings: PtrBindings::new(),
         }
@@ -48,13 +51,16 @@ impl GpuStorage {
     /// This method processes all pending deallocations by freeing the associated GPU memory.
     pub fn perform_deallocations(&mut self) {
         for id in self.deallocations.drain(..) {
-            if let Some(ptr) = self.memory.remove(&id) {
+            if let Some((ptr, size)) = self.memory.remove(&id) {
+                self.allocated -= size;
                 // SAFETY: `ptr` was obtained from a prior `hipMalloc` call and
                 // has not been freed yet. `hipFree` synchronizes the device, so
                 // in-flight work never sees the page disappear.
                 let status = unsafe { cubecl_hip_sys::hipFree(ptr) };
-                if status != HIP_SUCCESS {
-                    eprintln!("HIP free error: {status}");
+                // Logged, not reported: this runs on a deallocation path with
+                // no caller left to hand an error to.
+                if let Err(err) = checked("hipFree", status) {
+                    log::warn!("releasing a device page failed: {err}");
                 }
             }
         }
@@ -109,18 +115,26 @@ impl ComputeStorage for GpuStorage {
         self.mem_alignment
     }
 
-    fn get(&mut self, handle: &StorageHandle) -> Self::Resource {
-        let ptr = (*self.memory.get(&handle.id).unwrap()) as u64;
+    fn get(&mut self, handle: &StorageHandle) -> Result<Self::Resource, IoError> {
+        let (ptr, _) =
+            *self
+                .memory
+                .get(&handle.id)
+                .ok_or_else(|| IoError::StorageHandleNotFound {
+                    reason: format!("{} in the HIP gpu storage", handle.id).into(),
+                    backtrace: BackTrace::capture(),
+                })?;
+        let ptr = ptr as u64;
 
         let offset = handle.offset();
         let size = handle.size();
         let ptr = self.ptr_bindings.register(ptr + offset);
 
-        GpuResource::new(
+        Ok(GpuResource::new(
             *ptr as cubecl_hip_sys::hipDeviceptr_t,
             std::ptr::from_ref(ptr) as *mut std::ffi::c_void,
             size,
-        )
+        ))
     }
 
     #[cfg_attr(
@@ -143,17 +157,10 @@ impl ComputeStorage for GpuStorage {
             let mut ptr: *mut ::std::os::raw::c_void = std::ptr::null_mut();
             let status = cubecl_hip_sys::hipMalloc(&mut ptr, size as usize);
 
-            match status {
-                HIP_SUCCESS => {}
-                other => {
-                    return Err(IoError::Unknown {
-                        description: format!("HIP allocation error: {other}"),
-                        backtrace: BackTrace::capture(),
-                    });
-                }
-            }
+            checked("hipMalloc", status)?;
 
-            self.memory.insert(id, ptr);
+            self.memory.insert(id, (ptr, size));
+            self.allocated += size;
         };
 
         Ok(StorageHandle::new(
@@ -169,6 +176,10 @@ impl ComputeStorage for GpuStorage {
 
     fn flush(&mut self) {
         self.perform_deallocations();
+    }
+
+    fn bytes_allocated(&self) -> u64 {
+        self.allocated
     }
 }
 

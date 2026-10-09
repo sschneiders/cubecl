@@ -17,7 +17,7 @@ fn copy_perpendicular<T: Numeric, N: Size>(
     input: &Tensor<Vector<T, N>>,
     output: &mut Tensor<Vector<T, N>>,
     axis_vectorized: usize,
-    #[define(T)] _elem: StorageType,
+    #[define(T)] _elem: ElemType,
 ) {
     let vector_size = input.vector_size();
     let last_axis = input.rank() - 1;
@@ -68,6 +68,7 @@ fn copy_perpendicular<T: Numeric, N: Size>(
         // --- STEP 1: GATHER ---
         // Load data from the input tensor. Since the data is "perpendicular",
         // we read across the stride-1 axis to fill the accumulators.
+        #[unroll]
         for i in 0..vector_size {
             let index = batch_offset + i * channel_input_stride;
             let batched = input[index];
@@ -98,11 +99,11 @@ fn copy_perpendicular<T: Numeric, N: Size>(
 /// This is used when the input tensor's memory layout is such that the last dimension
 /// is not the one with a stride of 1 (the vectorized dimension). It optimizes
 /// the copy by using hardware vectorization (Vectors) and an in-register transpose.
-pub fn launch_into_contiguous_perpendicular<R: Runtime>(
-    client: &ComputeClient<R>,
-    input: TensorBinding<R>,
-    dtype: StorageType,
-) -> TensorHandle<R> {
+pub fn launch_into_contiguous_perpendicular(
+    client: &Client,
+    input: TensorBinding,
+    dtype: ElemType,
+) -> TensorHandle {
     // Fallback for 1D tensors where perpendicularity doesn't apply.
     if input.shape.len() <= 1 {
         return into_contiguous(client, input, dtype);
@@ -119,11 +120,11 @@ pub fn launch_into_contiguous_perpendicular<R: Runtime>(
 /// This is used when the input tensor's memory layout is such that the last dimension
 /// is not the one with a stride of 1 (the vectorized dimension). It optimizes
 /// the copy by using hardware vectorization (Vectors) and an in-register transpose.
-pub fn launch_copy_perpendicular_ref<R: Runtime>(
-    client: &ComputeClient<R>,
-    input: TensorBinding<R>,
-    output: TensorBinding<R>,
-    dtype: StorageType,
+pub fn launch_copy_perpendicular_ref(
+    client: &Client,
+    input: TensorBinding,
+    output: TensorBinding,
+    dtype: ElemType,
 ) {
     let mut axis = 0;
 
@@ -147,7 +148,18 @@ pub fn launch_copy_perpendicular_ref<R: Runtime>(
         &output.strides,
         rank - 1,
     );
-    let vector_size = min(vector_size_perpendicular, vector_size_parallel);
+    // The gather loads `vector_size` consecutive elements along the input's unit-stride axis,
+    // so that axis must be vectorizable on its own.
+    let vector_size_axis = tensor_vector_size_parallel(
+        client.io_optimized_vector_sizes(dtype.size()),
+        &input.shape,
+        &input.strides,
+        axis,
+    );
+    let vector_size = min(
+        min(vector_size_perpendicular, vector_size_parallel),
+        vector_size_axis,
+    );
 
     let num_elems = output.shape.iter().product::<usize>();
     let working_units = num_elems / (vector_size as usize * output.shape[rank - 1]);
@@ -158,7 +170,7 @@ pub fn launch_copy_perpendicular_ref<R: Runtime>(
         .max(output.required_address_type(dtype.size()));
 
     unsafe {
-        copy_perpendicular::launch_unchecked::<R>(
+        copy_perpendicular::launch_unchecked(
             client,
             cube_count,
             cube_dim,

@@ -1,15 +1,23 @@
+use cubecl_common::device::ServiceId;
 use cubecl_environment::stream::StreamId;
 use cubecl_zspace::{Shape, Strides};
 
 use crate::{
-    memory_management::{ManagedMemoryBinding, ManagedMemoryHandle},
-    server::CopyDescriptor,
+    memory_management::{
+        ManagedMemoryBinding, ManagedMemoryHandle, ManagedMemoryId, WeakMemoryBinding,
+    },
+    server::{CopyDescriptor, TensorMapBinding},
 };
 
 /// Server handle containing the [memory handle](crate::server::Handle).
 pub struct Handle {
     /// Memory handle.
     pub memory: ManagedMemoryHandle,
+    /// The service whose memory this handle addresses. A client checks it
+    /// before handing the handle to its device: memory coordinates mean
+    /// nothing on another device, and reading them there is not an error
+    /// but garbage.
+    pub service: ServiceId,
     /// Memory offset in bytes.
     pub offset_start: Option<u64>,
     /// Memory offset in bytes.
@@ -24,6 +32,7 @@ impl core::fmt::Debug for Handle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Handle")
             .field("id", &self.memory)
+            .field("service", &self.service)
             .field("offset_start", &self.offset_start)
             .field("offset_end", &self.offset_end)
             .field("stream", &self.stream)
@@ -36,6 +45,7 @@ impl Clone for Handle {
     fn clone(&self) -> Self {
         Self {
             memory: self.memory.clone(),
+            service: self.service,
             offset_start: self.offset_start,
             offset_end: self.offset_end,
             stream: self.stream,
@@ -46,9 +56,15 @@ impl Clone for Handle {
 
 impl Handle {
     /// Creates a new handle of the given size.
-    pub fn from_memory(id: ManagedMemoryHandle, stream: StreamId, size: u64) -> Self {
+    pub fn from_memory(
+        id: ManagedMemoryHandle,
+        service: ServiceId,
+        stream: StreamId,
+        size: u64,
+    ) -> Self {
         Self {
             memory: id,
+            service,
             offset_start: None,
             offset_end: None,
             stream,
@@ -56,9 +72,10 @@ impl Handle {
         }
     }
     /// Creates a new handle of the given size.
-    pub fn new(stream: StreamId, size: u64) -> Self {
+    pub fn new(service: ServiceId, stream: StreamId, size: u64) -> Self {
         Self {
             memory: ManagedMemoryHandle::new(),
+            service,
             offset_start: None,
             offset_end: None,
             stream,
@@ -70,10 +87,11 @@ impl Handle {
         self.memory.can_mut()
     }
 
-    /// Returns the [`Binding`] corresponding to the current handle.
-    pub fn binding(self) -> Binding {
-        Binding {
+    /// Returns the [`BufferBinding`] corresponding to the current handle.
+    pub fn binding(self) -> BufferBinding {
+        BufferBinding {
             memory: self.memory.binding(),
+            service: self.service,
             offset_start: self.offset_start,
             offset_end: self.offset_end,
             stream: self.stream,
@@ -126,18 +144,30 @@ impl Handle {
     }
 }
 
-/// A binding represents a [Handle] that is bound to managed memory.
+/// A resource passed to a kernel function
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum KernelResource {
+    /// Buffer resource
+    Buffer(BufferBinding),
+    /// Tensor map resource for CUDA
+    TensorMap(TensorMapBinding),
+}
+
+/// A buffer binding represents a [Handle] that is bound to managed memory.
 ///
 /// The memory used is known by the compute server.
-/// A binding is only valid after being initlized with [`super::ComputeServer::initialize_bindings`]
+/// A buffer binding is only valid after being initlized with [`super::Server::initialize_bindings`]
 ///
 /// # Notes
 ///
-/// A binding is detached from a [`Handle`], meaning that is won't affect [`Handle::can_mut`].
+/// A buffer binding is detached from a [`Handle`], meaning that is won't affect [`Handle::can_mut`].
 #[derive(Clone, Debug)]
-pub struct Binding {
+pub struct BufferBinding {
     /// The id of the handle the binding is bound to.
     pub memory: ManagedMemoryBinding,
+    /// The service whose memory this binding addresses; see [`Handle::service`].
+    pub service: ServiceId,
     /// Memory offset in bytes.
     pub offset_start: Option<u64>,
     /// Memory offset in bytes.
@@ -148,10 +178,71 @@ pub struct Binding {
     pub size: u64,
 }
 
-impl Binding {
+/// A [`BufferBinding`] that does not keep its memory reserved: what a record
+/// of a buffer holds when holding the buffer would change what its pool may
+/// reuse.
+#[derive(Clone, Debug)]
+pub struct WeakBufferBinding {
+    memory: WeakMemoryBinding,
+    service: ServiceId,
+    offset_start: Option<u64>,
+    offset_end: Option<u64>,
+    stream: StreamId,
+    size: u64,
+}
+
+impl WeakBufferBinding {
+    /// The binding back, while its memory is allocated (see
+    /// [`WeakMemoryBinding::upgrade`]).
+    pub fn upgrade(&self) -> Option<BufferBinding> {
+        Some(BufferBinding {
+            memory: self.memory.upgrade()?,
+            service: self.service,
+            offset_start: self.offset_start,
+            offset_end: self.offset_end,
+            stream: self.stream,
+            size: self.size,
+        })
+    }
+}
+
+impl BufferBinding {
+    /// This binding, without keeping its memory reserved.
+    pub fn downgrade(&self) -> WeakBufferBinding {
+        WeakBufferBinding {
+            memory: self.memory.downgrade(),
+            service: self.service,
+            offset_start: self.offset_start,
+            offset_end: self.offset_end,
+            stream: self.stream,
+            size: self.size,
+        }
+    }
+
     /// Get the size of the handle, in bytes, accounting for offsets
     pub fn size_in_used(&self) -> u64 {
         self.size - self.offset_start.unwrap_or(0) - self.offset_end.unwrap_or(0)
+    }
+
+    /// The byte range of the allocation this binding names: what the offsets
+    /// leave of the buffer. This is the region the taint bookkeeping claims
+    /// when work writing through this binding fails, and releases when work
+    /// writing through it lands.
+    pub fn range(&self) -> core::ops::Range<u64> {
+        self.offset_start.unwrap_or(0)..self.size - self.offset_end.unwrap_or(0)
+    }
+
+    /// The identity a claim on this binding is stored under: the allocation
+    /// and the byte range of it, exactly as [`range`](Self::range) computes
+    /// it.
+    ///
+    /// Anything that deduplicates or compares claims — a capture's write set,
+    /// above all — must key by this and nothing coarser. Two tensors carved
+    /// from one batched allocation share a memory id and nothing else; keyed
+    /// by the id alone, one sibling's claim swallows the others'.
+    pub fn claim_key(&self) -> (ManagedMemoryId, u64, u64) {
+        let range = self.range();
+        (self.memory.id(), range.start, range.end)
     }
     /// Get the total size of the handle, in bytes.
     pub fn size(&self) -> u64 {

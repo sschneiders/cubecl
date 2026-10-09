@@ -9,7 +9,7 @@ use core::time::Duration;
 
 /// Events that occurred during autotuning, useful for observability and logging.
 #[derive(Debug, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum AutotuneLogEvent {
     /// Tracks a tunable kernel that was executed during autotuning.
     TuningStep(String, Duration),
@@ -20,7 +20,7 @@ pub enum AutotuneLogEvent {
 
 /// The context containing bounds, limits, and events that happened during autotuning.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub struct AutotuneLogContext {
     /// Calculated bounds for autotuning.
     pub bounds: Option<crate::tune::Bounds>,
@@ -33,12 +33,12 @@ pub struct AutotuneLogContext {
 }
 
 impl AutotuneLogContext {
-    /// Creates a new log context if either the human logger or the machine-readable recorder is
-    /// enabled. The recorder is independent of the logger, so records are still populated when the
+    /// Creates a new log context if either the human logger or the machine-readable decisions
+    /// are enabled. Decisions are independent of the logger, so they are still populated when the
     /// logger is disabled.
     pub fn new(logger: &mut Logger) -> Option<Self> {
         let logging = !matches!(logger.log_level_autotune(), AutotuneLogLevel::Disabled);
-        if logging || logger.autotune_recording_enabled() {
+        if logging || logger.autotune_decisions_enabled() {
             Some(Self {
                 bounds: None,
                 limit: None,
@@ -137,12 +137,12 @@ macro_rules! impl_autotune_logger_ext {
 impl_autotune_logger_ext!(Option<AutotuneLogContext>, as_mut, as_ref);
 impl_autotune_logger_ext!(Option<&'_ mut AutotuneLogContext>, as_deref_mut, as_deref);
 
-/// The complete record of one tuning decision, written as JSON when the autotune recorder has a
-/// sink configured. One record per line, per decision, in a fixed schema for tools to read back.
+/// The complete account of one tuning decision, written as JSON when autotune decisions have a
+/// sink configured. One entry per line, per decision, in a fixed schema for tools to read back.
 #[cfg(std_io)]
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "K: Clone + serde::Deserialize<'de>"))]
-pub struct AutotuneRecord<'a, K: Clone> {
+pub struct AutotuneDecision<'a, K: Clone> {
     /// The key for the autotuning job.
     pub key: Cow<'a, K>,
     /// The index of the fastest candidate.
@@ -167,7 +167,7 @@ pub struct CheckResult {
 }
 
 /// Emit the autotune result: a line for humans at the logger's level and, independently, the
-/// [`AutotuneRecord`] for tools if the recorder has a sink. Either, both, or neither.
+/// [`AutotuneDecision`] for tools if decisions have a sink. Either, both, or neither.
 fn log_result<K: AutotuneKey>(
     logger: &mut Logger,
     key: &K,
@@ -175,29 +175,33 @@ fn log_result<K: AutotuneKey>(
     log_context: Option<&AutotuneLogContext>,
 ) {
     let level = logger.log_level_autotune();
-    let recording = logger.autotune_recording_enabled();
-    if matches!(level, AutotuneLogLevel::Disabled) && !recording {
+    let decisions = logger.autotune_decisions_enabled();
+    if matches!(level, AutotuneLogLevel::Disabled) && !decisions {
         return;
     }
 
-    // Shared by both sinks, and resolved only once one of them is listening: it assumes a candidate
-    // succeeded, which is not true of every tuning pass.
-    let fastest = results
+    // Shared by both sinks, and resolved only once one of them is listening.
+    // The sort puts any success first, so `None` here means *no* candidate
+    // measured — which still happens: an all-failed plan can decide an
+    // unmeasured winner (see `Schedule::run_plan`), and the report must not
+    // be what kills it. The schedule already warned with the full results;
+    // there is no measurement to record.
+    let Some(fastest) = results
         .first()
-        .expect("At least one kernel needed.")
-        .outcome
-        .as_ref()
-        .expect("At least one kernel has to succeed.");
+        .and_then(|result| result.outcome.as_ref().ok())
+    else {
+        return;
+    };
 
-    if recording {
-        write_record(logger, key, results, log_context, fastest);
+    if decisions {
+        write_decision(logger, key, results, log_context, fastest);
     }
     write_log(logger, level, key, results, log_context, fastest);
 }
 
-/// The record, for tools: one JSON object on the recorder's sink.
+/// The decision, for tools: one JSON object on the decisions' sink.
 #[cfg_attr(not(std_io), allow(unused_variables))]
-fn write_record<K: AutotuneKey>(
+fn write_decision<K: AutotuneKey>(
     logger: &mut Logger,
     key: &K,
     results: &[AutotuneResult],
@@ -206,7 +210,7 @@ fn write_record<K: AutotuneKey>(
 ) {
     #[cfg(std_io)]
     {
-        let record = AutotuneRecord {
+        let decision = AutotuneDecision {
             key: Cow::Borrowed(key),
             fastest_index: fastest.index,
             fastest_time: fastest.computation.median,
@@ -217,15 +221,15 @@ fn write_record<K: AutotuneKey>(
                 .map(Cow::Borrowed),
         };
 
-        let msg = serde_json::to_string(&record).unwrap_or_else(|err| {
-            format!("{{\"error\": \"Failed to serialize the autotune record: {err}\"}}")
+        let msg = serde_json::to_string(&decision).unwrap_or_else(|err| {
+            format!("{{\"error\": \"Failed to serialize the autotune decision: {err}\"}}")
         });
-        logger.log_autotune_record(&msg);
+        logger.log_autotune_decision(&msg);
     }
     #[cfg(not(std_io))]
     {
-        logger.log_autotune_record(
-            &"{\"error\": \"Recording autotune is not available without std_io\"}",
+        logger.log_autotune_decision(
+            &"{\"error\": \"Writing autotune decisions is not available without std_io\"}",
         );
     }
 }

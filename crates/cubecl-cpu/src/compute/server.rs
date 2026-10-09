@@ -1,59 +1,71 @@
-use crate::{
-    CpuCompiler,
-    compiler::MlirCompilerOptions,
-    compute::{
-        cpu_kernel::CpuKernel,
-        schedule::{BindingsResource, ScheduleTask, ScheduledCpuBackend},
-    },
+use cubecl_llvm::PlironOptions;
+use cubecl_server::compiler::{ArtifactId, KernelLoader};
+use cubecl_server::memory_management::relocation::RelocatingStreams;
+
+use crate::compute::{
+    cpu_kernel::CpuCompiledKernel,
+    kernel_compiler::{BufferAlignment, CpuKernelCompiler},
+    schedule::{BindingsResource, ScheduleTask, ScheduledCpuBackend},
 };
 use cubecl_common::{bytes::Bytes, profile::ProfileDuration};
+use cubecl_core::server::ServerStorage;
 use cubecl_core::{
-    CompilationError, CubeCount, ExecutionMode, MemoryConfiguration, MemoryUsage,
+    CompilationError, CubeCount, MemoryConfiguration,
     ir::MemoryDeviceProperties,
     server::{
-        Binding, ComputeServer, CopyDescriptor, IoError, KernelArguments, ProfileError,
-        ProfilingToken, ServerCommunication, ServerError, ServerUtilities,
+        BufferBinding, CopyDescriptor, IoError, KernelArguments, KernelResource, LaunchError,
+        ProfileError, ProfilingToken, Server, ServerCommunication, ServerError, ServerUtilities,
     },
     zspace::{Shape, Strides, strides},
 };
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::DynFut;
 use cubecl_environment::stream::StreamId;
-use cubecl_runtime::{
-    allocator::ContiguousMemoryLayoutPolicy,
-    compiler::CubeTask,
-    config::{CubeClRuntimeConfig, RuntimeConfig},
-    dry_run::LaunchMode,
-    id::KernelId,
+use cubecl_server::{
+    config::{CubeClRuntimeConfig, RuntimeConfig, compilation::F16Evaluation},
+    execution::LaunchMode,
+    kernel::CubeKernel,
     logging::ServerLogger,
     memory_management::{ManagedMemoryHandle, MemoryAllocationMode},
     storage::{BytesStorage, ComputeStorage, ManagedResource},
     stream::scheduler::{SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy},
+    stream::{ExecuteScope, FailureStore, WriteScoped, failed_writing},
 };
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct CpuServer {
     scheduler: SchedulerMultiStream<ScheduledCpuBackend>,
-    utilities: Arc<ServerUtilities<CpuServer>>,
-    compilation_cache: HashMap<KernelId, CpuKernel>,
+    utilities: Arc<ServerUtilities>,
+    /// The kernels compiled so far, and how to compile another.
+    kernels: KernelLoader<CpuKernelCompiler>,
     // A buffer that can be used to store stream id without extra allocations.
     streams_pool: Vec<StreamId>,
 }
 
+impl WriteScoped for CpuServer {
+    type Streams = SchedulerMultiStream<ScheduledCpuBackend>;
+
+    fn write_streams(&mut self) -> &mut Self::Streams {
+        &mut self.scheduler
+    }
+
+    fn on_failure(&mut self, stream: StreamId, error: &ServerError) {
+        // Measured per stream on this backend, so the scope's stream is the
+        // one whose measurement a failure invalidates.
+        self.scheduler.stream(&stream).profile_failure(error);
+    }
+}
+
 impl CpuServer {
     pub fn new(
-        max_units_per_cube: u32,
         memory_properties: MemoryDeviceProperties,
         memory_config: MemoryConfiguration,
-        utilities: Arc<ServerUtilities<CpuServer>>,
+        f16_evaluation: F16Evaluation,
+        utilities: Arc<ServerUtilities>,
     ) -> Self {
-        let backend = ScheduledCpuBackend::new(
-            max_units_per_cube,
-            memory_properties,
-            memory_config,
-            utilities.logger.clone(),
-        );
+        let backend =
+            ScheduledCpuBackend::new(memory_properties, memory_config, utilities.logger.clone());
         let config = CubeClRuntimeConfig::get();
         let max_streams = config.streaming.max_streams;
 
@@ -70,7 +82,10 @@ impl CpuServer {
         Self {
             scheduler,
             utilities,
-            compilation_cache: HashMap::new(),
+            kernels: KernelLoader::new(CpuKernelCompiler::new(PlironOptions {
+                f16_evaluation,
+                ..Default::default()
+            })),
             streams_pool: Vec::new(),
         }
     }
@@ -79,17 +94,22 @@ impl CpuServer {
         // Store all the resources we'll be using. This could be eliminated if
         // there was a way to tie the lifetime of the resource to the memory handle.
         let resources = bindings
-            .buffers
+            .resources
             .into_iter()
-            .map(|binding| {
+            .filter_map(|binding| {
+                let KernelResource::Buffer(binding) = binding else {
+                    return None;
+                };
                 let stream = self.scheduler.stream(&binding.stream);
                 let memory = binding.memory.clone();
-                let resource = stream
-                    .memory_management
-                    .get_resource(binding.memory, binding.offset_start, binding.offset_end)
-                    .unwrap();
-
-                ManagedResource::new(memory, resource)
+                let resource = stream.get_resource(binding).unwrap();
+                // No page guard: a relocation runs every queued and running
+                // kernel to completion before anything moves, and a guard
+                // would keep the pages from serving new reservations for as
+                // long as the task is queued. A read-back outlives its task,
+                // and its binding is what keeps the allocation in place: a
+                // relocation leaves a page with a bound allocation as it is.
+                Some(ManagedResource::new(memory, resource))
             })
             .collect::<Vec<_>>();
 
@@ -101,10 +121,10 @@ impl CpuServer {
 
     fn prepare_task(
         &mut self,
-        kernel: Box<dyn CubeTask<CpuCompiler>>,
+        kernel: &CpuCompiledKernel,
         count: CubeCount,
         bindings: BindingsResource,
-        kind: ExecutionMode,
+        stream_id: StreamId,
     ) -> Result<ScheduleTask, CompilationError> {
         let cube_count = match count {
             CubeCount::Static(x, y, z) => [x, y, z],
@@ -115,12 +135,7 @@ impl CpuServer {
                     .get_resource(binding.memory, binding.offset_start, binding.offset_end)
                     .unwrap();
 
-                let _ = stream
-                    .flush(cubecl_core::server::StreamErrorMode {
-                        ignore: true,
-                        flush: false,
-                    })
-                    .ok();
+                stream.submit();
 
                 let bytes = resource.read();
                 let x = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
@@ -130,41 +145,28 @@ impl CpuServer {
             }
         };
 
-        self.prepare_task_inner(kernel, cube_count, bindings, kind)
+        self.prepare_task_inner(kernel, cube_count, bindings, stream_id)
     }
 
     fn prepare_task_inner(
         &mut self,
-        kernel: Box<dyn CubeTask<CpuCompiler>>,
+        kernel: &CpuCompiledKernel,
         cube_count: [u32; 3],
         bindings: BindingsResource,
-        kind: ExecutionMode,
+        stream_id: StreamId,
     ) -> Result<ScheduleTask, CompilationError> {
-        let kernel_id = kernel.id();
-        let kernel = if let Some(kernel) = self.compilation_cache.get(&kernel_id) {
-            kernel
-        } else {
-            let definition = kernel.define();
-            let kernel = kernel.compile(
-                definition,
-                &mut Default::default(),
-                &MlirCompilerOptions::default(),
-                kind,
-                kernel.address_type(),
-            )?;
-            self.compilation_cache
-                .insert(kernel_id.clone(), CpuKernel::new(kernel));
-            self.compilation_cache
-                .get_mut(&kernel_id)
-                .expect("Just inserted")
-        };
-
         let cube_dim = kernel.mlir.cube_dim;
 
-        let mlir_engine = kernel.mlir.repr.clone().unwrap();
+        let mlir_engine = kernel
+            .mlir
+            .repr
+            .clone()
+            .expect("the compiler refuses a kernel without a representation")
+            .expect_jit();
 
         let task = ScheduleTask::Execute {
-            mlir_engine,
+            stream_id,
+            pliron_engine: mlir_engine,
             bindings,
             cube_dim,
             cube_count,
@@ -173,17 +175,12 @@ impl CpuServer {
         Ok(task)
     }
 
-    pub(crate) fn utilities(&self) -> Arc<ServerUtilities<Self>> {
+    pub(crate) fn utilities(&self) -> Arc<ServerUtilities> {
         self.utilities.clone()
     }
 }
 
-impl ComputeServer for CpuServer {
-    type Kernel = Box<dyn CubeTask<CpuCompiler>>;
-    type Storage = BytesStorage;
-    type MemoryLayoutPolicy = ContiguousMemoryLayoutPolicy;
-    type Info = ();
-
+impl Server for CpuServer {
     fn logger(&self) -> Arc<ServerLogger> {
         self.scheduler.logger.clone()
     }
@@ -199,14 +196,29 @@ impl ComputeServer for CpuServer {
         .into())
     }
 
-    fn utilities(&self) -> Arc<ServerUtilities<Self>> {
+    fn utilities(&self) -> Arc<ServerUtilities> {
         self.utilities.clone()
     }
 
-    fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId) {
-        let stream = self.scheduler.stream(&stream_id);
-        let reserved = stream.empty(size).unwrap();
-        stream.bind(reserved, memory);
+    fn initialize_memory(
+        &mut self,
+        memory: ManagedMemoryHandle,
+        size: u64,
+        stream_id: StreamId,
+    ) -> Result<(), ServerError> {
+        self.scheduler.relocating(stream_id).relocate_when_wanted();
+        let (stream, failures) = self.scheduler.stream_and_failures(&stream_id);
+        let reserved = match stream.empty(size, failures) {
+            Ok(reserved) => reserved,
+            Err(err) => {
+                // Nothing to allocate: the buffer carries the error instead.
+                let err = ServerError::from(err);
+                failures.fail_unallocated(&memory, err.clone());
+                return Err(err);
+            }
+        };
+        stream.bind(reserved, memory, failures);
+        Ok(())
     }
 
     fn read(
@@ -214,6 +226,15 @@ impl ComputeServer for CpuServer {
         descriptors: Vec<CopyDescriptor>,
         stream_id: StreamId,
     ) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+        // Buffers another stream wrote are only as good as the work that wrote
+        // them; see `StreamPool::ensure_written`.
+        if let Err(err) = self
+            .scheduler
+            .ensure_written(descriptors.iter().map(|d| &d.handle))
+        {
+            return Box::pin(async move { Err(err) });
+        }
+
         let mut streams = vec![stream_id];
         let mut results = Vec::with_capacity(descriptors.len());
         let mut resources = Vec::with_capacity(descriptors.len());
@@ -223,12 +244,20 @@ impl ComputeServer for CpuServer {
             if !streams.contains(&desc.handle.stream) {
                 streams.push(desc.handle.stream);
             }
-            let stream = self.scheduler.stream(&stream_id);
+            // The resource lives in the memory management of the stream that
+            // owns the handle, which is not always the reader's.
+            let stream = self.scheduler.stream(&desc.handle.stream);
             let result = stream.read_async(desc);
             results.push(result);
         }
 
         self.scheduler.execute_streams(streams);
+
+        // The reader's own errors, on the way out: a launch that failed here
+        // never wrote the buffers either, so the bytes below are stale.
+        if let Err(err) = self.scheduler.stream(&stream_id).flush(stream_id) {
+            return Box::pin(async move { Err(err) });
+        }
 
         Box::pin(async move {
             for result in results {
@@ -243,88 +272,221 @@ impl ComputeServer for CpuServer {
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
+        // No health gate, as on every other backend: a failure is the
+        // caller's to surface at its next flush, and refusing the write here
+        // would leave the buffer unwritten for a caller whose flush has already
+        // reported and cleared that error.
         for (desc, data) in descriptors {
-            let stream = self.scheduler.stream(&desc.handle.stream);
-
-            if contiguous_strides(&desc.shape) != desc.strides {
-                stream.error(ServerError::Io(IoError::UnsupportedStrides {
-                    backtrace: BackTrace::capture(),
-                }));
-                return;
-            }
-
-            if !stream.is_healthy() {
-                return;
-            }
-
-            let resource = match stream.get_resource(desc.handle.clone()) {
-                Ok(r) => r,
-                Err(err) => {
-                    stream.error(ServerError::Io(err));
-                    return;
+            // Each copy runs in its own scope over its destination: the write
+            // that lands fills it, which is what releases an earlier
+            // failure's hold on it — a caller recovers by writing from the
+            // host as much as by relaunching — and a failure leaves it as it
+            // was, which is what a later read of it has to fail on. The scope
+            // queues failures on the caller's stream, the one that flushes
+            // them, even though the resource is resolved on the stream that
+            // owns the handle.
+            let mut written = self.write_set();
+            written.push(desc.handle.clone());
+            ExecuteScope::over(self, stream_id, written).execute(|server| {
+                if contiguous_strides(&desc.shape) != desc.strides {
+                    return Err(ServerError::Io(IoError::UnsupportedStrides {
+                        backtrace: BackTrace::capture(),
+                    }));
                 }
-            };
-            let memory = desc.handle.memory.clone();
-            let task = ScheduleTask::Write {
-                data,
-                buffer: ManagedResource::new(memory, resource),
-            };
 
-            self.scheduler.register(stream_id, task, &[]);
+                // The write is registered on the caller, so name the
+                // stream that owns the handle as an argument: its queued
+                // work has to land before this write overwrites the same
+                // memory.
+                let owner = desc.handle.stream;
+                let stream = server.scheduler.stream(&owner);
+                let memory = desc.handle.memory.clone();
+                let resource = stream.get_resource(desc.handle).map_err(ServerError::Io)?;
+                // No page guard, as for a launch's bindings.
+                let buffer = ManagedResource::new(memory, resource);
+                let task = ScheduleTask::Write { data, buffer };
+
+                server.scheduler.register(stream_id, task, &[owner]);
+                Ok(())
+            });
         }
     }
 
-    fn memory_usage(&mut self, stream_id: StreamId) -> Result<MemoryUsage, ServerError> {
-        let stream = self.scheduler.stream(&stream_id);
-        Ok(stream.memory_management.memory_usage())
+    fn memory_report(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Option<cubecl_server::memory_management::StreamMemoryReport> {
+        Some(cubecl_server::memory_management::StreamMemoryReport {
+            stream: stream_id,
+            pools: self
+                .scheduler
+                .stream(&stream_id)
+                .memory_management
+                .memory_report(),
+            auxiliary: Vec::new(),
+        })
     }
 
     fn stream_ids(&self) -> Vec<StreamId> {
         self.scheduler.stream_ids().collect()
     }
 
-    fn memory_cleanup(&mut self, stream_id: StreamId) {
-        let stream = self.scheduler.stream(&stream_id);
-        stream.memory_management.cleanup(true)
+    fn memory_cleanup(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        self.scheduler.relocating(stream_id).reclaim()
     }
 
     unsafe fn launch(
         &mut self,
-        kernel: Self::Kernel,
+        kernel: Box<dyn CubeKernel>,
         count: CubeCount,
         bindings: KernelArguments,
-        kind: ExecutionMode,
         stream_id: StreamId,
         launch_mode: LaunchMode,
     ) {
-        self.streams_pool.clear();
-        bindings
-            .buffers
-            .iter()
-            .for_each(|b| self.streams_pool.push(b.stream));
-        let bindings = self.prepare_bindings(bindings);
-        let task = self.prepare_task(kernel, count, bindings, kind).unwrap();
-
-        if launch_mode.is_skipped() {
+        // Compilation comes first — memoized, so a launch after the first
+        // pays a map lookup — because the write scope stages what the
+        // compiled kernel says it writes. A kernel that fails to compile has
+        // no IR and no compiled answer, so the caller's declared IO decides:
+        // only the declared outputs are left carrying the failure, never the
+        // buffers the kernel was only going to read — tainting those would
+        // refuse every later launch that shares them, an autotune sweep
+        // above all.
+        //
+        // A discarded launch stages none either way. It was never going to write, so a
+        // failure in it leaves nothing stale, and tainting its buffers would
+        // fail unrelated reads of memory the run deliberately left alone. It
+        // stops right after compilation, before anything that touches a
+        // buffer: resolving resources or reading a dynamic cube count would
+        // materialize memory discarding a launch exists to leave unmapped. It registers
+        // no stream dependency either, which is correct rather than an
+        // oversight — nothing is scheduled, so there is no work for a later
+        // stream to order against.
+        // Storage bases and pool offsets are 64-byte aligned. A view can weaken that
+        // guarantee, so cache a separate specialization for its common alignment.
+        // Inspect only descriptors: discarded launches must not materialize any buffer.
+        let alignment =
+            bindings
+                .resources
+                .iter()
+                .fold(
+                    BytesStorage::ALIGNMENT as u32,
+                    |align, resource| match resource {
+                        KernelResource::Buffer(binding) => {
+                            let bits = binding.offset_start.unwrap_or(0).trailing_zeros();
+                            1u32 << bits.min(align.trailing_zeros())
+                        }
+                        _ => align,
+                    },
+                );
+        let alignment = BufferAlignment(alignment);
+        if launch_mode == LaunchMode::Queue {
+            self.kernels.enqueue(kernel, alignment);
+            return;
+        }
+        let id = ArtifactId {
+            kernel: kernel.id(),
+            variant: alignment,
+        };
+        let loaded = match self
+            .kernels
+            .load(kernel.as_ref(), &id, &self.scheduler.logger)
+        {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                let error = ServerError::Launch(err);
+                self.scheduler.stream(&stream_id).profile_failure(&error);
+                if !launch_mode.discards_launch() {
+                    let mut written = self.write_set();
+                    written.extend(bindings.buffers_written(None).cloned());
+                    failed_writing(self, stream_id, written, error);
+                }
+                return;
+            }
+        };
+        if launch_mode.discards_launch() {
             return;
         }
 
-        self.scheduler.register(stream_id, task, &self.streams_pool);
+        let io = loaded.mlir.io.as_deref();
+
+        // The scope claims what the launch writes until the body proves the
+        // work enqueued, so a failure — or a panic — anywhere in it leaves a
+        // read of those buffers failing on the error rather than copying
+        // bytes nothing wrote. An input that already carries a failure skips
+        // the launch instead, and the scope settles that too.
+        let mut written = self.write_set();
+        written.extend(bindings.buffers_written(io).cloned());
+        // A dynamic count travels outside `resources`, so `buffers_read`
+        // never names it — yet the dispatch reads it as its grid dimensions,
+        // which is exactly the garbage-as-cube-count read the skip exists to
+        // prevent.
+        let count_read = match &count {
+            CubeCount::Dynamic(binding) => Some(binding),
+            CubeCount::Static(..) => None,
+        };
+        ExecuteScope::launching(
+            self,
+            id.kernel,
+            stream_id,
+            bindings.buffers_read(io).chain(count_read),
+            written,
+        )
+        .execute(|server| {
+            server.streams_pool.clear();
+            bindings
+                .resources
+                .iter()
+                .filter_map(|b| {
+                    let KernelResource::Buffer(b) = b else {
+                        return None;
+                    };
+                    Some(b)
+                })
+                .for_each(|b| server.streams_pool.push(b.stream));
+            let bindings = server.prepare_bindings(bindings);
+            let task = server
+                .prepare_task(&loaded, count, bindings, stream_id)
+                .map_err(|err| ServerError::Launch(LaunchError::CompilationError(err)))?;
+
+            server
+                .scheduler
+                .register(stream_id, task, &server.streams_pool);
+            Ok(())
+        });
+    }
+
+    fn check(
+        &mut self,
+        handles: Vec<BufferBinding>,
+        _stream_id: StreamId,
+    ) -> Result<(), ServerError> {
+        self.scheduler.ensure_written(handles.iter())
+    }
+
+    fn compile_queued(&mut self) {
+        self.kernels.compile_queued(&self.scheduler.logger);
     }
 
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.flush(cubecl_core::server::StreamErrorMode {
-            ignore: false,
-            flush: true,
-        })
+        // Nothing beyond that is the flush's to report: a launch failure
+        // lives on the buffers it left unwritten.
+        stream.flush(stream_id)
     }
 
-    fn sync(&mut self, stream_id: StreamId) -> DynFut<Result<(), ServerError>> {
+    fn sync(
+        &mut self,
+        handles: Vec<BufferBinding>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<(), ServerError>> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        let result = stream.sync();
+        let mut result = stream.flush(stream_id);
+        // The claim check a read would have made, without the read.
+        if result.is_ok() {
+            result = self.scheduler.ensure_written(handles.iter());
+        }
 
         Box::pin(async move { result })
     }
@@ -332,7 +494,7 @@ impl ComputeServer for CpuServer {
     fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.start_profile()
+        stream.start_profile(stream_id)
     }
 
     fn end_profile(
@@ -342,25 +504,13 @@ impl ComputeServer for CpuServer {
     ) -> Result<ProfileDuration, ProfileError> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.end_profile(token)
+        stream.end_profile(token, stream_id)
     }
 
-    fn get_resource(
-        &mut self,
-        binding: Binding,
-        stream_id: StreamId,
-    ) -> Result<ManagedResource<<Self::Storage as ComputeStorage>::Resource>, ServerError> {
-        let mut streams = vec![stream_id];
-        if binding.stream != stream_id {
-            streams.push(binding.stream);
-        }
-        self.scheduler.execute_streams(streams);
-
-        let stream = self.scheduler.stream(&binding.stream);
-        let memory = binding.memory.clone();
-        let resource = stream.get_resource(binding)?;
-
-        Ok(ManagedResource::new(memory, resource))
+    fn abandon_profile(&mut self, stream_id: StreamId, token: ProfilingToken) {
+        // No `execute_streams`: an abandon measures nothing, so it leaves the
+        // stream's queued work where it found it.
+        self.scheduler.stream(&stream_id).abandon_profile(token);
     }
 
     fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId) {
@@ -369,9 +519,7 @@ impl ComputeServer for CpuServer {
     }
 }
 
-impl ServerCommunication for CpuServer {
-    const SERVER_COMM_ENABLED: bool = false;
-}
+impl ServerCommunication for CpuServer {}
 
 pub(crate) fn contiguous_strides(shape: &Shape) -> Strides {
     let rank = shape.len();
@@ -380,4 +528,31 @@ pub(crate) fn contiguous_strides(shape: &Shape) -> Strides {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     strides
+}
+
+impl ServerStorage for CpuServer {
+    type Storage = BytesStorage;
+
+    fn get_resource(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<ManagedResource<<Self::Storage as ComputeStorage>::Resource>, ServerError> {
+        // The same claim check a read makes: a buffer a failed launch never
+        // filled reports the failure rather than handing back a pointer to
+        // whatever was there before.
+        self.scheduler.ensure_written([&binding].into_iter())?;
+        let mut streams = vec![stream_id];
+        if binding.stream != stream_id {
+            streams.push(binding.stream);
+        }
+        self.scheduler.execute_streams(streams);
+
+        let stream = self.scheduler.stream(&binding.stream);
+        Ok(stream.memory_management.managed_resource(
+            binding.memory,
+            binding.offset_start,
+            binding.offset_end,
+        )?)
+    }
 }

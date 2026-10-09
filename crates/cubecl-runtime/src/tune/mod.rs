@@ -28,12 +28,19 @@
 
 mod base;
 mod bounds_generator;
+mod eviction;
+mod gathering;
 mod input_generator;
 mod key_generator;
 mod local;
 mod log;
 mod operation;
-// Both are the adaptive strategy, which only the native driver can run.
+// What a tune leaves in the environment beside its answer.
+#[cfg(persistence)]
+mod record;
+// The adaptive strategy, which only the native driver can run.
+#[cfg(not(target_family = "wasm"))]
+mod patience;
 #[cfg(not(target_family = "wasm"))]
 mod sampler;
 #[cfg(not(target_family = "wasm"))]
@@ -46,11 +53,14 @@ mod util;
 
 pub use base::*;
 pub use bounds_generator::*;
+pub use eviction::*;
 pub use input_generator::*;
 pub use key_generator::*;
 pub use local::*;
 pub use log::*;
 pub use operation::*;
+#[cfg(persistence)]
+pub use record::{PlannedCandidate, Trial, TuneRecord};
 pub use tune_benchmark::*;
 pub use tune_cache::*;
 pub use tune_inputs::*;

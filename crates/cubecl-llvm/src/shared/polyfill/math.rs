@@ -1,0 +1,320 @@
+use crate::{
+    prelude::*,
+    shared::polyfill::transcendental::{cos, exp, ln, sin, tanh},
+};
+use cubecl_core::{
+    ir::dialect::{
+        bitwise::{BitwiseNotOp, FindFirstSetOp},
+        cmp::{FClampOp, SClampOp, UClampOp},
+        math::{
+            ArcCoshOp, ArcSinhOp, ArcTanhOp, CosOp, DegreesOp, Dp4aOp, ErfOp, ExpOp, Expm1Op,
+            FModFloorOp, HypotOp, Log1pOp, LogOp, PowiOp, RadiansOp, RecipOp, RhypotOp, RsqrtOp,
+            SModFloorOp, SMulHiOp, SNegOp, SinOp, TanhOp, UMulHiOp,
+        },
+        vector::{FDotOp, MagnitudeOp, NormalizeOp, SDotOp, UDotOp},
+    },
+    prelude::{
+        polyfills::{
+            erf, expand_dp4a_polyfill, expand_himul_sim, expand_s_himul_64, expand_u_himul_64,
+            expm1, log1p, powi_int, recip, to_degrees, to_radians,
+        },
+        *,
+    },
+};
+
+#[op_interface_impl]
+impl LowerOp for Dp4aOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let ctx = scope.ctx();
+        vec![expand_dp4a_polyfill(
+            scope,
+            self.a(ctx),
+            self.b(ctx),
+            self.c(ctx),
+        )]
+    }
+}
+
+macro_rules! lower_unary_math_arith {
+    ($cube_op:ty => $polyfill:ident $(, $gate:path)?) => {
+        #[op_interface_impl]
+        impl LowerOp for $cube_op {
+            $(
+                fn should_lower(&self, ctx: &Context) -> bool {
+                    $gate(self.input(ctx), ctx)
+                }
+            )?
+
+            fn lower(&self, scope: &Scope) -> Vec<Value> {
+                define_scalar!(T);
+                define_size!(S);
+                let value = self.input(scope.ctx());
+                scope.register_value_type::<T, S>(value);
+                vec![$polyfill::expand::<T, S>(scope, value.into()).read_value(scope)]
+            }
+        }
+    };
+}
+
+/// Polynomial approximations are limited to f32 vectors on the CPU, where the alternative is
+/// a scalar libm call per lane. A GPU target scalarizes the vector anyway, so each lane reaches
+/// the same device-library call or hardware instruction a scalar does, faster than the
+/// polynomial and with the scalar's result.
+fn is_cpu_narrow_float_line(input: Value, ctx: &Context) -> bool {
+    ctx.target() == LlvmTarget::Cpu
+        && input.vector_size(ctx) > 1
+        && !input.scalar_ty(ctx).is_float64(ctx)
+}
+
+lower_unary_math_arith!(ExpOp => exp, is_cpu_narrow_float_line);
+lower_unary_math_arith!(LogOp => ln, is_cpu_narrow_float_line);
+lower_unary_math_arith!(SinOp => sin, is_cpu_narrow_float_line);
+lower_unary_math_arith!(CosOp => cos, is_cpu_narrow_float_line);
+lower_unary_math_arith!(TanhOp => tanh, is_cpu_narrow_float_line);
+
+macro_rules! lower_binary_math_arith {
+    ($cube_op:ty => $polyfill:ident) => {
+        #[op_interface_impl]
+        impl LowerOp for $cube_op {
+            fn lower(&self, scope: &Scope) -> Vec<Value> {
+                define_scalar!(T);
+                define_size!(S);
+                let lhs = self.lhs(scope.ctx());
+                let rhs = self.rhs(scope.ctx());
+                scope.register_value_type::<T, S>(lhs);
+                vec![$polyfill::expand::<T, S>(scope, lhs.into(), rhs.into()).read_value(scope)]
+            }
+        }
+    };
+}
+
+lower_binary_math_arith!(HypotOp => hypot);
+lower_binary_math_arith!(RhypotOp => rhypot);
+
+#[cube]
+fn dot<T: Numeric, N: Size>(rhs: Vector<T, N>, lhs: Vector<T, N>) -> T {
+    (rhs * lhs).vector_sum()
+}
+
+lower_binary_math_arith!(FDotOp => dot);
+lower_binary_math_arith!(UDotOp => dot);
+lower_binary_math_arith!(SDotOp => dot);
+
+#[cube]
+pub fn powi<T: Float, N: Size>(base: Vector<T, N>, exp: Vector<i32, N>) -> Vector<T, N> {
+    let one_u = Vector::<i32, N>::new(1);
+    let one_t = Vector::<T, N>::new(T::from_int(1));
+
+    let neg = exp.less_than(&Vector::<i32, N>::new(0));
+    let mut e = select_many(neg, Vector::<i32, N>::new(0) - exp, exp);
+
+    let bits = 32;
+
+    let mut acc = one_t;
+    let mut sq = base;
+
+    for _ in 0..bits {
+        // TODO: Optimize masked multiplication.
+        acc *= select_many((e & one_u).equal(&one_u), sq, one_t);
+        sq *= sq;
+        e >>= one_u;
+    }
+
+    select_many(neg, one_t / acc, acc)
+}
+
+#[op_interface_impl]
+impl LowerOp for PowiOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        define_scalar!(T);
+        define_size!(S);
+        let lhs = self.lhs(scope.ctx());
+        let rhs = self.rhs(scope.ctx());
+        scope.register_value_type::<T, S>(lhs);
+
+        let ty = lhs.scalar_ty(scope.ctx());
+        let result = if ty.is_int(scope.ctx()) || ty.is_index(scope.ctx()) {
+            powi_int::expand::<T, S>(scope, lhs.into(), rhs.into()).read_value(scope)
+        } else {
+            powi::expand::<T, S>(scope, lhs.into(), rhs.into()).read_value(scope)
+        };
+        vec![result]
+    }
+}
+
+#[cube]
+fn f_mod_floor<F: Float, N: Size>(lhs: Vector<F, N>, rhs: Vector<F, N>) -> Vector<F, N> {
+    lhs - rhs * (lhs / rhs).floor()
+}
+
+lower_binary_math_arith!(FModFloorOp => f_mod_floor);
+
+#[cube]
+fn s_mod_floor<I: Int, N: Size>(lhs: Vector<I, N>, rhs: Vector<I, N>) -> Vector<I, N> {
+    let zero = Vector::<I, N>::zero();
+    let rem = lhs % rhs;
+    let signs_differ = rem.less_than(&zero).not_equal(&rhs.less_than(&zero));
+    let needs_fixup = rem.not_equal(&zero).vec_and(signs_differ);
+    select_many(needs_fixup, rem + rhs, rem)
+}
+
+lower_binary_math_arith!(SModFloorOp => s_mod_floor);
+
+#[cube]
+fn arc_sinh<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    (x + (x * x + Vector::one()).sqrt()).ln()
+}
+
+lower_unary_math_arith!(ArcSinhOp => arc_sinh);
+
+#[cube]
+fn arc_cosh<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    (x + (x * x - Vector::one()).sqrt()).ln()
+}
+
+lower_unary_math_arith!(ArcCoshOp => arc_cosh);
+
+#[cube]
+fn arc_tanh<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    Vector::new(F::new(0.5f32)) * ((Vector::one() + x) / (Vector::one() - x)).ln()
+}
+
+lower_unary_math_arith!(ArcTanhOp => arc_tanh);
+
+lower_unary_math_arith!(DegreesOp => to_degrees);
+lower_unary_math_arith!(RadiansOp => to_radians);
+lower_unary_math_arith!(Log1pOp => log1p);
+lower_unary_math_arith!(Expm1Op => expm1);
+
+#[cube]
+fn inverse_sqrt<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    Vector::one() / x.sqrt()
+}
+
+lower_unary_math_arith!(RsqrtOp => inverse_sqrt);
+lower_unary_math_arith!(ErfOp => erf);
+lower_unary_math_arith!(RecipOp => recip);
+
+#[cube]
+fn neg<I: Int, N: Size>(x: Vector<I, N>) -> Vector<I, N> {
+    Vector::zero() - x
+}
+
+lower_unary_math_arith!(SNegOp => neg);
+
+#[cube]
+fn magnitude<F: Float, N: Size>(x: Vector<F, N>) -> F {
+    (x * x).vector_sum().sqrt()
+}
+
+lower_unary_math_arith!(MagnitudeOp => magnitude);
+
+#[cube]
+fn normalize<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    let magnitude = Vector::new((x * x).vector_sum().sqrt());
+    x / magnitude
+}
+
+lower_unary_math_arith!(NormalizeOp => normalize);
+
+#[cube]
+pub fn find_first_set<I: Int, N: Size>(x: Vector<I, N>) -> Vector<u32, N> {
+    select_many(
+        x.equal(&Vector::zero()),
+        Vector::zero(),
+        x.trailing_zeros() + Vector::one(),
+    )
+}
+
+lower_unary_math_arith!(FindFirstSetOp => find_first_set);
+
+#[cube]
+fn bitwise_not<I: Int, N: Size>(x: Vector<I, N>) -> Vector<I, N> {
+    x ^ Vector::from_int(-1)
+}
+
+lower_unary_math_arith!(BitwiseNotOp => bitwise_not);
+
+#[op_interface_impl]
+impl LowerOp for SMulHiOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let ctx = scope.ctx();
+        let lhs = self.lhs(ctx);
+        let val = if lhs.size_bits(ctx) == 32 {
+            expand_s_himul_64(scope, lhs, self.rhs(ctx))
+        } else {
+            expand_himul_sim(scope, lhs, self.rhs(ctx))
+        };
+        vec![val]
+    }
+}
+
+#[op_interface_impl]
+impl LowerOp for UMulHiOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let ctx = scope.ctx();
+        let lhs = self.lhs(ctx);
+        let val = if lhs.size_bits(ctx) == 32 {
+            expand_u_himul_64(scope, lhs, self.rhs(ctx))
+        } else {
+            expand_himul_sim(scope, lhs, self.rhs(ctx))
+        };
+        vec![val]
+    }
+}
+
+macro_rules! lower_clamp_math_arith {
+    ($cube_op:ty => $polyfill:ident) => {
+        #[op_interface_impl]
+        impl LowerOp for $cube_op {
+            fn lower(&self, scope: &Scope) -> Vec<Value> {
+                define_scalar!(T);
+                define_size!(S);
+                let ctx = scope.ctx();
+                let input = self.input(ctx);
+                let min = self.min(ctx);
+                let max = self.max(ctx);
+                scope.register_value_type::<T, S>(input);
+                let val = $polyfill::expand::<T, S>(scope, input.into(), min.into(), max.into())
+                    .read_value(scope);
+                vec![val]
+            }
+        }
+    };
+}
+
+#[cube]
+fn clamp_op<T: Int, N: Size>(
+    value: Vector<T, N>,
+    min: Vector<T, N>,
+    max: Vector<T, N>,
+) -> Vector<T, N> {
+    value.min(max).max(min)
+}
+
+lower_clamp_math_arith!(SClampOp => clamp_op);
+lower_clamp_math_arith!(UClampOp => clamp_op);
+
+#[cube]
+fn f_clamp_op<T: Float, N: Size>(
+    value: Vector<T, N>,
+    min: Vector<T, N>,
+    max: Vector<T, N>,
+) -> Vector<T, N> {
+    value.min(max).max(min)
+}
+
+lower_clamp_math_arith!(FClampOp => f_clamp_op);
+
+#[op_interface_impl]
+impl LowerOp for cubecl_core::ir::dialect::cmp::FClampNanOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let ctx = scope.ctx();
+        vec![cubecl_core::frontend::polyfills::expand_clamp_nan(
+            scope,
+            self.input(ctx),
+            self.min(ctx),
+            self.max(ctx),
+        )]
+    }
+}

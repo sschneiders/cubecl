@@ -1,4 +1,5 @@
 use crate as cubecl;
+use cubecl_runtime::runtime::Runtime;
 
 use cubecl::prelude::*;
 
@@ -54,10 +55,24 @@ fn assign_ref<F: Float>(value: &mut F) {
     *value = F::new(5f32);
 }
 
-pub fn test_kernel_assign_scalar<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+#[cube(launch)]
+fn assign_mut_expression(output: &mut [u32]) {
+    let thread_idx = UNIT_POS as usize;
+    let num_threads = CUBE_DIM as usize;
+    let mut step = 256 / 2usize;
+
+    while step > 0 {
+        for pos in range_stepped(thread_idx, step, num_threads) {
+            output[pos] = 0;
+        }
+        step /= 2;
+    }
+}
+
+pub fn test_kernel_assign_scalar<R: Runtime, F: Float + CubeElement>(client: Client) {
     let handle = client.create_from_slice(F::as_bytes(&[F::new(0.0), F::new(1.0)]));
 
-    kernel_assign::launch::<F, R>(
+    kernel_assign::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new(&client, 1),
@@ -70,10 +85,10 @@ pub fn test_kernel_assign_scalar<R: Runtime, F: Float + CubeElement>(client: Com
     assert_eq!(actual[0], F::new(5.0));
 }
 
-pub fn test_kernel_assign_one_tuple<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_kernel_assign_one_tuple<R: Runtime, F: Float + CubeElement>(client: Client) {
     let handle = client.create_from_slice(F::as_bytes(&[F::new(0.0)]));
 
-    kernel_assign_one_tuple::launch::<F, R>(
+    kernel_assign_one_tuple::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new(&client, 1),
@@ -86,12 +101,12 @@ pub fn test_kernel_assign_one_tuple<R: Runtime, F: Float + CubeElement>(client: 
     assert_eq!(actual[0], F::new(5.0));
 }
 
-pub fn test_kernel_add_assign_array<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_kernel_add_assign_array<R: Runtime, F: Float + CubeElement>(client: Client) {
     let handle = client.create_from_slice(F::as_bytes(&[F::new(0.0), F::new(1.0)]));
 
     let vectorization = 2;
 
-    kernel_add_assign_array::launch::<F, R>(
+    kernel_add_assign_array::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new(&client, 1),
@@ -105,12 +120,12 @@ pub fn test_kernel_add_assign_array<R: Runtime, F: Float + CubeElement>(client: 
     assert_eq!(actual[0], F::new(6.0));
 }
 
-pub fn test_kernel_add_assign_vector<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_kernel_add_assign_vector<R: Runtime, F: Float + CubeElement>(client: Client) {
     let handle = client.create_from_slice(F::as_bytes(&[F::new(0.0), F::new(1.0)]));
 
     let vectorization = 2;
 
-    kernel_add_assign_vector::launch::<F, R>(
+    kernel_add_assign_vector::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new(&client, 1),
@@ -125,10 +140,10 @@ pub fn test_kernel_add_assign_vector<R: Runtime, F: Float + CubeElement>(client:
     assert_eq!(actual[1], F::new(2.0));
 }
 
-pub fn test_kernel_assign_ref<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_kernel_assign_ref<R: Runtime, F: Float + CubeElement>(client: Client) {
     let handle = client.create_from_slice(F::as_bytes(&[F::new(0.0), F::new(1.0)]));
 
-    kernel_assign_ref::launch::<F, R>(
+    kernel_assign_ref::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new(&client, 1),
@@ -139,6 +154,21 @@ pub fn test_kernel_assign_ref<R: Runtime, F: Float + CubeElement>(client: Comput
     let actual = F::from_bytes(&actual);
 
     assert_eq!(actual[0], F::new(5.0));
+}
+
+pub fn test_assign_mut_expr<R: Runtime>(client: Client) {
+    let output = client.empty(128 * size_of::<u32>());
+
+    unsafe {
+        assign_mut_expression::launch(
+            &client,
+            CubeCount::new_1d(1),
+            CubeDim::new_1d(1),
+            BufferArg::from_raw_parts(output.clone(), 128),
+        );
+    }
+
+    client.read_one(output).unwrap();
 }
 
 #[allow(missing_docs)]
@@ -188,6 +218,13 @@ macro_rules! testgen_assign {
             cubecl_core::runtime_tests::assign::test_kernel_assign_ref::<TestRuntime, FloatType>(
                 client,
             );
+        }
+
+        #[ignore = "Broken right now, should be fixed with future frontend work"]
+        #[$crate::runtime_tests::test_log::test]
+        fn test_assign_mut_expr() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::assign::test_assign_mut_expr::<TestRuntime>(client);
         }
     };
 }

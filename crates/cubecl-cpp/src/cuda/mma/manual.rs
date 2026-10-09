@@ -1,0 +1,287 @@
+use cubecl_core::{
+    cmma::{MatrixIdent, MatrixType},
+    ir::{
+        ElemType, FloatKind, IntKind, UIntKind,
+        dialect::matrix::{ColIndexOp, RowIndexOp},
+        features::{MmaConfig, ScaledMmaConfig},
+        interfaces::TypedExt,
+        prelude::*,
+    },
+    prelude::*,
+};
+use itertools::Itertools;
+use pliron::r#type::TypedHandle;
+
+use cubecl_core::prelude::polyfills::mma::{col_index, row_index};
+
+use crate::{
+    cuda::arch::CudaArchitecture,
+    shared::{
+        Architecture, SupportedMmaCombinations, SupportedScaledMmaCombinations, lowering::LowerOp,
+    },
+    target::Cuda,
+};
+
+#[op_interface_impl]
+impl LowerOp<Cuda> for RowIndexOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let matrix = *self.matrix_ty(scope.ctx()).deref(scope.ctx());
+        let elems_per_reg = 32 / matrix.unpacked_elem_size_bits(scope.ctx());
+        let lane_id = self.lane_id(scope.ctx());
+        let i = self.i(scope.ctx());
+        let out = row_index::expand(scope, lane_id.into(), i.into(), elems_per_reg, matrix.ident);
+        vec![out.value(scope)]
+    }
+}
+
+#[op_interface_impl]
+impl LowerOp<Cuda> for ColIndexOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let matrix = *self.matrix_ty(scope.ctx()).deref(scope.ctx());
+        let elems_per_reg = 32 / matrix.unpacked_elem_size_bits(scope.ctx());
+        let lane_id = self.lane_id(scope.ctx());
+        let i = self.i(scope.ctx());
+        let out = col_index::expand(scope, lane_id.into(), i.into(), elems_per_reg, matrix.ident);
+        vec![out.value(scope)]
+    }
+}
+
+pub fn supported_mma_combinations(arch: &CudaArchitecture) -> SupportedMmaCombinations {
+    if !arch.tensor_cores {
+        return vec![];
+    }
+    let mut result: SupportedMmaCombinations = vec![];
+    // Higher than WMMA because we only support the newest shapes. Other shapes would make things
+    // very complicated.
+    // Also only use f32 accumulators for now
+    if arch.get_version() >= 80 {
+        result.extend([
+            MmaConfig {
+                a_type: ElemType::Float(FloatKind::F16),  // a
+                b_type: ElemType::Float(FloatKind::F16),  // b
+                cd_type: ElemType::Float(FloatKind::F32), // cd
+                m: 16,
+                n: 8,
+                k: 16,
+            },
+            MmaConfig {
+                a_type: ElemType::Float(FloatKind::BF16),
+                b_type: ElemType::Float(FloatKind::BF16),
+                cd_type: ElemType::Float(FloatKind::F32),
+                m: 16,
+                n: 8,
+                k: 16,
+            },
+            MmaConfig {
+                a_type: ElemType::Float(FloatKind::TF32),
+                b_type: ElemType::Float(FloatKind::TF32),
+                cd_type: ElemType::Float(FloatKind::F32),
+                m: 16,
+                n: 8,
+                k: 8,
+            },
+            MmaConfig {
+                a_type: ElemType::Int(IntKind::I8),
+                b_type: ElemType::Int(IntKind::I8),
+                cd_type: ElemType::Int(IntKind::I32),
+                m: 16,
+                n: 8,
+                k: 32,
+            },
+            MmaConfig {
+                a_type: ElemType::UInt(UIntKind::U8),
+                b_type: ElemType::UInt(UIntKind::U8),
+                cd_type: ElemType::Int(IntKind::I32),
+                m: 16,
+                n: 8,
+                k: 32,
+            },
+            MmaConfig {
+                a_type: ElemType::Int(IntKind::I8),
+                b_type: ElemType::UInt(UIntKind::U8),
+                cd_type: ElemType::Int(IntKind::I32),
+                m: 16,
+                n: 8,
+                k: 32,
+            },
+            MmaConfig {
+                a_type: ElemType::UInt(UIntKind::U8),
+                b_type: ElemType::Int(IntKind::I8),
+                cd_type: ElemType::Int(IntKind::I32),
+                m: 16,
+                n: 8,
+                k: 32,
+            },
+            // TODO: u4/i4/b1, there's no types for them yet
+        ]);
+    }
+    if arch.get_version() >= 89 {
+        let f8f6f4_types = [
+            FloatKind::E4M3,
+            FloatKind::E5M2,
+            FloatKind::E3M2,
+            FloatKind::E2M3,
+            FloatKind::E2M1,
+        ];
+        let combinations = f8f6f4_types.iter().cartesian_product(f8f6f4_types.iter());
+        result.extend(combinations.map(|(t1, t2)| MmaConfig {
+            a_type: ElemType::Float(*t1),
+            b_type: ElemType::Float(*t2),
+            cd_type: ElemType::Float(FloatKind::F32),
+            m: 16,
+            n: 8,
+            k: 32,
+        }));
+    }
+    // Turing on, not Volta: ptxas refuses `.m16n8k8` below sm_75, and sm_70 has
+    // `m8n8k4` alone. The `k = 8` shape lays its `A` fragment out cell for cell as an `m16n8`
+    // accumulator, so a product's output contracts again without leaving registers: it is kept
+    // beside the `k = 16` one wherever both exist.
+    if arch.get_version() >= 75 {
+        result.push(MmaConfig {
+            a_type: ElemType::Float(FloatKind::F16),
+            b_type: ElemType::Float(FloatKind::F16),
+            cd_type: ElemType::Float(FloatKind::F32),
+            m: 16,
+            n: 8,
+            k: 8,
+        });
+    }
+    if arch.get_version() >= 80 {
+        result.push(MmaConfig {
+            a_type: ElemType::Float(FloatKind::BF16),
+            b_type: ElemType::Float(FloatKind::BF16),
+            cd_type: ElemType::Float(FloatKind::F32),
+            m: 16,
+            n: 8,
+            k: 8,
+        });
+    }
+    result
+}
+
+pub fn supported_scaled_mma_combinations(
+    arch: &CudaArchitecture,
+) -> SupportedScaledMmaCombinations {
+    if !arch.tensor_cores {
+        return vec![];
+    }
+    let mut result: SupportedScaledMmaCombinations = vec![];
+    // sm_120f
+    if arch.get_version() >= 120 && arch.get_version() < 130 {
+        let f8f6f4_types = [
+            FloatKind::E4M3,
+            FloatKind::E5M2,
+            FloatKind::E3M2,
+            FloatKind::E2M3,
+            FloatKind::E2M1,
+        ];
+        let combinations = f8f6f4_types
+            .iter()
+            .flat_map(|t1| f8f6f4_types.iter().map(move |t2| (t1, t2)));
+
+        result.extend(combinations.map(|(t1, t2)| ScaledMmaConfig {
+            a_type: ElemType::Float(*t1),
+            b_type: ElemType::Float(*t2),
+            cd_type: ElemType::Float(FloatKind::F32),
+            scales_type: ElemType::Float(FloatKind::UE8M0),
+            m: 16,
+            n: 8,
+            k: 32,
+            scales_factor: 1,
+        }));
+
+        result.extend([
+            ScaledMmaConfig {
+                a_type: ElemType::Float(FloatKind::E2M1x2),
+                b_type: ElemType::Float(FloatKind::E2M1x2),
+                cd_type: ElemType::Float(FloatKind::F32),
+                scales_type: ElemType::Float(FloatKind::UE8M0),
+                m: 16,
+                n: 8,
+                k: 64,
+                scales_factor: 2,
+            },
+            // Sign of scales is ignored
+            ScaledMmaConfig {
+                a_type: ElemType::Float(FloatKind::E2M1x2),
+                b_type: ElemType::Float(FloatKind::E2M1x2),
+                cd_type: ElemType::Float(FloatKind::F32),
+                scales_type: ElemType::Float(FloatKind::E4M3),
+                m: 16,
+                n: 8,
+                k: 64,
+                scales_factor: 4,
+            },
+        ]);
+    }
+    result
+}
+
+pub fn contiguous_elements_cuda(
+    ctx: &Context,
+    ident: MatrixIdent,
+    matrix: TypedHandle<MatrixType>,
+) -> usize {
+    let elem = matrix.deref(ctx).elem_ty;
+    match ident {
+        MatrixIdent::A | MatrixIdent::B => 32 / elem.size_bits(ctx),
+        MatrixIdent::Accumulator => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supported_mma_combinations;
+    use crate::cuda::arch::CudaArchitecture;
+
+    /// A die with no tensor cores offers no MMA at all, so nothing downstream can pick a tile
+    /// and measure the FP16 pipeline in units that claim tensor hardware.
+    #[test]
+    fn a_turing_die_without_tensor_cores_offers_no_mma() {
+        let turing = |name: &str| CudaArchitecture {
+            version: 75,
+            tensor_cores: CudaArchitecture::has_tensor_cores(75, name),
+        };
+
+        assert!(supported_mma_combinations(&turing("NVIDIA GeForce GTX 1660 SUPER")).is_empty());
+        assert!(!supported_mma_combinations(&turing("NVIDIA GeForce RTX 2060")).is_empty());
+    }
+
+    fn shapes(version: u32) -> Vec<(u32, u32, u32)> {
+        supported_mma_combinations(&CudaArchitecture {
+            version,
+            tensor_cores: true,
+        })
+        .into_iter()
+        .map(|config| (config.m, config.n, config.k))
+        .collect()
+    }
+
+    /// `ptxas -arch=sm_70`: "Feature `.m16n8k8` requires `.target sm_75` or higher".
+    /// Offering it there ends in `LLVM ERROR: Cannot select: intrinsic
+    /// llvm.nvvm.mma.m16n8k8`, which aborts the process rather than failing a launch.
+    #[test]
+    fn volta_is_offered_no_mma_shape() {
+        assert!(shapes(70).is_empty());
+    }
+
+    #[test]
+    fn turing_keeps_its_one_shape() {
+        assert_eq!(shapes(75), vec![(16, 8, 8)]);
+    }
+
+    /// The shapes from 80 on are their own set, reached by a separate branch.
+    #[test]
+    fn ampere_is_offered_more_than_turing() {
+        assert!(shapes(80).len() > shapes(75).len());
+    }
+
+    /// The `k = 8` shape stays offered past Turing: its `A` fragment is an `m16n8`
+    /// accumulator's layout, what a product contracting its own output reads.
+    #[test]
+    fn ampere_keeps_the_half_depth_shape() {
+        assert!(shapes(80).contains(&(16, 8, 8)));
+        assert!(shapes(120).contains(&(16, 8, 8)));
+    }
+}

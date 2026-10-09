@@ -1,14 +1,24 @@
 mod server;
 
-pub(crate) mod command;
+pub(crate) mod artifact;
+pub(crate) mod capture;
 pub(crate) mod context;
-pub(crate) mod fence;
-pub(crate) mod graph;
-pub(crate) mod io;
+pub(crate) mod driver;
+pub(crate) mod events;
+pub(crate) mod modules;
+pub(crate) mod status;
 pub(crate) mod storage;
 pub(crate) mod stream;
 
 pub use server::*;
 pub use storage::*;
 
-pub(crate) const MB: usize = 1024 * 1024;
+/// One unit of work against the device — the shared
+/// [`Command`](cubecl_server::command::Command), driven by [`driver::Hip`].
+pub(crate) type Command<'a> = cubecl_server::command::Command<'a, driver::Hip>;
+
+/// The graphs this device has captured, driven by [`driver::Hip`].
+pub(crate) type Captures = cubecl_server::command::Captures<driver::Hip>;
+
+/// A capture window on one stream, driven by [`driver::Hip`].
+pub(crate) type Window<'c, 'a> = cubecl_server::command::Window<'c, 'a, driver::Hip>;

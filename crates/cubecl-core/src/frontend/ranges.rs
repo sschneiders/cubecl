@@ -1,7 +1,6 @@
 use alloc::boxed::Box;
 use core::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
-
-use cubecl_ir::{Branch, RangeLoop, Value};
+use cubecl_ir::{ExpandValue, OpInserter, dialect::branch::RangeLoopOp};
 use num_traits::NumCast;
 
 use crate as cubecl;
@@ -37,11 +36,15 @@ impl<I: Int> RangeExpand<I> {
 impl<I: Int> Iterable for RangeExpand<I> {
     type Item = NativeExpand<I>;
 
-    fn expand_unroll(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand_unroll(
+        self,
+        scope: &Scope,
+        body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
+    ) {
         iter_expand_unroll(scope, self.start, self.end, false, body);
     }
 
-    fn expand(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand(self, scope: &Scope, body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType)) {
         iter_expand(scope, self.start, self.end, false, body);
     }
 
@@ -129,11 +132,15 @@ impl<I: Int> RangeInclusiveExpand<I> {
 impl<I: Int> Iterable for RangeInclusiveExpand<I> {
     type Item = NativeExpand<I>;
 
-    fn expand_unroll(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand_unroll(
+        self,
+        scope: &Scope,
+        body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
+    ) {
         iter_expand_unroll(scope, self.start, self.last, true, body);
     }
 
-    fn expand(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand(self, scope: &Scope, body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType)) {
         iter_expand(scope, self.start, self.last, true, body);
     }
 
@@ -186,12 +193,16 @@ impl<I: Int> RangeToExpand<I> {
 impl<I: Int> Iterable for RangeToExpand<I> {
     type Item = NativeExpand<I>;
 
-    fn expand_unroll(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand_unroll(
+        self,
+        scope: &Scope,
+        body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
+    ) {
         let start = NativeExpand::from_lit(scope, I::new(0));
         iter_expand_unroll(scope, start, self.end, false, body);
     }
 
-    fn expand(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand(self, scope: &Scope, body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType)) {
         let start = NativeExpand::from_lit(scope, I::new(0));
         iter_expand(scope, start, self.end, false, body);
     }
@@ -241,12 +252,16 @@ impl<I: Int> RangeToInclusiveExpand<I> {
 impl<I: Int> Iterable for RangeToInclusiveExpand<I> {
     type Item = NativeExpand<I>;
 
-    fn expand_unroll(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand_unroll(
+        self,
+        scope: &Scope,
+        body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
+    ) {
         let start = NativeExpand::from_lit(scope, I::new(0));
         iter_expand_unroll(scope, start, self.last, true, body);
     }
 
-    fn expand(self, scope: &Scope, body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
+    fn expand(self, scope: &Scope, body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType)) {
         let start = NativeExpand::from_lit(scope, I::new(0));
         iter_expand(scope, start, self.last, true, body);
     }
@@ -316,7 +331,7 @@ fn iter_expand_unroll<I: Int>(
     start: NativeExpand<I>,
     end: NativeExpand<I>,
     inclusive: bool,
-    mut body: impl FnMut(&Scope, <I as CubeType>::ExpandType),
+    body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
 ) {
     let start = start
         .expand
@@ -347,25 +362,30 @@ fn iter_expand<I: Int>(
     start: NativeExpand<I>,
     end: NativeExpand<I>,
     inclusive: bool,
-    mut body: impl FnMut(&Scope, <I as CubeType>::ExpandType),
+    body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
 ) {
-    let mut child = scope.child();
-    let index_ty = I::__expand_as_type(scope);
-    let i = scope.create_local_mut(index_ty);
-
-    body(&mut child, i.into());
-
     let start = I::__expand_cast_from(scope, start).expand;
-    let end = I::__expand_cast_from(scope, end).expand;
+    let mut end = I::__expand_cast_from(scope, end);
+    let step: ExpandValue = I::new(1).into();
 
-    scope.register(Branch::RangeLoop(Box::new(RangeLoop {
-        i,
-        start,
-        end,
-        step: None,
-        scope: child,
-        inclusive,
-    })));
+    if inclusive {
+        end = end.__expand_add_method(scope, I::new(1).into());
+    }
+
+    let start = start.read_value(scope);
+    let end = end.read_value(scope);
+    let step = step.read_value(scope);
+
+    let range_loop = RangeLoopOp::new(scope.ctx_mut(), start, end, step);
+    let i = range_loop.iter_var(scope.ctx());
+    let body_block = range_loop.loop_body(scope.ctx());
+    let child = scope.loop_child(OpInserter::new_at_block_end(body_block));
+
+    body(&child, i.into());
+    child.terminate_yield();
+
+    register_range_loop::<I>(scope, &range_loop, &child);
+    scope.set_may_return(&[child]);
 }
 
 pub struct SteppedRangeExpand<I: Int> {
@@ -375,30 +395,34 @@ pub struct SteppedRangeExpand<I: Int> {
     inclusive: bool,
 }
 
-impl<I: Int + Into<Value>> Iterable for SteppedRangeExpand<I> {
+impl<I: Int + Into<ExpandValue>> Iterable for SteppedRangeExpand<I> {
     type Item = NativeExpand<I>;
 
-    fn expand(self, scope: &Scope, mut body: impl FnMut(&Scope, <I as CubeType>::ExpandType)) {
-        let child = scope.child();
-        let index_ty = I::__expand_as_type(scope);
-        let i = scope.create_local_mut(index_ty);
+    fn expand(self, scope: &Scope, body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType)) {
+        let mut end = self.end;
+        if self.inclusive {
+            end = end.__expand_add_method(scope, I::new(1).into());
+        }
+
+        let start = self.start.read_value(scope);
+        let end = end.read_value(scope);
+        let step = self.step.read_value(scope);
+
+        let range_loop = RangeLoopOp::new(scope.ctx_mut(), start, end, step);
+        let i = range_loop.iter_var(scope.ctx());
+        let body_block = range_loop.loop_body(scope.ctx());
+        let child = scope.loop_child(OpInserter::new_at_block_end(body_block));
 
         body(&child, i.into());
 
-        scope.register(Branch::RangeLoop(Box::new(RangeLoop {
-            i,
-            start: self.start.expand,
-            end: self.end.expand,
-            step: Some(self.step.expand),
-            scope: child,
-            inclusive: self.inclusive,
-        })));
+        register_range_loop::<I>(scope, &range_loop, &child);
+        scope.set_may_return(&[child]);
     }
 
     fn expand_unroll(
         self,
         scope: &Scope,
-        mut body: impl FnMut(&Scope, <I as CubeType>::ExpandType),
+        body: &mut dyn FnMut(&Scope, <I as CubeType>::ExpandType),
     ) {
         let start = self
             .start

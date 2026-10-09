@@ -3,19 +3,20 @@ use std::println;
 
 use cubecl_common::device::{Device, DeviceId};
 
-use crate::Runtime;
 use crate::prelude::*;
+use cubecl_runtime::runtime::Runtime;
 
 pub fn test_to_client<R: Runtime>() {
-    let type_id = 0;
-    let client = R::client(&Default::default());
-    let device_count = client.device_count(type_id);
+    // Every device the runtime can reach, not just one type: a machine with a
+    // single discrete GPU still has other devices to move data between, and
+    // this test is the only cover for the cross-device transfer path.
+    let devices = R::enumerate_all_devices();
 
-    if device_count < 2 {
+    if devices.len() < 2 {
         return;
     }
 
-    for (device_0, device_1) in num_combination(type_id, device_count as u32) {
+    for (device_0, device_1) in num_combination(&devices) {
         let device_0 = R::Device::from_id(device_0);
         let device_1 = R::Device::from_id(device_1);
 
@@ -40,15 +41,57 @@ pub fn test_to_client<R: Runtime>() {
     }
 }
 
-fn num_combination(type_id: u16, n: u32) -> Vec<(DeviceId, DeviceId)> {
+/// Threads transfer between two devices at once, half in each direction, each sending values no
+/// other thread sends, so receiving another's means two transfers were paired out of order.
+pub fn test_to_client_concurrent<R: Runtime>() {
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 50;
+
+    let devices = R::enumerate_all_devices();
+    if devices.len() < 2 {
+        return;
+    }
+    let device_0 = R::Device::from_id(devices[0]);
+    let device_1 = R::Device::from_id(devices[1]);
+
+    std::thread::scope(|scope| {
+        for thread in 0..THREADS {
+            let (source, destination) = match thread % 2 {
+                0 => (&device_0, &device_1),
+                _ => (&device_1, &device_0),
+            };
+            scope.spawn(move || {
+                let mut source = R::client(source);
+                let destination = R::client(destination);
+
+                for round in 0..ROUNDS {
+                    let expected = [(thread * ROUNDS + round) as f32; 64];
+                    let input = source.create_from_slice(f32::as_bytes(&expected));
+
+                    let output = source.to_client(
+                        input,
+                        &destination,
+                        cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F32),
+                    );
+
+                    let actual = destination.read_one_unchecked(output);
+                    assert_eq!(
+                        f32::from_bytes(&actual),
+                        expected,
+                        "thread {thread} round {round} received another transfer's data"
+                    );
+                }
+            });
+        }
+    });
+}
+
+fn num_combination(devices: &[DeviceId]) -> Vec<(DeviceId, DeviceId)> {
     let mut results = Vec::new();
 
-    for i in 0..n {
-        for j in i + 1..n {
-            results.push((
-                DeviceId::new(type_id, i as u16),
-                DeviceId::new(type_id, j as u16),
-            ));
+    for i in 0..devices.len() {
+        for j in i + 1..devices.len() {
+            results.push((devices[i], devices[j]));
         }
     }
 
@@ -64,6 +107,11 @@ macro_rules! testgen_to_client {
         #[$crate::runtime_tests::test_log::test]
         fn test_to_client() {
             cubecl_core::runtime_tests::to_client::test_to_client::<TestRuntime>();
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_to_client_concurrent() {
+            cubecl_core::runtime_tests::to_client::test_to_client_concurrent::<TestRuntime>();
         }
     };
 }

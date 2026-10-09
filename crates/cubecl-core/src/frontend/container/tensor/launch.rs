@@ -1,13 +1,11 @@
-use core::marker::PhantomData;
-
-use cubecl_ir::{AddressType, Id};
-use cubecl_runtime::{runtime::Runtime, server::CopyDescriptor};
-use cubecl_zspace::{Shape, Strides};
+use cubecl_ir::AddressType;
+use cubecl_runtime::server::CopyDescriptor;
+use cubecl_zspace::{MetadataError, Shape, Strides, Tiling};
 
 use crate::{
     self as cubecl,
     compute::{KernelBuilder, KernelLauncher},
-    frontend::container::slice,
+    frontend::container::{buffer_len::expand_buffer_length_native, slice},
     prelude::*,
 };
 
@@ -22,11 +20,11 @@ pub struct TensorMeta {
 
 /// Argument to be used for [tensors](Tensor) passed as arguments to kernels.
 #[derive(Debug)]
-pub enum TensorArg<R: Runtime> {
+pub enum TensorArg {
     /// The tensor is passed with a tensor handle.
     Handle {
         /// The tensor handle.
-        handle: TensorBinding<R>,
+        handle: TensorBinding,
     },
     /// The tensor is aliasing another input tensor.
     Alias {
@@ -39,25 +37,27 @@ pub enum TensorArg<R: Runtime> {
 
 /// Tensor representation with a reference to the [server handle](cubecl_runtime::server::Handle),
 /// the strides and the shape.
-pub struct TensorBinding<R: Runtime> {
-    pub handle: cubecl_runtime::server::Binding,
+pub struct TensorBinding {
+    pub handle: cubecl_runtime::server::BufferBinding,
     pub strides: Strides,
     pub shape: Shape,
-    pub runtime: PhantomData<R>,
+    /// How many fragments each logical dim is stored as; untiled by default.
+    /// The shape and strides stay physical, as on [`Metadata`](cubecl_zspace::Metadata).
+    pub tiling: Tiling,
 }
 
-impl<R: Runtime> Clone for TensorBinding<R> {
+impl Clone for TensorBinding {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
             strides: self.strides.clone(),
             shape: self.shape.clone(),
-            runtime: PhantomData,
+            tiling: self.tiling,
         }
     }
 }
 
-impl<R: Runtime> TensorBinding<R> {
+impl TensorBinding {
     pub fn size(&self) -> usize {
         self.shape.iter().product()
     }
@@ -66,14 +66,36 @@ impl<R: Runtime> TensorBinding<R> {
     pub fn required_address_type(&self, elem_size: usize) -> AddressType {
         AddressType::from_len(self.handle.size() as usize / elem_size)
     }
+
+    /// This binding with `tiling` labelling its physical dims.
+    ///
+    /// # Errors
+    ///
+    /// When `tiling` does not describe this rank: see [`Tiling::logical_rank`].
+    pub fn with_tiling(mut self, tiling: Tiling) -> Result<Self, MetadataError> {
+        tiling.logical_rank(self.shape.rank())?;
+        self.tiling = tiling;
+        Ok(self)
+    }
+
+    /// An alias reaches its tensor through another argument's dims, which carry
+    /// no tiling of their own, so a tiled binding says so rather than aliasing
+    /// as if it were plain.
+    fn assert_untiled(&self, op: &str) {
+        assert!(
+            !self.tiling.is_tiled(),
+            "TensorBinding::{op} on a storage-tiled binding is not supported: {:?}",
+            self.tiling
+        );
+    }
 }
 
-impl<R: Runtime> core::fmt::Debug for TensorBinding<R> {
+impl core::fmt::Debug for TensorBinding {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(
             f,
-            "TensorHandleRef {{ strides: {:?}, shape: {:?} }}",
-            self.strides, self.shape
+            "TensorHandleRef {{ strides: {:?}, shape: {:?}, tiling: {:?} }}",
+            self.strides, self.shape, self.tiling
         )
     }
 }
@@ -86,23 +108,21 @@ pub struct TensorCompilationArg {
 }
 
 impl<C: CubePrimitive> LaunchArg for Tensor<C> {
-    type RuntimeArg<R: Runtime> = TensorArg<R>;
+    type RuntimeArg = TensorArg;
     type CompilationArg = TensorCompilationArg;
 
-    fn register<R: Runtime>(
-        arg: Self::RuntimeArg<R>,
-        launcher: &mut KernelLauncher<R>,
-    ) -> Self::CompilationArg {
-        let ty = launcher.with_scope(|scope| C::__expand_as_type(scope));
-        let len = arg.size() / ty.vector_size();
+    fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
+        let elem_size = launcher.with_scope(|scope| C::__expand_size(scope));
+        let vector_size = launcher.with_scope(|scope| C::__expand_vector_size(scope));
+        let len = arg.size() / vector_size;
         let meta_arg = TensorMetaLaunch::new(len, arg.shape().len());
         let buffer = match &arg {
             TensorArg::Handle { .. } => BufferCompilationArg { inplace: None },
             TensorArg::Alias { input_pos, .. } => BufferCompilationArg {
-                inplace: Some(*input_pos as Id),
+                inplace: Some(*input_pos),
             },
         };
-        launcher.register_tensor(arg, ty);
+        launcher.register_tensor(arg, elem_size);
         let meta = TensorMeta::register(meta_arg, launcher);
         TensorCompilationArg { meta, buffer }
     }
@@ -122,13 +142,10 @@ impl<C: CubePrimitive> LaunchArg for Tensor<C> {
 }
 
 impl<C: CubePrimitive> LaunchArg for OwnedTensor<C> {
-    type RuntimeArg<R: Runtime> = TensorArg<R>;
+    type RuntimeArg = TensorArg;
     type CompilationArg = TensorCompilationArg;
 
-    fn register<R: Runtime>(
-        arg: Self::RuntimeArg<R>,
-        launcher: &mut KernelLauncher<R>,
-    ) -> Self::CompilationArg {
+    fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
         Tensor::<C>::register(arg, launcher)
     }
 
@@ -141,7 +158,7 @@ impl<C: CubePrimitive> LaunchArg for OwnedTensor<C> {
     }
 }
 
-impl<R: Runtime> TensorArg<R> {
+impl TensorArg {
     /// Create a new tensor argument specified with its vectorization factor.
     ///
     /// # Safety
@@ -157,7 +174,7 @@ impl<R: Runtime> TensorArg<R> {
     }
 
     pub(crate) unsafe fn from_raw_parts_binding(
-        handle: cubecl_runtime::server::Binding,
+        handle: cubecl_runtime::server::BufferBinding,
         strides: Strides,
         shape: Shape,
     ) -> Self {
@@ -198,8 +215,8 @@ impl<R: Runtime> TensorArg<R> {
     }
 }
 
-impl<R: Runtime> TensorArg<R> {
-    pub fn into_buffer_arg(self) -> BufferArg<R> {
+impl TensorArg {
+    pub fn into_buffer_arg(self) -> BufferArg {
         match self {
             TensorArg::Handle { handle } => {
                 let handle = unsafe {
@@ -218,13 +235,14 @@ impl<R: Runtime> TensorArg<R> {
     }
 }
 
-impl<R: Runtime> TensorBinding<R> {
+impl TensorBinding {
     /// Convert the handle into a [tensor argument](TensorArg).
-    pub fn into_tensor_arg(self) -> TensorArg<R> {
+    pub fn into_tensor_arg(self) -> TensorArg {
         TensorArg::Handle { handle: self }
     }
     /// Convert the handle into a [tensor argument](TensorArg).
-    pub fn into_alias(self, index: usize) -> TensorArg<R> {
+    pub fn into_alias(self, index: usize) -> TensorArg {
+        self.assert_untiled("into_alias");
         TensorArg::Alias {
             input_pos: index,
             strides: self.strides,
@@ -232,7 +250,8 @@ impl<R: Runtime> TensorBinding<R> {
         }
     }
     /// Convert the handle into a [tensor argument](TensorArg).
-    pub fn as_alias(&self, index: usize) -> TensorArg<R> {
+    pub fn as_alias(&self, index: usize) -> TensorArg {
+        self.assert_untiled("as_alias");
         TensorArg::Alias {
             input_pos: index,
             strides: self.strides.clone(),
@@ -240,7 +259,7 @@ impl<R: Runtime> TensorBinding<R> {
         }
     }
     /// Convert the handle into a [buffer argument](BufferArg).
-    pub fn into_buffer_arg(self) -> BufferArg<R> {
+    pub fn into_buffer_arg(self) -> BufferArg {
         unsafe { BufferArg::from_raw_parts_binding(self.handle, self.shape.iter().product()) }
     }
 
@@ -265,7 +284,7 @@ impl<R: Runtime> TensorBinding<R> {
     /// If you provide wrong strides or shapes, it might create undefined behavior caused by
     /// out-of-bounds reads and writes.
     pub unsafe fn from_raw_parts_binding(
-        handle: cubecl_runtime::server::Binding,
+        handle: cubecl_runtime::server::BufferBinding,
         strides: Strides,
         shape: Shape,
     ) -> Self {
@@ -273,7 +292,7 @@ impl<R: Runtime> TensorBinding<R> {
             handle,
             strides,
             shape,
-            runtime: PhantomData,
+            tiling: Tiling::UNTILED,
         }
     }
 

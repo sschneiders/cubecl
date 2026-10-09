@@ -24,7 +24,7 @@ pub use cubecl_environment as environment;
 pub use cubecl_environment::future;
 
 use cubecl_ir::VectorSize;
-use cubecl_runtime::client::ComputeClient;
+use cubecl_runtime::client::Client;
 pub use cubecl_runtime::memory_management::MemoryConfiguration;
 use cubecl_runtime::server::CubeCountSelection;
 pub use frontend::cmma;
@@ -39,14 +39,18 @@ pub mod prelude;
 mod pod;
 
 pub use codegen::*;
-pub use cubecl_runtime::runtime::*;
 pub use pod::*;
 
 pub use cubecl_macros::*;
 pub use cubecl_runtime::benchmark;
 pub use cubecl_runtime::client;
-pub use cubecl_runtime::compiler::{CompilationError, Compiler, CubeTask};
+pub use cubecl_runtime::compiler::{CompilationError, Compiler};
+pub use cubecl_runtime::kernel::{CubeKernel, PrecompiledSource, define_kernel};
 pub use cubecl_runtime::memory_management::MemoryUsage;
+pub use cubecl_runtime::memory_management::{
+    AuxiliaryMemoryReport, MemoryPoolKind, MemoryPoolReport, MemoryPoolsReport, MemoryReport,
+    MemoryScope, StreamMemoryReport,
+};
 pub use cubecl_runtime::server;
 pub use cubecl_runtime::throughput;
 pub use cubecl_runtime::tune;
@@ -66,7 +70,9 @@ pub use id::*;
 // Private utils for macros
 #[doc(hidden)]
 pub mod __private {
+    pub use alloc::sync::Arc;
     pub use alloc::{format, vec};
+    pub use cubecl_runtime::runtime::Runtime;
     pub use paste::paste;
 }
 
@@ -74,8 +80,8 @@ pub use prelude::{Assign, IntoRuntime};
 
 /// Calculate the number of cubes required to execute an operation where one cube unit is
 /// assigned to one element.
-pub fn calculate_cube_count_elemwise<R: Runtime>(
-    client: &ComputeClient<R>,
+pub fn calculate_cube_count_elemwise(
+    client: &Client,
     num_elems: usize,
     cube_dim: CubeDim,
 ) -> CubeCount {
@@ -214,7 +220,7 @@ pub fn try_tensor_vector_sizes_perpendicular(
 }
 
 /// Runtime arguments to launch a kernel.
-pub type RuntimeArg<T, R> = <T as LaunchArg>::RuntimeArg<R>;
+pub type RuntimeArg<T> = <T as LaunchArg>::RuntimeArg;
 pub type ExpandType<T> = <T as crate::prelude::CubeType>::ExpandType;
 
 #[cfg(feature = "export_tests")]

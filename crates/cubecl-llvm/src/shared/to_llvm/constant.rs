@@ -1,0 +1,110 @@
+use crate::prelude::*;
+use cubecl_core::ir::{
+    attributes::{BoolAttr, FloatAttr},
+    types::Fp8Format,
+};
+use half::{bf16, f16};
+use pliron::{
+    attribute::boxed_attr_cast,
+    utils::apfloat::{self, Float},
+};
+use pliron_llvm::ops::ZeroOp;
+
+/// LLVM width for vector indices, intrinsic flags and allocation sizes.
+pub const I32_WIDTH: u32 = 32;
+
+pub fn int_attr(ctx: &mut Context, width: u32, value: i128) -> IntegerAttr {
+    let ty = IntegerType::get(ctx, width, Signedness::Signless);
+    IntegerAttr::new(ty, APInt::from_i128(value, bw(width as usize)))
+}
+
+pub fn float_attr(ctx: &Context, ty: TypeHandle, value: f64) -> Option<AttrObj> {
+    Some(if ty.is_float16(ctx) {
+        let value = f16::from_f64(value);
+        FPHalfAttr(apfloat::Half::from_bits(value.to_bits() as u128)).into()
+    } else if ty.is_bfloat16(ctx) {
+        let value = bf16::from_f64(value);
+        FPBFloatAttr(apfloat::BFloat::from_bits(value.to_bits() as u128)).into()
+    } else if ty.is_float32(ctx) || ty.is_tfloat32(ctx) {
+        FPSingleAttr::from(value as f32).into()
+    } else if ty.is_float64(ctx) {
+        FPDoubleAttr::from(value).into()
+    } else {
+        None?
+    })
+}
+
+pub fn insert_int_const(
+    ctx: &mut Context,
+    rewriter: &mut impl Inserter,
+    width: u32,
+    value: i128,
+) -> Value {
+    let attr = int_attr(ctx, width, value);
+    let op = llvm::ConstantOp::new(ctx, Box::new(attr));
+    rewriter.insert_op(ctx, &op);
+    op.get_result(ctx)
+}
+
+pub fn insert_i32_const(ctx: &mut Context, rewriter: &mut impl Inserter, value: i32) -> Value {
+    insert_int_const(ctx, rewriter, I32_WIDTH, value as i128)
+}
+
+pub fn insert_bool_const(ctx: &mut Context, rewriter: &mut impl Inserter, value: bool) -> Value {
+    insert_int_const(ctx, rewriter, 1, value as i128)
+}
+
+pub fn convert_attr(ctx: &mut Context, value: AttrObj) -> AttrObj {
+    if let Some(int) = value.downcast_ref::<IntegerAttr>() {
+        let width = int.get_type().deref(ctx).width();
+        IntegerAttr::new(
+            IntegerType::get(ctx, width, Signedness::Signless),
+            int.value(),
+        )
+        .into()
+    } else if let Some(bool_attr) = value.downcast_ref::<BoolAttr>() {
+        int_attr(ctx, 1, bool_attr.0 as i128).into()
+    } else if let Some(index_attr) = value.downcast_ref::<IndexAttr>() {
+        int_attr(ctx, index_width(ctx), index_attr.0 as i128).into()
+    } else if let Some(float) = value.downcast_ref::<FloatAttr>() {
+        // FP8 constants use their 8-bit encoding.
+        if Fp8Format::of_type(ctx, float.ty).is_some() {
+            return int_attr(ctx, 8, float.val.to_bits() as i128).into();
+        }
+        let val = float.float_type(ctx).value_to_f64(float.val);
+        float_attr(ctx, float.ty, val).unwrap()
+    } else {
+        unreachable!("Attr should be covered")
+    }
+}
+
+pub fn constant_op(ctx: &mut Context, value: AttrObj) -> Ptr<Operation> {
+    if let Some(zero) = value.downcast_ref::<ZeroAttr>() {
+        let ty = cube_type_to_llvm(ctx, zero.ty);
+        ZeroOp::new(ctx, ty).get_operation()
+    } else {
+        let attr = convert_attr(ctx, value);
+        let attr = boxed_attr_cast(attr).unwrap();
+        llvm::ConstantOp::new(ctx, attr).get_operation()
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMDialect for ConstantOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let value = self.get_attr_builtin_constant_value(ctx).unwrap().clone();
+
+        let llvm_const = constant_op(ctx, value);
+        rewriter.insert_operation(ctx, llvm_const);
+
+        let old_op = self.get_operation();
+        rewriter.replace_operation(ctx, old_op, llvm_const);
+
+        Ok(())
+    }
+}

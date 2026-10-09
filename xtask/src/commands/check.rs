@@ -52,22 +52,22 @@ pub(crate) fn handle_command(
 
     // Additional feature-specific checks
     #[cfg(not(target_os = "macos"))]
-    helpers::custom_crates_check(
+    build_helpers::custom_crates_check(
         vec!["cubecl-wgpu"],
         vec!["--features", "spirv"],
         None,
         None,
         "std with SPIR-V compiler",
     )?;
-    helpers::custom_crates_check(
+    build_helpers::custom_crates_check(
         vec!["cubecl-wgpu"],
         vec!["--features", "exclusive-memory-only"],
         None,
         None,
         "std with exclusive_memory_only",
     )?;
-    helpers::custom_crates_check(
-        vec!["cubecl-runtime"],
+    build_helpers::custom_crates_check(
+        vec!["cubecl-runtime", "cubecl-server"],
         vec!["--no-default-features"],
         None,
         None,

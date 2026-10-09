@@ -1,14 +1,18 @@
+#![cfg(any(target_os = "linux", target_os = "windows"))]
+
 //! Validates HIP graph capture/replay on the actual device.
 
 use cubecl_common::bytes::Bytes;
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
+use cubecl_core::runtime_tests::capture_status;
 use cubecl_core::server::Handle;
 use cubecl_hip::HipRuntime;
+use cubecl_server::runtime::Runtime;
 use std::sync::Mutex;
 
-/// Graph capture toggles device-global allocation state (persistent mode) on
-/// the one cached client, so two captures must not overlap — exactly one
+/// Graph capture holds the one cached client's stream for its whole window,
+/// so two captures must not overlap — exactly one
 /// capture at a time per device, as in real use. Serialize the tests instead
 /// of relying on `--test-threads 1`.
 static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
@@ -38,8 +42,8 @@ fn hip_graph_capture_replay() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<HipRuntime>| {
-        add_one::launch::<HipRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -48,7 +52,7 @@ fn hip_graph_capture_replay() {
         );
     };
 
-    // Prepare arms the persistent pool; it is mandatory before a capture.
+    // Prepare starts the warmup run; it is mandatory before a capture.
     client.graph_prepare().expect("graph_prepare");
 
     // Warm up: compile the kernel and allocate every buffer, so capture stays
@@ -62,12 +66,12 @@ fn hip_graph_capture_replay() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Replay executes the recorded launch; the output is input + 1.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
     // Replaying again re-runs it deterministically.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 }
@@ -78,9 +82,9 @@ fn hip_graph_capture_replay() {
 /// holding an allocation node it never frees cannot be relaunched: the first launch succeeds and
 /// every later one fails. Nothing else catches this — instantiation succeeds, and the graph
 /// upload does not inspect memory nodes — so a caller that trusted `stop_capture` would only
-/// discover it on its second replay, far from the cause. Warmup usually leaves the persistent
-/// pool able to serve the recorded run, so real workloads hit the growth path only
-/// intermittently; this forces it by allocating a size the pool has never seen inside the window.
+/// discover it on its second replay, far from the cause. So nothing is allocated while recording:
+/// warmup usually leaves the pools able to serve the recorded run, and this forces the case where
+/// it does not by asking for a size the pools have never seen inside the window.
 #[test]
 fn hip_graph_capture_growing_the_pool_is_rejected() {
     let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -90,8 +94,8 @@ fn hip_graph_capture_growing_the_pool_is_rejected() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<HipRuntime>| {
-        add_one::launch::<HipRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -132,8 +136,8 @@ fn hip_graph_input_rewrite() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<HipRuntime>| {
-        add_one::launch::<HipRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -151,7 +155,7 @@ fn hip_graph_input_rewrite() {
     launch(&client);
     let graph = client.stop_capture().expect("stop_capture");
 
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
@@ -161,7 +165,7 @@ fn hip_graph_input_rewrite() {
         &input,
         Bytes::from_bytes_vec(f32::as_bytes(&[10.0, 20.0, 30.0, 40.0]).to_vec()),
     );
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[11.0, 21.0, 31.0, 41.0]);
 }
@@ -175,11 +179,10 @@ fn hip_graph_input_rewrite() {
 /// reallocates sentinel buffers over its freed slice, then replays.
 ///
 /// The graph's own output stays correct (its first kernel rewrites `tmp`
-/// before the second reads it — write-before-read), and with buffer retention
-/// (`graph_prepare` routes capture-phase allocations into the persistent pool,
-/// warmup populates it, `end_capture` pins those slices) a later allocation
-/// can no longer reuse `tmp`'s slice, so replay does **not** clobber the
-/// sentinels. This is the acceptance test for that retention.
+/// before the second reads it — write-before-read), and because `end_capture`
+/// guards every page the recording touched, a later allocation can no longer
+/// reuse `tmp`'s slice, so replay does **not** clobber the sentinels. This is
+/// the acceptance test for that guard.
 #[test]
 fn hip_graph_intermediate_recycling() {
     let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -189,15 +192,15 @@ fn hip_graph_intermediate_recycling() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(bytes);
 
-    let run = |client: &ComputeClient<HipRuntime>, tmp: &Handle| {
-        add_one::launch::<HipRuntime>(
+    let run = |client: &Client, tmp: &Handle| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
             unsafe { BufferArg::from_raw_parts(input.clone(), n) },
             unsafe { BufferArg::from_raw_parts(tmp.clone(), n) },
         );
-        mul_two::launch::<HipRuntime>(
+        mul_two::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -206,19 +209,18 @@ fn hip_graph_intermediate_recycling() {
         );
     };
 
-    // Prepare: capture-phase allocations now go to the persistent pool and are
-    // snapshotted for retention.
+    // Prepare: the warmup run below leaves the pools holding `tmp`.
     client.graph_prepare().expect("graph_prepare");
 
-    // Warm up so `tmp` is compiled + allocated in the persistent pool (then
-    // freed, so the capture run reuses it without a fresh malloc).
+    // Warm up so `tmp` is compiled and allocated, then freed, so the capture
+    // run reuses its slice without a fresh allocation.
     {
         let tmp = client.empty(bytes);
         run(&client, &tmp);
         let _ = client.read_one(output.clone()).unwrap();
     }
 
-    // Capture the two-kernel computation; `tmp` reuses the warm persistent slice.
+    // Capture the two-kernel computation; `tmp` reuses the warm slice.
     client.start_capture().expect("start_capture");
     let tmp = client.empty(bytes);
     run(&client, &tmp);
@@ -234,7 +236,7 @@ fn hip_graph_intermediate_recycling() {
     // Replay. The graph's own OUTPUT is correct regardless: its first kernel
     // rewrites `tmp` before the second reads it (write-before-read), so
     // external reuse cannot corrupt the graph's result.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out_bytes = client.read_one(output).unwrap();
     let out = f32::from_bytes(&out_bytes);
     println!("graph output: {out:?} (want [4, 6, 8, 10])");
@@ -264,7 +266,7 @@ fn add_one_tensor(input: &Tensor<f32>, output: &mut Tensor<f32>) {
 }
 
 /// Decode-shaped stress: capture a window of many launches (well past the
-/// drop-queue flush threshold of 64 pushes, so the deferred-flush/pool-priming
+/// drop-queue flush threshold of 64 pushes, so the deferred-flush/staging-priming
 /// path is exercised) of a `Tensor` kernel that reads `shape(0)`, forcing
 /// every launch through the dynamic-metadata staging + info-cache path. Then
 /// verify the recorded pass did not execute, two replays re-run it exactly,
@@ -276,7 +278,7 @@ fn hip_graph_many_launches_dynamic_metadata() {
 
     // One pass: ping-pong `dst = src + 1` between `a` and `b`. The identical
     // sequence is run once as warmup and once recorded.
-    fn run_pass(client: &ComputeClient<HipRuntime>, a: &Handle, b: &Handle) {
+    fn run_pass(client: &Client, a: &Handle, b: &Handle) {
         for i in 0..PASS_LAUNCHES {
             let (src, dst) = if i % 2 == 0 { (a, b) } else { (b, a) };
             add_one_tensor::launch(
@@ -336,8 +338,8 @@ fn hip_graph_many_launches_dynamic_metadata() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Warmup + 2 replays = 3 executed passes (the recorded pass ran 0 times).
-    unsafe { graph.replay() };
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(0.0, 3);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),
@@ -353,7 +355,7 @@ fn hip_graph_many_launches_dynamic_metadata() {
     let fresh = f32::as_bytes(&[100.0f32; N]).to_vec();
     client.write(&a, Bytes::from_bytes_vec(fresh.clone()));
     client.write(&b, Bytes::from_bytes_vec(fresh));
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(100.0, 1);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),
@@ -363,4 +365,18 @@ fn hip_graph_many_launches_dynamic_metadata() {
         f32::from_bytes(&client.read_one(b.clone()).unwrap()),
         &exp_b[..]
     );
+}
+
+/// See [`capture_status::a_capture_is_seen_by_every_client_of_its_stream`].
+#[test]
+fn hip_graph_capture_is_seen_by_every_client_of_its_stream() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    capture_status::a_capture_is_seen_by_every_client_of_its_stream::<HipRuntime>();
+}
+
+/// See [`capture_status::a_prepared_capture_ends_at_stop_capture`].
+#[test]
+fn hip_graph_prepared_capture_ends_at_stop_capture() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    capture_status::a_prepared_capture_ends_at_stop_capture::<HipRuntime>();
 }

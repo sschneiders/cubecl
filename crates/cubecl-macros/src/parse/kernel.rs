@@ -8,8 +8,8 @@ use crate::{
 use core::hash::Hash;
 use darling::{FromMeta, ast::NestedMeta, util::Flag};
 use proc_macro2::{Span, TokenStream};
-use quote::{ToTokens, format_ident, quote};
-use std::{collections::HashMap, iter};
+use quote::{ToTokens, quote};
+use std::{collections::BTreeMap, iter};
 use syn::{
     AssocType, Attribute, ConstParam, Expr, GenericArgument, Generics, Ident, ItemFn, LitStr, Path,
     ReturnType, Signature, Type, TypeGroup, TypeParam, TypeParen, Visibility, parse_quote,
@@ -40,6 +40,13 @@ pub(crate) struct KernelArgs {
     pub address_type: AddressType,
 }
 
+pub enum ExecutionMode {
+    /// Checked kernels are safe.
+    Checked,
+    /// Unchecked kernels are unsafe.
+    Unchecked,
+}
+
 #[derive(Default, FromMeta, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum AddressType {
     #[default]
@@ -62,13 +69,12 @@ impl KernelArgs {
 #[derive(Clone)]
 pub struct GenericArg {
     pub expand_ty: syn::Path,
-    pub marker_ty: syn::Ident,
     pub kind: DefineKind,
 }
 
 #[derive(Clone)]
 pub struct GenericAnalysis {
-    pub map: HashMap<syn::Ident, GenericArg>,
+    pub map: BTreeMap<syn::Ident, GenericArg>,
 }
 
 impl GenericAnalysis {
@@ -100,7 +106,7 @@ impl GenericAnalysis {
 
     pub fn register_types(
         &self,
-        mut name_mapping: HashMap<Ident, (Ident, Option<usize>)>,
+        mut name_mapping: BTreeMap<Ident, (Ident, Option<usize>)>,
         scope: TokenStream,
         has_self: bool,
         launch: bool,
@@ -127,7 +133,7 @@ impl GenericAnalysis {
                     continue;
                 }
                 None => match kind {
-                    DefineKind::Type => quote![#ident::as_type_native_unchecked().storage_type()],
+                    DefineKind::Type => quote![#ident::elem_type(&#scope)],
                     DefineKind::Size => quote![#ident::value()],
                 },
             };
@@ -158,7 +164,7 @@ impl GenericAnalysis {
     }
 
     pub fn process_ty(&self, ty: &syn::Type) -> syn::Type {
-        fn process_ty_inner(ty: &mut Type, map: &HashMap<syn::Ident, GenericArg>) {
+        fn process_ty_inner(ty: &mut Type, map: &BTreeMap<syn::Ident, GenericArg>) {
             match ty {
                 Type::Array(type_array) => process_ty_inner(&mut type_array.elem, map),
                 Type::Group(type_group) => process_ty_inner(&mut type_group.elem, map),
@@ -190,7 +196,7 @@ impl GenericAnalysis {
 
         fn process_generic_param_inner(
             arg: &mut GenericArgument,
-            map: &HashMap<syn::Ident, GenericArg>,
+            map: &BTreeMap<syn::Ident, GenericArg>,
         ) {
             match arg {
                 GenericArgument::Type(Type::Path(path))
@@ -221,11 +227,12 @@ impl GenericAnalysis {
     }
 
     pub fn from_generics(generics: &syn::Generics, explicit_defines: bool) -> Self {
-        let mut map = HashMap::new();
+        let mut map = BTreeMap::new();
         let elem_expand = prelude_type("DynamicScalar");
         let size_expand = prelude_type("DynamicSize");
+        let slot = prelude_type("GenericSlot");
 
-        for type_param in generics.type_params() {
+        for (position, type_param) in generics.type_params().enumerate() {
             if type_param.bounds.len() > 1 {
                 continue;
             }
@@ -235,16 +242,18 @@ impl GenericAnalysis {
             {
                 let name = bound.to_string();
                 let ident = type_param.ident.clone();
-                let marker_ty = format_ident!("_{ident}");
+                // Keyed by position, not by kernel, so the same slot in two
+                // kernels is the same type and shares instantiations.
+                let position = proc_macro2::Literal::usize_unsuffixed(position);
+                let marker_ty: syn::Path = parse_quote!(#slot<#position>);
 
                 match name.as_str() {
-                    "Float" | "Int" | "Numeric" | "CubePrimitive" => {
+                    "Float" | "Int" | "Numeric" | "CubePrimitive" | "Complex" => {
                         if explicit_defines {
                             map.insert(
                                 ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#ident),
-                                    marker_ty,
                                     kind: DefineKind::Type,
                                 },
                             );
@@ -253,7 +262,6 @@ impl GenericAnalysis {
                                 ident,
                                 GenericArg {
                                     expand_ty: parse_quote!(#elem_expand<#marker_ty>),
-                                    marker_ty,
                                     kind: DefineKind::Type,
                                 },
                             );
@@ -265,7 +273,6 @@ impl GenericAnalysis {
                                 ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#ident),
-                                    marker_ty,
                                     kind: DefineKind::Size,
                                 },
                             );
@@ -274,7 +281,6 @@ impl GenericAnalysis {
                                 type_param.ident.clone(),
                                 GenericArg {
                                     expand_ty: parse_quote!(#size_expand<#marker_ty>),
-                                    marker_ty,
                                     kind: DefineKind::Size,
                                 },
                             );
@@ -420,7 +426,6 @@ impl KernelFn {
 
 impl Launch {
     pub fn from_item_fn(function: ItemFn, args: KernelArgs) -> syn::Result<Self> {
-        let runtime = prelude_type("Runtime");
         let ret = function.sig.output.clone();
 
         let vis = function.vis;
@@ -476,7 +481,6 @@ impl Launch {
             }
         }
 
-        kernel_generics.params.push(parse_quote![__R: #runtime]);
         let mut launch_generics = kernel_generics.clone();
         launch_generics.params =
             Punctuated::from_iter(iter::once(parse_quote!['kernel]).chain(launch_generics.params));
@@ -616,4 +620,33 @@ pub fn anon_lifetime_to_static(mut ty: Type) -> Type {
 
     map_ty(&mut ty);
     ty
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Each `HashMap` is seeded separately, so a hash-ordered expansion differs between calls.
+    #[test]
+    fn kernel_expansion_is_deterministic() {
+        let item: ItemFn = parse_quote! {
+            pub fn k<A: Float, B: Int, C: Numeric, D: CubePrimitive, E: Float, N: Size, M: Size>(
+                input: &Array<A>,
+                output: &mut Array<B>,
+                #[comptime] c: u32,
+            ) {}
+        };
+        let expand = || {
+            let args: KernelArgs = from_tokens(quote![launch]).unwrap();
+            Launch::from_item_fn(item.clone(), args)
+                .unwrap()
+                .to_token_stream()
+                .to_string()
+        };
+
+        let first = expand();
+        for _ in 0..16 {
+            assert_eq!(expand(), first);
+        }
+    }
 }

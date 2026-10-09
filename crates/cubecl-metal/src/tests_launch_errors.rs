@@ -4,11 +4,9 @@
 //! opaque `CompilationError` Metal's pipeline creation produces when a kernel genuinely
 //! uses more threadgroup memory than the device allows.
 
+use cubecl_core::server::{LaunchError, ResourceLimitError, ServerError};
 use cubecl_core::{self as cubecl, prelude::*};
-use cubecl_core::{
-    Runtime,
-    server::{LaunchError, ResourceLimitError, ServerError},
-};
+use cubecl_server::runtime::Runtime;
 
 type R = crate::MetalRuntime;
 
@@ -30,7 +28,7 @@ fn oversized_shared_memory_is_a_resource_limit_error() {
     let requested_bytes = shared_size * size_of::<u32>();
 
     let handle = client.create_from_slice(u32::as_bytes(&[0]));
-    oversized_smem_kernel::launch::<R>(
+    oversized_smem_kernel::launch(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_1d(1),
@@ -38,20 +36,26 @@ fn oversized_shared_memory_is_a_resource_limit_error() {
         shared_size,
     );
 
-    let err = client
+    // A launch failure is not the flush's to report: it lives on the buffer
+    // the launch never wrote, and the read of it is what surfaces it.
+    client
         .flush()
-        .expect_err("a launch requesting more shared memory than the device limit must fail");
-    let ServerError::ServerUnhealthy { errors, .. } = err else {
-        panic!("expected ServerUnhealthy, got: {err}");
+        .expect("a launch failure is not the flush's to report");
+
+    let err = client
+        .read_one(handle)
+        .expect_err("the launch never wrote the buffer, so the read fails on it");
+    let ServerError::Unwritten { root, .. } = err else {
+        panic!("expected the read to fail on the unwritten buffer, got: {err}");
     };
-    match &errors[0] {
+    match *root {
         ServerError::Launch(LaunchError::TooManyResources(ResourceLimitError::SharedMemory {
             requested,
             max: reported_max,
             ..
         })) => {
-            assert_eq!(*requested, requested_bytes);
-            assert_eq!(*reported_max, max);
+            assert_eq!(requested, requested_bytes);
+            assert_eq!(reported_max, max);
         }
         other => panic!("expected a shared memory resource limit error, got: {other}"),
     }

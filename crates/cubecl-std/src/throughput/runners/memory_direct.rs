@@ -1,75 +1,117 @@
 use cubecl::prelude::*;
 use cubecl_core as cubecl;
-use cubecl_runtime::throughput::{KernelConfig, ThroughputKey};
+use cubecl_runtime::throughput::{KernelConfig, MemorySpec, ThroughputError, ThroughputKey};
 
-use crate::throughput::LaunchConfig;
+use crate::throughput::{
+    LaunchConfig,
+    memory_probe::{self, MemoryProbe},
+};
 
-/// Per-buffer size, clamped to the device's maximum allocation.
-const TARGET_BYTES: usize = 512 * 1024 * 1024;
-
-/// Builds the copy kernel.
-pub fn build_kernel<R: Runtime>(
-    client: &ComputeClient<R>,
+/// Builds the copy kernel, moving `working_set` bytes per pass: half read out
+/// of the input buffer, half written into the output one.
+pub fn build_kernel(
+    client: &Client,
     key: ThroughputKey,
     config: LaunchConfig,
-) -> KernelConfig {
+    spec: MemorySpec,
+) -> Result<KernelConfig, ThroughputError> {
     let client = client.clone();
     let dtype = key.dtype();
 
     let line_bytes = config.vector_size * dtype.size();
+    let probe = MemoryProbe::new(&client, config, line_bytes, spec);
 
-    let max_alloc = client.properties().memory.max_page_size as usize;
-    let target = TARGET_BYTES.min(max_alloc);
+    let [in_handle, out_handle] =
+        memory_probe::reserve(&client, [probe.buffer_bytes, probe.buffer_bytes])?;
+    memory_probe::prime(&client, &in_handle, probe.pool_lines, config, dtype);
 
-    let total_threads = config.cube_count * config.cube_dim;
-    let num_lines = (target / line_bytes).max(total_threads);
-    let bytes = num_lines * line_bytes;
-
-    let in_handle = client.empty(bytes);
-    let out_handle = client.empty(bytes);
-
+    let (verifier, written) = (client.clone(), out_handle.clone());
     let sample = Box::new(move |iterations: usize| {
         let start = cubecl_common::profile::Instant::now();
         unsafe {
             memory_direct_throughput::launch_unchecked(
                 &client,
-                CubeCount::Static(config.cube_count as u32, 1, 1),
-                CubeDim::new(&client, config.cube_dim),
+                CubeCount::Static(probe.cube_count as u32, 1, 1),
+                config.cube_dim,
                 config.vector_size,
-                BufferArg::from_raw_parts(in_handle.clone(), num_lines),
-                BufferArg::from_raw_parts(out_handle.clone(), num_lines),
+                BufferArg::from_raw_parts(in_handle.clone(), probe.pool_lines),
+                BufferArg::from_raw_parts(out_handle.clone(), probe.pool_lines),
+                probe.window_lines,
                 iterations,
-                dtype.into(),
+                probe.blocked,
+                dtype,
             )
         };
+        // A failure is not this sync's to report: `verify` asked the output.
         let _ = cubecl_core::future::block_on(client.sync());
         start.elapsed()
     });
+    memory_probe::verify(&verifier, &sample, &written)?;
 
-    let ops_count = 2 * num_lines * config.vector_size;
+    // One pass moves the window twice: once in, once out.
+    let ops_count = 2 * probe.window_lines * config.vector_size;
 
-    KernelConfig { sample, ops_count }
+    Ok(KernelConfig {
+        sample,
+        ops_count,
+        min_iterations: probe.min_iterations(),
+    })
 }
 
 #[cube(launch_unchecked)]
 pub fn memory_direct_throughput<I: Numeric, N: Size>(
     input: &[Vector<I, N>],
     output: &mut [Vector<I, N>],
+    window: usize,
     n_iter: usize,
-    #[define(I)] _dtype: StorageType,
+    #[comptime] blocked: bool,
+    #[define(I)] _dtype: ElemType,
 ) {
     let len = output.len();
     let stride = CUBE_DIM as usize * CUBE_COUNT;
 
-    let steps = (len - ABSOLUTE_POS).div_ceil(stride).max(1);
+    // From `window` alone rather than from `window - ABSOLUTE_POS`, which
+    // underflows for a thread past the end of a window smaller than the launch.
+    // High threads get one step too many and the bounds check drops it.
+    let steps = window.div_ceil(stride).max(1);
+
+    // Each pass copies the *next* window of the buffers, not the same one
+    // again. A window read repeatedly would be served from cache after the
+    // first pass, and every working set below the cache would report cache
+    // bandwidth instead of what a kernel of that size moves; coming back to a
+    // window only after a whole buffer of traffic keeps it cold.
+    //
+    // It also keeps the addresses moving. A window small enough that every
+    // thread copies a single line would otherwise be loop-invariant, and the
+    // compiler is free to sink such a copy out of the loop and perform it once
+    // — leaving the probe reporting a bandwidth the hardware never moved.
+    let mut start = 0;
 
     for _ in 0..n_iter {
         for step in 0..steps {
-            let idx = ABSOLUTE_POS + (step * stride);
+            // Coalesced spreads one step's addresses across adjacent threads,
+            // which is only fast where those threads share a real plane. A
+            // CPU worker has no such neighbour, so it instead gets a run of
+            // `steps` lines entirely its own.
+            let base = if blocked {
+                ABSOLUTE_POS * steps + step
+            } else {
+                ABSOLUTE_POS + (step * stride)
+            };
 
-            if idx < len {
+            if base < window {
+                let mut idx = start + base;
+                if idx >= len {
+                    idx -= len;
+                }
+
                 output[idx] = input[idx];
             }
+        }
+
+        start += window;
+        if start >= len {
+            start -= len;
         }
     }
 }

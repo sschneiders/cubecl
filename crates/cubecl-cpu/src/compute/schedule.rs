@@ -1,10 +1,14 @@
-use crate::{compiler::mlir_engine::MlirEngine, compute::stream::CpuStream};
+use crate::compute::stream::CpuStream;
 use cubecl_common::bytes::Bytes;
 use cubecl_core::{
     CubeDim, MemoryConfiguration, ir::MemoryDeviceProperties, server::MetadataBindingInfo,
 };
-use cubecl_runtime::{
+use cubecl_environment::stream::StreamId;
+use cubecl_llvm::PlironEngine;
+use cubecl_server::{
     logging::ServerLogger,
+    memory_management::ErrorGraph,
+    server::ServerError,
     storage::{BytesResource, ManagedResource},
     stream::{StreamFactory, scheduler::SchedulerStreamBackend},
 };
@@ -19,7 +23,8 @@ pub enum ScheduleTask {
     },
     /// Represents a task to execute a kernel.
     Execute {
-        mlir_engine: MlirEngine,
+        stream_id: StreamId,
+        pliron_engine: PlironEngine,
         bindings: BindingsResource,
         cube_dim: CubeDim,
         cube_count: [u32; 3],
@@ -35,12 +40,14 @@ impl core::fmt::Debug for ScheduleTask {
                 .field("buffer", buffer)
                 .finish(),
             Self::Execute {
-                mlir_engine: _,
+                stream_id,
+                pliron_engine: _,
                 bindings: _,
                 cube_dim,
                 cube_count,
             } => f
                 .debug_struct("Execute")
+                .field("stream_id", stream_id)
                 .field("cube_dim", cube_dim)
                 .field("cube_count", cube_count)
                 .finish(),
@@ -67,7 +74,6 @@ pub struct ScheduledCpuBackend {
 /// Factory for creating cpu streams with specific configurations.
 #[derive(Debug)]
 pub struct CpuStreamFactory {
-    max_units_per_cube: u32,
     memory_properties: MemoryDeviceProperties,
     memory_config: MemoryConfiguration,
     logger: Arc<ServerLogger>,
@@ -76,27 +82,24 @@ pub struct CpuStreamFactory {
 impl StreamFactory for CpuStreamFactory {
     type Stream = CpuStream;
 
-    fn create(&mut self) -> Self::Stream {
-        CpuStream::new(
-            self.max_units_per_cube,
+    fn create(&mut self) -> Result<Self::Stream, ServerError> {
+        Ok(CpuStream::new(
             self.memory_properties.clone(),
             self.memory_config.clone(),
             self.logger.clone(),
-        )
+        ))
     }
 }
 
 impl ScheduledCpuBackend {
     /// Creates a new [`ScheduledCpuBackend`] with the given configurations.
     pub fn new(
-        max_units_per_cube: u32,
         memory_properties: MemoryDeviceProperties,
         memory_config: MemoryConfiguration,
         logger: Arc<ServerLogger>,
     ) -> Self {
         Self {
             factory: CpuStreamFactory {
-                max_units_per_cube,
                 memory_properties,
                 memory_config,
                 logger,
@@ -110,17 +113,12 @@ impl SchedulerStreamBackend for ScheduledCpuBackend {
     type Stream = CpuStream;
     type Factory = CpuStreamFactory;
 
-    fn enqueue(task: Self::Task, stream: &mut Self::Stream) {
-        stream.enqueue_task(task);
+    fn enqueue(task: Self::Task, stream: &mut Self::Stream, failures: &mut ErrorGraph) {
+        stream.enqueue_task(task, failures);
     }
 
-    fn flush(stream: &mut Self::Stream) {
-        let _ = stream
-            .flush(cubecl_core::server::StreamErrorMode {
-                ignore: true,
-                flush: false,
-            })
-            .ok();
+    fn flush(stream: &mut Self::Stream, _failures: &mut ErrorGraph) {
+        stream.submit();
     }
 
     fn factory(&mut self) -> &mut Self::Factory {

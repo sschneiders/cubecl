@@ -1,121 +1,396 @@
-use cubecl_core::ir::ElemType;
+use cubecl_core::ir::{ElemType, features::Features};
 use cubecl_runtime::{
-    client::ComputeClient,
+    client::Client,
     runtime::Runtime,
-    server::CubeDim,
-    throughput::{ThroughputKey, ThroughputMode, ThroughputValue},
-    tune::{Bounds, Thresholds, Work, calculate_bounds},
+    throughput::{
+        MemoryAccess, MemoryCurve, MemoryPoint, MemorySpec, ThroughputError, ThroughputKey,
+        ThroughputMode, ThroughputValue, sweep_size, working_set_sweep,
+    },
+    tune::{AutotuneBound, Bounds, ResourceBound, Thresholds, Work},
 };
 
-use crate::throughput::{compute_cmma, compute_direct, launch_overhead, memory_direct};
+use crate::throughput::{
+    Arithmetic, CooperativeMatrix, LaunchConfig, PooledProbes, ShapeSweep, WorkerSweep,
+    compute_cmma, compute_direct, launch_overhead, memory_direct, memory_probe, memory_read,
+    memory_write,
+};
 
 /// Measure peak throughput on `device` for each of the given `keys`.
 pub fn device_throughput<R: Runtime>(
     device: &R::Device,
     keys: &[ThroughputKey],
-) -> alloc::vec::Vec<ThroughputValue> {
+) -> alloc::vec::Vec<Result<ThroughputValue, ThroughputError>> {
     let client = R::client(device);
     keys.iter()
-        .map(|key| measure_peak_throughput::<R>(&client, *key))
+        .map(|key| measure_peak_throughput(&client, *key))
         .collect()
+}
+
+/// Measure the memory ceiling across a range of working sets, from a few
+/// kilobytes up to as much as the device will allocate.
+///
+/// One point per size in [`working_set_sweep`], each measured and cached
+/// exactly like the single-size probe, so a curve costs one probe per size on
+/// the first run and nothing afterwards.
+///
+/// Returns an empty curve on WASM.
+pub fn measure_memory_curve(client: &Client, access: MemoryAccess) -> MemoryCurve {
+    let (points, probed) = {
+        // Every point of a sweep asks for the same pool, so the sweep holds one.
+        let _pooled = PooledProbes::enter(client);
+
+        sweep(client, access, |bytes| {
+            ThroughputMode::Memory(MemorySpec::new(access, bytes))
+        })
+    };
+
+    if probed {
+        PooledProbes::cleanup_unless_held(client);
+    }
+
+    MemoryCurve::new(access, points)
+}
+
+fn sweep(
+    client: &Client,
+    access: MemoryAccess,
+    mode: impl Fn(u64) -> ThroughputMode,
+) -> (alloc::vec::Vec<MemoryPoint>, bool) {
+    let mut probed = false;
+
+    let points = working_set_sweep(working_set_cap(client, access))
+        .into_iter()
+        .filter_map(|bytes| {
+            let key = ThroughputKey { mode: mode(bytes) };
+            let (value, ran) = measure(client, key);
+            probed |= ran;
+
+            Some(MemoryPoint {
+                bytes,
+                value: value.ok()?,
+            })
+        })
+        .collect();
+
+    (points, probed)
+}
+
+/// The largest working set `access` can be probed at: the largest window one
+/// buffer holds, times the buffers the access touches.
+fn working_set_cap(client: &Client, access: MemoryAccess) -> u64 {
+    let max_alloc = client.properties().memory.max_page_size;
+
+    memory_probe::window_cap(max_alloc) * access.buffers()
 }
 
 /// Computes the peak throughput for a given runtime and key.
 ///
-/// Native only, panics on WASM
-pub fn measure_peak_throughput<R: Runtime>(
-    client: &ComputeClient<R>,
+/// Native only: a probe blocks on the device, which the browser can't do.
+/// There this reports [`Unsupported`](ThroughputError::Unsupported), so a
+/// roofline bound built from it has no peak and no time limit, and the tune
+/// runs without one rather than not at all.
+///
+/// # Errors
+///
+/// [`Unsupported`](ThroughputError::Unsupported) where the device implements
+/// no such operation, [`NoTiming`](ThroughputError::NoTiming) where it does
+/// and reported no elapsed time, [`Allocation`](ThroughputError::Allocation)
+/// where it has no room for the probe's buffers, [`Launch`](ThroughputError::Launch)
+/// where a memory probe's kernel did not run. None of them is cached, so a
+/// device that was full is measured the next time it is asked.
+pub fn measure_peak_throughput(
+    client: &Client,
     key: ThroughputKey,
-) -> ThroughputValue {
-    let launch_config = launch_config(client, key.dtype());
+) -> Result<ThroughputValue, ThroughputError> {
+    let (value, probed) = measure(client, key);
 
-    let kernel_config = match key.mode {
-        ThroughputMode::ComputeDirect { .. } => {
-            compute_direct::build_kernel(client, key, launch_config)
-        }
-        ThroughputMode::ComputeCmma {
-            config: cmma_config,
-            ..
-        } => {
-            if client.properties().features.matmul.cmma.is_empty() {
-                return ThroughputValue::ZERO;
-            }
-            compute_cmma::build_kernel(client, key, cmma_config, launch_config)
-        }
-        ThroughputMode::Memory => memory_direct::build_kernel(client, key, launch_config),
-        ThroughputMode::Launch => launch_overhead::build_kernel(client, key, launch_config),
-    };
-
-    let value = client.measure_throughput(key, kernel_config);
-
-    client.memory_cleanup();
+    if probed {
+        PooledProbes::cleanup_unless_held(client);
+    }
 
     value
 }
 
-/// Calculates roofline autotune bounds for a given [`Work`] amount and compute throughput key.
+/// The value for `key`, and whether a probe ran for it rather than the cache
+/// answering or the platform declining. Only a probe leaves pools with the
+/// allocator.
+fn measure(
+    client: &Client,
+    key: ThroughputKey,
+) -> (Result<ThroughputValue, ThroughputError>, bool) {
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (client, key);
+        (Err(ThroughputError::Unsupported), false)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        // Errors are never cached, so a declined key would otherwise take
+        // the device on every call.
+        if declined(&client.properties().features, key) {
+            return (Err(ThroughputError::Unsupported), false);
+        }
+
+        let mut probed = false;
+        let value = client.measure_throughput(key, || {
+            // The probe's stream executes whatever the process mode drops: resolved
+            // where its launches are issued, which here is the runner.
+            let measuring = cubecl_runtime::execution::StreamModeOverride::new(
+                cubecl_runtime::execution::StreamMode::Execute,
+                client,
+            );
+
+            probed = true;
+            let value = probe(client, key);
+            core::mem::drop(measuring);
+            value
+        });
+
+        (value, probed)
+    }
+}
+
+/// Measures `key`, in the fastest shape its probe can be launched in.
+fn probe(client: &Client, key: ThroughputKey) -> Result<ThroughputValue, ThroughputError> {
+    let launch_config = LaunchConfig::for_device(client, key.dtype());
+
+    match key.mode {
+        ThroughputMode::ComputeDirect { dtype } => {
+            ShapeSweep::new(compute_direct_shapes(client, dtype, launch_config))
+                .fastest(|(dtype, config)| Ok(compute_direct::build_kernel(client, dtype, config)))
+                .map(|(value, _)| value)
+        }
+        ThroughputMode::ComputeCmma {
+            config: cmma_config,
+            ..
+        } => ShapeSweep::new(alloc::vec![launch_config])
+            .fastest(|config| Ok(compute_cmma::build_kernel(client, key, cmma_config, config)))
+            .map(|(value, _)| value),
+        ThroughputMode::Memory(spec) => {
+            let (value, fastest) = ShapeSweep::new(WorkerSweep::shapes(
+                client,
+                launch_config,
+                spec.access,
+            ))
+            .fastest(|config| match spec.access {
+                MemoryAccess::Copy => memory_direct::build_kernel(client, key, config, spec),
+                MemoryAccess::Read => memory_read::build_kernel(client, key, config, spec),
+                MemoryAccess::Write => memory_write::build_kernel(client, key, config, spec),
+            })?;
+
+            WorkerSweep::remember(client, spec.access, fastest.cube_dim.num_elems());
+
+            Ok(value)
+        }
+        ThroughputMode::Launch => ShapeSweep::new(alloc::vec![launch_config])
+            .fastest(|config| Ok(launch_overhead::build_kernel(client, key, config)))
+            .map(|(value, _)| value),
+    }
+}
+
+/// Whether the device properties alone refuse `key`. A type the backend
+/// cannot lower panics rather than answering, so this runs before any probe.
+fn declined(features: &Features, key: ThroughputKey) -> bool {
+    match key.mode {
+        ThroughputMode::ComputeDirect { dtype } => !features.supports_type(dtype),
+        ThroughputMode::ComputeCmma { dtype, config } => {
+            !CooperativeMatrix::implemented(features, dtype, config)
+        }
+        ThroughputMode::Memory(_) | ThroughputMode::Launch => false,
+    }
+}
+
+/// Every operand type and vector width the arithmetic ceiling for `dtype` is
+/// measured over.
+fn compute_direct_shapes(
+    client: &Client,
+    dtype: ElemType,
+    launch_config: LaunchConfig,
+) -> alloc::vec::Vec<(ElemType, LaunchConfig)> {
+    Arithmetic::dtypes(client, dtype)
+        .into_iter()
+        .flat_map(|dtype| {
+            Arithmetic::widths(client, dtype)
+                .into_iter()
+                .map(move |vector_size| {
+                    (
+                        dtype,
+                        LaunchConfig {
+                            vector_size,
+                            ..launch_config
+                        },
+                    )
+                })
+        })
+        .collect()
+}
+
+/// Both halves of the roofline for a [`Work`] amount, with the memory ceiling a copy's.
 ///
-/// Measures compute and memory peak throughputs along with launch overhead for the runtime client.
-pub fn roofline_bounds<R: Runtime>(
-    client: &ComputeClient<R>,
+/// A copy's traffic runs in both directions, which is the ceiling for a kernel that reads
+/// and writes alike. A kernel bound by one resource states that half alone with
+/// [`compute_bound`] or [`memory_bound`].
+pub fn roofline_bounds(
+    client: &Client,
     compute_key: ThroughputKey,
     work: Work,
     thresholds: Thresholds,
 ) -> Bounds {
-    let memory_key = ThroughputKey {
-        mode: ThroughputMode::Memory,
-    };
-    let launch_key = ThroughputKey {
-        mode: ThroughputMode::Launch,
-    };
-
     Bounds {
-        bounds: calculate_bounds(
-            work,
-            thresholds,
-            &measure_peak_throughput(client, compute_key),
-            &measure_peak_throughput(client, memory_key),
-            &memory_key,
-        ),
-        launch_overhead: measure_peak_throughput(client, launch_key).duration_per_op(),
+        bounds: alloc::vec![
+            compute_bound(client, compute_key, work, thresholds.compute),
+            memory_bound(client, MemoryAccess::Copy, work, thresholds.memory),
+        ],
+        launch_overhead: measure_launch_overhead(client),
     }
 }
 
-/// Hardware execution parameters for launching a compute kernel.
-#[derive(Clone, Copy)]
-pub struct LaunchConfig {
-    /// The number of threads per cube.
-    pub cube_dim: usize,
-    /// The total number of cubes to dispatch.
-    pub cube_count: usize,
-    /// The vectorization factor (e.g., 4 for `vec4` operations).
-    pub vector_size: usize,
-    /// The number of threads in a hardware execution plane.
-    pub plane_size: usize,
+/// The compute half of a roofline: `work`'s operations against the peak of `compute_key`,
+/// close enough to it past `threshold`.
+pub fn compute_bound(
+    client: &Client,
+    compute_key: ThroughputKey,
+    work: Work,
+    threshold: f32,
+) -> AutotuneBound {
+    // An unmeasurable ceiling is zero, which `time_at_peak` declines.
+    let peak = measure_peak_throughput(client, compute_key).unwrap_or(ThroughputValue::ZERO);
+    AutotuneBound {
+        resource: ResourceBound {
+            amount: work.compute_ops,
+            peak_per_s: peak.ops_per_s(),
+        },
+        threshold,
+    }
 }
 
-fn launch_config<R: Runtime>(client: &ComputeClient<R>, dtype: ElemType) -> LaunchConfig {
-    let hardware = &client.properties().hardware;
+/// The memory half of a roofline: `work`'s bytes against the ceiling in the direction
+/// `access` names, at the work's own footprint.
+///
+/// The direction is the caller's because a read-dominated kernel exceeds a copy's
+/// bandwidth, half of which is a direction it never uses. Bounding one by
+/// [`MemoryAccess::Copy`] passes a candidate at a fraction of the bus for close to peak.
+pub fn memory_bound(
+    client: &Client,
+    access: MemoryAccess,
+    work: Work,
+    threshold: f32,
+) -> AutotuneBound {
+    // Past what the device will allocate the probe measures the cap regardless,
+    // so capping the ask keeps one cache entry rather than one per kernel.
+    let footprint = (work.bytes as u64).min(working_set_cap(client, access));
+    let memory_key = ThroughputKey {
+        mode: ThroughputMode::Memory(MemorySpec::new(access, sweep_size(footprint))),
+    };
+    let peak = measure_peak_throughput(client, memory_key).unwrap_or(ThroughputValue::ZERO);
+    AutotuneBound {
+        resource: ResourceBound {
+            amount: work.bytes,
+            peak_per_s: peak.bytes_per_s(&memory_key),
+        },
+        threshold,
+    }
+}
 
-    let plane_size = hardware.plane_size_max.max(1);
-    let requested = (hardware.max_units_per_cube / plane_size * plane_size)
-        .max(plane_size)
-        .min(hardware.max_cube_dim.0);
+/// What one launch costs on top of its kernel, which a time limit allows for.
+pub fn measure_launch_overhead(client: &Client) -> core::time::Duration {
+    let launch_key = ThroughputKey {
+        mode: ThroughputMode::Launch,
+    };
+    measure_peak_throughput(client, launch_key)
+        .map(|value| value.duration_per_op())
+        .unwrap_or_default()
+}
 
-    let cube_dim = CubeDim::new(client, requested as usize).num_elems();
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl_core::ir::{
+        FloatKind,
+        features::{MmaConfig, TypeUsage},
+    };
+    use cubecl_runtime::throughput::{CmmaDims, ComputeCmmaConfig};
 
-    let sms = hardware.num_streaming_multiprocessors.unwrap_or(64);
-    let cube_count = (sms * 32).min(hardware.max_cube_count.0);
+    const F16: ElemType = ElemType::Float(FloatKind::F16);
+    const F32: ElemType = ElemType::Float(FloatKind::F32);
 
-    let vector_size = client
-        .io_optimized_vector_sizes(dtype.size())
-        .next()
-        .unwrap_or(1);
+    const DIMS: CmmaDims = CmmaDims {
+        m: 16,
+        n: 16,
+        k: 16,
+    };
 
-    LaunchConfig {
-        cube_dim: cube_dim as usize,
-        cube_count: cube_count as usize,
-        vector_size,
-        plane_size: plane_size as usize,
+    fn cmma_key(dims: CmmaDims) -> ThroughputKey {
+        ThroughputKey {
+            mode: ThroughputMode::ComputeCmma {
+                dtype: F16,
+                config: ComputeCmmaConfig {
+                    accumulator_type: F32,
+                    cmma_dims: dims,
+                },
+            },
+        }
+    }
+
+    fn cmma_features(dims: CmmaDims) -> Features {
+        let mut features = Features::default();
+
+        features.matmul.cmma.insert(MmaConfig {
+            a_type: F16,
+            b_type: F16,
+            cd_type: F32,
+            m: dims.m as u32,
+            n: dims.n as u32,
+            k: dims.k as u32,
+        });
+
+        features
+    }
+
+    #[test]
+    fn a_type_the_device_cannot_lower_is_declined() {
+        let key = ThroughputKey {
+            mode: ThroughputMode::ComputeDirect { dtype: F16 },
+        };
+
+        assert!(declined(&Features::default(), key));
+
+        let mut features = Features::default();
+        features
+            .types
+            .elem
+            .insert(F16, TypeUsage::Arithmetic.into());
+
+        assert!(!declined(&features, key));
+    }
+
+    #[test]
+    fn a_cmma_shape_the_device_does_not_have_is_declined() {
+        let features = cmma_features(DIMS);
+
+        assert!(!declined(&features, cmma_key(DIMS)));
+        assert!(declined(&features, cmma_key(CmmaDims { k: 8, ..DIMS })));
+        assert!(declined(&Features::default(), cmma_key(DIMS)));
+    }
+
+    #[test]
+    fn memory_and_launch_are_left_to_the_probe() {
+        let features = Features::default();
+
+        for access in [MemoryAccess::Copy, MemoryAccess::Read, MemoryAccess::Write] {
+            let key = ThroughputKey {
+                mode: ThroughputMode::Memory(MemorySpec::new(access, 1024)),
+            };
+
+            assert!(!declined(&features, key));
+        }
+
+        assert!(!declined(
+            &features,
+            ThroughputKey {
+                mode: ThroughputMode::Launch
+            }
+        ));
     }
 }

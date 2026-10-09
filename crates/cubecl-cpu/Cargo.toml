@@ -18,69 +18,66 @@ workspace = true
 [features]
 default = [
     "std",
-    "cubecl-runtime/default",
+    "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
+    "cubecl-llvm/default",
 ]
 
-mlir-dump = []
-std = ["cubecl-runtime/std", "cubecl-common/std", "cubecl-core/std"]
+pliron-dump = ["cubecl-llvm/pliron-dump"]
+persistence = ["cubecl-server/persistence"]
+std = [
+    "cubecl-server/std",
+    "cubecl-common/std",
+    "cubecl-core/std",
+    "cubecl-llvm/std",
+]
 
 tracing = [
-    "cubecl-runtime/tracing",
+    "cubecl-server/tracing",
     "cubecl-common/tracing",
     "cubecl-core/tracing",
-    "cubecl-opt/tracing",
+    "cubecl-llvm/tracing",
 ]
 
 
 [dependencies]
-cubecl-common = { path = "../cubecl-common", version = "=0.11.0-pre.2", default-features = false, features = [
+cubecl-common = { workspace = true, features = [
     "std",
 ] }
-cubecl-environment = { path = "../cubecl-environment", version = "=0.11.0-pre.2", default-features = false }
-cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.2", default-features = false, features = [
+cubecl-core = { workspace = true, features = [
     "std",
 ] }
-cubecl-opt = { path = "../cubecl-opt", version = "=0.11.0-pre.2", default-features = false, features = [
-    "std",
-] }
-cubecl-runtime = { path = "../cubecl-runtime", version = "=0.11.0-pre.2", default-features = false, features = [
-    "channel-mutex",
+cubecl-environment = { workspace = true }
+cubecl-llvm = { workspace = true }
+cubecl-server = { workspace = true, features = [
     "std",
     "storage-bytes",
 ] }
-cubecl-std = { path = "../cubecl-std", version = "=0.11.0-pre.2", default-features = false }
-
+cubecl-std = { workspace = true }
 
 bytemuck = { workspace = true }
-derive-new = { workspace = true }
-half = { workspace = true }
-log = { workspace = true }
-paste = { workspace = true }
-serde = { workspace = true }
-sysinfo = { workspace = true }
-tracel-llvm = { workspace = true }
-smallvec = { workspace = true }
-spin = { workspace = true, features = ["mutex", "spin_mutex"] }
 crossbeam-utils = "0.8.21"
+derive-new = { workspace = true }
+log = { workspace = true }
+pliron = { workspace = true, features = ["std"] }
+spin = { workspace = true, features = ["mutex", "spin_mutex"] }
+sysinfo = { workspace = true }
 
 [target.'cfg(any(target_os = "android", target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
 libc = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+bytemuck = { workspace = true }
 winapi = { workspace = true }
 
 [dev-dependencies]
-cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.2", features = [
+cubecl-core = { workspace = true, default-features = true, features = [
     "export_tests",
 ] }
-cubecl-std = { path = "../cubecl-std", version = "=0.11.0-pre.2", features = [
+cubecl-std = { workspace = true, default-features = true, features = [
     "export_tests",
 ] }
+half = { workspace = true }
 paste = { workspace = true }
-pretty_assertions = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
-
-[build-dependencies]
-tracel-llvm-bundler = { workspace = true }

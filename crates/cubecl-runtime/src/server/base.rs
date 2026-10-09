@@ -1,34 +1,32 @@
-use super::Handle;
+use super::{CaptureStatus, DeviceCaptures, Handle};
+use crate::kernel::BufferIOAttr;
 use crate::{
-    client::ComputeClient,
+    client::Client,
     compiler::CompilationError,
     config::{CubeClRuntimeConfig, RuntimeConfig, compilation::BoundsCheckMode},
-    dry_run::LaunchMode,
+    execution::LaunchMode,
     id::GraphId,
-    kernel::KernelMetadata,
+    kernel::CubeKernel,
     logging::ServerLogger,
     memory_management::{
-        ManagedMemoryHandle, MemoryAllocationMode, MemoryConfiguration, MemoryUsage,
+        ManagedMemoryHandle, ManagedMemoryId, MemoryAllocationMode, StreamMemoryReport,
     },
-    runtime::Runtime,
-    server::Binding,
+    poison::DevicePoison,
+    server::{BufferBinding, KernelResource},
     storage::{ComputeStorage, ManagedResource},
     tma::{OobFill, TensorMapFormat, TensorMapInterleave, TensorMapPrefetch, TensorMapSwizzle},
 };
-use ahash::AHasher;
 use alloc::boxed::Box;
-#[cfg(feature = "profile-tracy")]
-use alloc::format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::{
-    fmt::Debug,
-    hash::{Hash, Hasher},
+    fmt::{Debug, Display},
+    hash::{BuildHasher, Hash},
 };
 use cubecl_common::{
     bytes::Bytes,
-    device::{self, DeviceId},
+    device::{self, DeviceId, ServiceId},
     profile::ProfileDuration,
 };
 use cubecl_environment::backtrace::BackTrace;
@@ -36,13 +34,15 @@ use cubecl_environment::collections::HashSet;
 use cubecl_environment::future::DynFut;
 use cubecl_environment::stream::StreamId;
 use cubecl_environment::sync::RwLock;
-use cubecl_ir::{DeviceProperties, ElemType, StorageType};
+use cubecl_ir::{DeviceProperties, ElemType, TargetProperties, settings::Dim3};
 use cubecl_zspace::{Shape, Strides, metadata::Metadata};
+use derive_more::{Deref, DerefMut, From};
+use foldhash::fast::FixedState;
 use itertools::Itertools;
 use thiserror::Error;
 
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 /// An error during profiling.
 pub enum ProfileError {
     /// An unknown error happened during profiling
@@ -53,7 +53,7 @@ pub enum ProfileError {
         /// The caused of the error
         reason: String,
         /// The captured backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -61,7 +61,22 @@ pub enum ProfileError {
     #[error("No profiling registered\nBacktrace:\n{backtrace}")]
     NotRegistered {
         /// The captured backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// The profiled window resolved no device timing.
+    ///
+    /// Distinct from a zero duration, which is a measurement that came back
+    /// instant. This is the absence of one: nothing the window enqueued was
+    /// timestamped, so the backend has nothing to report. A caller that only
+    /// wants a number can treat it as zero; a caller comparing candidates must
+    /// not, because an absence that reads as zero is the fastest result there
+    /// is and wins every comparison it enters.
+    #[error("The profiled window resolved no device timing\nBacktrace:\n{backtrace}")]
+    NotMeasured {
+        /// The captured backtrace.
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -74,6 +89,15 @@ pub enum ProfileError {
     Server(#[from] Box<ServerError>),
 }
 
+/// A failure during a profiling window invalidates the measurement, whatever
+/// the failure was. Every backend answers a launch, write or replay failure
+/// this way, so the conversion lives here rather than five times over.
+impl From<&ServerError> for ProfileError {
+    fn from(error: &ServerError) -> Self {
+        ProfileError::Server(Box::new(error.clone()))
+    }
+}
+
 impl core::fmt::Debug for ProfileError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!("{self}"))
@@ -81,27 +105,48 @@ impl core::fmt::Debug for ProfileError {
 }
 
 /// Contains many different types that are useful for server implementations and compute clients.
-pub struct ServerUtilities<Server: ComputeServer> {
+pub struct ServerUtilities {
     /// The time when `profile-tracy` is activated.
     #[cfg(feature = "profile-tracy")]
     pub epoch_time: cubecl_environment::time::Instant,
     /// The GPU client when `profile-tracy` is activated.
     #[cfg(feature = "profile-tracy")]
     pub gpu_client: tracy_client::GpuContext,
+    /// The service these utilities belong to: what the handles it allocates
+    /// are stamped with, and what a client compares them against.
+    pub service: ServiceId,
+    /// The runtime name on this device, as logs and cache keys show it:
+    /// `cuda`, `wgpu<spirv>`.
+    pub name: &'static str,
     /// Information shared between all servers.
-    pub properties: DeviceProperties,
+    pub properties: Arc<DeviceProperties>,
     /// Stable hash of the device properties
     pub properties_hash: u64,
-    /// Information specific to the current server.
-    pub info: Server::Info,
+    /// What the target the server compiles for guarantees about its own
+    /// instructions — [`Runtime::target_properties`](crate::runtime::Runtime::target_properties)
+    /// resolved once, when the device came up, rather than on every launch.
+    ///
+    /// A kernel keeps a clone of this `Arc` so it can expand itself on the
+    /// device thread without naming a runtime, so building it per launch
+    /// would put a `TargetProperties` construction — and the allocations
+    /// inside it — on the hot path of every already-compiled kernel.
+    pub target_properties: Arc<TargetProperties>,
     /// The logger based on global cubecl configs.
     pub logger: Arc<ServerLogger>,
     /// How to create the allocation.
-    pub layout_policy: Server::MemoryLayoutPolicy,
+    pub layout_policy: Box<dyn MemoryLayoutPolicy>,
+    /// Whether the server can move data to a peer server of the same runtime
+    /// directly, without a round trip through the host: the device transport
+    /// `Client::has_device_transport` reports. Off unless the backend turns it
+    /// on at init.
+    pub server_comm_enabled: bool,
     /// How to enforce bounds checking on kernels.
     pub check_mode: BoundsCheckMode,
     /// A set containing the ids for which the inter-device communication has already been initialized.
     pub initialized_comms: RwLock<HashSet<CommunicationId>>,
+    /// The graph captures under way on the device, read-only: the streams update them through
+    /// the [`DeviceCaptures`] [`init`](Self::init) returns alongside.
+    pub captures: CaptureStatus,
 }
 
 /// Defines how the memory layout is determined.
@@ -112,47 +157,54 @@ pub trait MemoryLayoutPolicy: Send + Sync + 'static {
     /// single `Binding`.
     fn apply(
         &self,
+        service: ServiceId,
         stream_id: StreamId,
         descriptors: &[MemoryLayoutDescriptor],
     ) -> (Handle, Vec<MemoryLayout>);
 }
 
-impl<Server: core::fmt::Debug> core::fmt::Debug for ServerUtilities<Server>
-where
-    Server: ComputeServer,
-    Server::Info: core::fmt::Debug,
-{
+impl core::fmt::Debug for ServerUtilities {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("ServerUtilities")
             .field("properties", &self.properties)
-            .field("info", &self.info)
+            .field("name", &self.name)
             .field("logger", &self.logger)
             .finish()
     }
 }
 
-impl<S: ComputeServer> ServerUtilities<S> {
-    /// Creates a new server utilities.
-    pub fn new(
+impl ServerUtilities {
+    /// Creates the utilities of a device, with the [captures](DeviceCaptures) its streams
+    /// update.
+    ///
+    /// The utilities are shared with every client and only read the captures; the server hands
+    /// the returned writer to the streams it creates, and to nothing else.
+    pub fn init(
+        service: ServiceId,
+        name: &'static str,
         properties: DeviceProperties,
+        target_properties: TargetProperties,
         logger: Arc<ServerLogger>,
-        info: S::Info,
-        allocator: S::MemoryLayoutPolicy,
-    ) -> Self {
+        allocator: impl MemoryLayoutPolicy,
+    ) -> (Self, DeviceCaptures) {
+        let captures = DeviceCaptures::default();
         // Start a tracy client if needed.
         #[cfg(feature = "profile-tracy")]
         let client = tracy_client::Client::start();
 
-        Self {
+        let utilities = Self {
+            service,
+            name,
             properties_hash: properties.checksum(),
-            properties,
+            properties: Arc::new(properties),
+            target_properties: Arc::new(target_properties),
             logger,
             // Create the GPU client if needed.
             #[cfg(feature = "profile-tracy")]
             gpu_client: client
                 .clone()
                 .new_gpu_context(
-                    Some(&format!("{info:?}")),
+                    Some(name),
                     // In the future should ask the server what makes sense here. 'Invalid' atm is a generic stand-in (Tracy doesn't have CUDA/RocM atm anyway).
                     tracy_client::GpuContextType::Invalid,
                     0,   // Timestamps are manually aligned to this epoch so start at 0.
@@ -161,17 +213,20 @@ impl<S: ComputeServer> ServerUtilities<S> {
                 .unwrap(),
             #[cfg(feature = "profile-tracy")]
             epoch_time: cubecl_environment::time::Instant::now(),
-            info,
-            layout_policy: allocator,
+            layout_policy: Box::new(allocator),
+            server_comm_enabled: false,
             check_mode: CubeClRuntimeConfig::get().compilation.check_mode,
             initialized_comms: RwLock::new(HashSet::default()),
-        }
+            captures: captures.status(),
+        };
+
+        (utilities, captures)
     }
 }
 
 /// Kernel Launch Errors.
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum LaunchError {
     /// The given kernel can't be compiled.
     #[error("A compilation error happened during launch\nCaused by:\n  {0}")]
@@ -185,13 +240,18 @@ pub enum LaunchError {
         /// The caused of the memory error.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
     /// Too many resources were requested
     #[error("Too many resources were requested during launch\n{0}")]
     TooManyResources(#[from] ResourceLimitError),
+
+    /// The device is poisoned: a kernel faulted in a way the driver makes
+    /// sticky (an illegal address, a trap, a hardware fault, etc.)
+    #[error("The device was poisoned during launch\nCaused by:\n  {0}")]
+    DevicePoisoned(#[from] DevicePoison),
 
     /// Unknown launch error.
     #[error(
@@ -201,18 +261,14 @@ pub enum LaunchError {
         /// The caused of the unknown error.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
-
-    /// Can't launch because of an IO Error.
-    #[error("An io error happened during launch\nCaused by:\n  {0}")]
-    IoError(#[from] IoError),
 }
 
 /// Resource limit errors.
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum ResourceLimitError {
     /// Shared memory exceeds maximum
     #[error(
@@ -224,7 +280,7 @@ pub enum ResourceLimitError {
         /// Maximum value
         max: usize,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
     /// Total units exceeds maximum
@@ -237,7 +293,7 @@ pub enum ResourceLimitError {
         /// Maximum value
         max: u32,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
     /// `CubeDim` exceeds maximum
@@ -250,22 +306,29 @@ pub enum ResourceLimitError {
         /// Maximum value
         max: (u32, u32, u32),
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
-    /// Total of cube dim `CubeDim` exceeds maximum
-    #[error(
-        "Max units per cube exceeds maximum bounds.\nRequested {requested}, max is {max}.\nBacktrace\n{backtrace}"
-    )]
-    MaxUnitPerCube {
-        /// Requested value
-        requested: u32,
-        /// Maximum value
-        max: u32,
-        /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
-        backtrace: BackTrace,
-    },
+}
+
+impl LaunchError {
+    /// Whether the device that emitted the error is poisoned.
+    pub fn is_device_poisoned(&self) -> bool {
+        match self {
+            Self::DevicePoisoned(_) => true,
+            Self::CompilationError(error) => error.is_device_poisoned(),
+            _ => false,
+        }
+    }
+
+    /// Whether this is the kernel being refused before it ran.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            Self::CompilationError(error) => error.is_refusal(),
+            Self::TooManyResources(_) => true,
+            _ => false,
+        }
+    }
 }
 
 impl core::fmt::Debug for LaunchError {
@@ -280,17 +343,37 @@ impl core::fmt::Debug for ResourceLimitError {
     }
 }
 
-/// The error returned by the default (unsupported) graph-capture methods.
-fn graph_capture_unsupported() -> ServerError {
-    ServerError::Generic {
-        reason: alloc::string::String::from("graph capture is not supported by this backend"),
-        backtrace: BackTrace::capture(),
+/// A collective operation between the devices of one runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
+pub enum Collective {
+    /// Setting up the communication between a group of devices.
+    CommInit,
+    /// Reducing a buffer across a group of devices.
+    AllReduce,
+    /// Sending a buffer to a peer device.
+    Send,
+    /// Receiving a buffer from a peer device.
+    Recv,
+    /// Waiting for queued collectives to finish.
+    SyncCollective,
+}
+
+impl Display for Collective {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::CommInit => "comm_init",
+            Self::AllReduce => "all_reduce",
+            Self::Send => "send",
+            Self::Recv => "recv",
+            Self::SyncCollective => "sync_collective",
+        })
     }
 }
 
 /// Error that can happen asynchronously while executing registered kernels.
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum ServerError {
     /// A runtime validation error
     #[error(
@@ -300,7 +383,7 @@ pub enum ServerError {
         /// The details of the validation error.
         message: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -310,29 +393,127 @@ pub enum ServerError {
         /// The details of the generic error.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+
+    /// The runtime has no transport between its devices, so the collective was
+    /// not run. Its own variant rather than a `Generic` reason, so a caller can
+    /// tell a runtime that cannot do this apart from a collective that failed.
+    #[error(
+        "{operation} needs a transport between devices, and this runtime has none\nBacktrace:\n{backtrace}"
+    )]
+    NoDeviceTransport {
+        /// The collective that was asked for.
+        operation: Collective,
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// A handle from one service was handed to a client of another: memory
+    /// coordinates mean nothing there, so nothing was run.
+    #[error("A handle of {handle} was used on {client}\nBacktrace:\n{backtrace}")]
+    ForeignHandle {
+        /// The service whose memory the handle addresses.
+        handle: String,
+        /// The service the client reaches.
+        client: String,
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// A caller named a server type the client does not reach. The client is
+    /// erased over its server, so the type it is asked for is checked against
+    /// the one it was built from, and nothing was run.
+    #[error("The client reaches {client}, not a {requested}\nBacktrace:\n{backtrace}")]
+    ServiceMismatch {
+        /// The service the client reaches.
+        client: String,
+        /// The server type the caller asked for.
+        requested: String,
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// The device is poisoned: a kernel faulted in a way the driver makes
+    /// sticky (an illegal address, a trap, a hardware fault, etc.)
+    #[error("The device is poisoned\nCaused by:\n  {0}")]
+    DevicePoisoned(#[from] DevicePoison),
 
     /// A launch error happened
     #[error("A launch error happened\nCaused by:\n  {0}")]
     Launch(#[from] LaunchError),
 
-    /// An execution error happened during profiling
-    #[error("An execution error happened during profiling\nCaused by:\n  {0}")]
-    Profile(#[from] ProfileError),
-
     /// An IO error happened
     #[error("An IO error happened\nCaused by:\n  {0}")]
     Io(#[from] IoError),
 
-    /// The server is an invalid state.
-    #[error("The server is in an invalid state\nCaused by:\n  {}", errors.iter().join("\n"))]
-    ServerUnhealthy {
-        /// The details of the generic error.
+    /// The work writing this buffer was torn down before it could say what
+    /// went wrong: its write scope never reached the exit that names the real
+    /// failure, which a panic mid-launch explains.
+    ///
+    /// This is the provisional error every write scope enters with, so it
+    /// carries no payload and captures no backtrace — a launch that succeeds
+    /// mints one and drops it again, and paying a `String` and a stack walk
+    /// per launch for the message nobody normally reads is the whole reason
+    /// it is a variant rather than a [`Generic`](Self::Generic).
+    #[error(
+        "The work writing this buffer was torn down before it could say what went wrong: its \
+         write scope never reached the exit that names the real failure, which a panic \
+         mid-launch explains"
+    )]
+    TornDown,
+
+    /// The bytes asked about were never written: the work that was going to
+    /// write them failed, or was skipped downstream of a failure. `chain`
+    /// walks from the buffer asked about back toward the root, newest skip
+    /// first, and `root` is the failure that started it.
+    #[error(
+        "The bytes were never written (failure #{failure}, still claiming {claimed} buffer(s))\n{}Caused by:\n  {root}\nAsked at:\n{backtrace}",
+        chain.iter().map(|hop| alloc::format!("  {hop}\n")).collect::<String>()
+    )]
+    Unwritten {
+        /// The failure's id in the device's error store, as printed by every
+        /// other read that trips over the same failure.
+        failure: u64,
+        /// How many buffers the failure still claims.
+        claimed: u32,
+        /// The skip chain from the buffer asked about back toward the root.
+        chain: Vec<String>,
+        /// The failure that started it, backtrace included.
+        root: Box<ServerError>,
+        /// Where the question was asked, so the lazy report and the read that
+        /// tripped over it can be tied together.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// The work did not run, because an input it needed carried a failure.
+    ///
+    /// The report is on the buffers: the work's outputs claim the failure its
+    /// inputs did, so a read of one of them names the root cause and the path
+    /// back to it. This variant says only *that* the caller's work was
+    /// skipped, which is why it carries no payload — the failure the inputs
+    /// held is not the caller's to receive here, and minting a formatted
+    /// message per skip would cost the loop that skips on every iteration.
+    #[error(
+        "The work was skipped: an input carried a failure, and the work's outputs claim it now \
+         — a read of one of them names the root cause"
+    )]
+    Skipped,
+
+    /// More than one thing went wrong at once, and the caller is owed all of
+    /// them: a read naming buffers that several distinct failures claim, or a
+    /// capture that was both doomed and abandoned.
+    #[error("Several failures at once\nCaused by:\n  {}", errors.iter().join("\n"))]
+    Several {
+        /// The failures, in the order they were found.
         errors: Vec<Self>,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 }
@@ -343,35 +524,100 @@ impl Debug for ServerError {
     }
 }
 
-/// How errors are handled in a stream when executing a task.
-#[derive(Clone, Copy)]
-pub struct StreamErrorMode {
-    /// Whether the task still executes even if the stream is in error.
-    pub ignore: bool,
-    /// Whether the errors are flushed by the current task.
-    pub flush: bool,
+impl ServerError {
+    /// The error every collective returns on a runtime with no transport between devices.
+    pub fn no_device_transport(operation: Collective) -> Self {
+        Self::NoDeviceTransport {
+            operation,
+            backtrace: BackTrace::capture(),
+        }
+    }
+
+    /// Whether this is the kernel being refused before it ran, rather than
+    /// something going wrong while running it.
+    ///
+    /// The distinction a test harness or an autotuner needs: a kernel a
+    /// backend cannot build at this configuration is a candidate to drop or a
+    /// case to skip, while a fault, an out-of-memory, an IO failure or a
+    /// kernel that panicked while expanding is a defect that has to be
+    /// reported. Answering it by reading the message is
+    /// how a harness ends up accepting the second as the first.
+    ///
+    /// Walks [`Several`](Self::Several) and [`Unwritten`](Self::Unwritten) to
+    /// the roots, because a read of an unwritten buffer reports the failure
+    /// that stopped its writer and that is where the distinction lives. A
+    /// group answers yes only when every root does: one real failure among
+    /// refusals is still a real failure, and an empty group refuses nothing.
+    pub fn is_refusal(&self) -> bool {
+        match self {
+            Self::Launch(error) => error.is_refusal(),
+            Self::Unwritten { root, .. } => root.is_refusal(),
+            Self::Several { errors, .. } => {
+                !errors.is_empty() && errors.iter().all(Self::is_refusal)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the device that emitted the error is poisoned.
+    ///
+    /// The other half of [`is_refusal`](Self::is_refusal): a refusal says
+    /// "drop this candidate", a poisoned device says "drop the device". Anything
+    /// else — an out-of-memory, a failed copy, a skipped launch — leaves the
+    /// device usable, and redoing the work may well succeed.
+    ///
+    /// Walks [`Several`](Self::Several) and [`Unwritten`](Self::Unwritten) to
+    /// the roots, and answers yes when *any* root poisoned the device: one poisoned
+    /// device among other failures still means nothing on it can be trusted.
+    pub fn is_device_poisoned(&self) -> bool {
+        match self {
+            Self::DevicePoisoned(_) => true,
+            Self::Launch(error) => error.is_device_poisoned(),
+            Self::Io(error) => error.is_device_poisoned(),
+            Self::Unwritten { root, .. } => root.is_device_poisoned(),
+            Self::Several { errors, .. } => errors.iter().any(Self::is_device_poisoned),
+            _ => false,
+        }
+    }
+
+    /// A graph-capture call the stream's lifecycle does not allow — a
+    /// `begin_capture` without `graph_prepare`, a second overlapping capture, a
+    /// replay of an unknown graph, or an operation a capture window cannot
+    /// record. `reason` names the call and what was wrong with it.
+    pub fn graph_state(reason: impl Into<String>) -> Self {
+        Self::Generic {
+            reason: reason.into(),
+            backtrace: BackTrace::capture(),
+        }
+    }
+
+    /// The error the default (unsupported) graph-capture methods return, for a
+    /// backend that has no graph support at all.
+    pub fn graph_capture_unsupported() -> Self {
+        Self::graph_state("graph capture is not supported by this backend")
+    }
 }
 
 /// The compute server is responsible for handling resources and computations over resources.
 ///
 /// Everything in the server is mutable, therefore it should be solely accessed through the
-/// [`ComputeClient`] for thread safety.
-pub trait ComputeServer:
-    Send + core::fmt::Debug + ServerCommunication + device::DeviceService + 'static
-where
-    Self: Sized,
+/// [`Client`] for thread safety.
+pub trait Server:
+    core::any::Any + Send + core::fmt::Debug + ServerCommunication + device::DeviceService + 'static
 {
-    /// The kernel type defines the computation algorithms.
-    type Kernel: KernelMetadata;
-    /// Information that can be retrieved for the runtime.
-    type Info: Debug + Send + Sync;
-    /// Manages how allocations are performed for a server.
-    type MemoryLayoutPolicy: MemoryLayoutPolicy;
-    /// The [storage](ComputeStorage) type defines how data is stored and accessed.
-    type Storage: ComputeStorage;
-
     /// Initializes [memory](ManagedMemoryHandle) on the given [stream](StreamId) with the given size.
-    fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId);
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ServerError`] when the memory could not be initialized, e.g. because the stream
+    /// cannot be created on a poisoned device. The memory then carries the error: the next
+    /// sync point reading that memory reports it.
+    fn initialize_memory(
+        &mut self,
+        memory: ManagedMemoryHandle,
+        size: u64,
+        stream_id: StreamId,
+    ) -> Result<(), ServerError>;
 
     /// Reserves N [Bytes] of the provided sizes to be used as staging to load data.
     fn staging(
@@ -389,9 +635,18 @@ where
     fn logger(&self) -> Arc<ServerLogger>;
 
     /// Retrieve the server utilities.
-    fn utilities(&self) -> Arc<ServerUtilities<Self>>;
+    fn utilities(&self) -> Arc<ServerUtilities>;
 
     /// Given bindings, returns the owned resources as bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Several`] when the work that was supposed to
+    /// write one of these buffers failed, whichever stream it ran on — copying
+    /// bytes out would hand back whatever was in memory before. Every
+    /// implementation asks
+    /// `FailureStore::ensure_written` (in `cubecl-server`) before it copies
+    /// anything.
     fn read(
         &mut self,
         descriptors: Vec<CopyDescriptor>,
@@ -401,15 +656,27 @@ where
     /// Writes the specified bytes into the buffers given
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId);
 
-    /// Wait for the completion of every task in the server.
-    fn sync(&mut self, stream_id: StreamId) -> DynFut<Result<(), ServerError>>;
-
-    /// Given a resource handle, returns the storage resource.
-    fn get_resource(
+    /// Wait for the completion of every task in the server, then answer for
+    /// `handles`: the barrier first, so device faults count, and then the
+    /// claim check a read would have made — a read without the read.
+    ///
+    /// An empty `handles` is the plain barrier plus the device fault, which
+    /// is the only failure left that no buffer can report.
+    fn sync(
         &mut self,
-        binding: Binding,
+        handles: Vec<BufferBinding>,
         stream_id: StreamId,
-    ) -> Result<ManagedResource<<Self::Storage as ComputeStorage>::Resource>, ServerError>;
+    ) -> DynFut<Result<(), ServerError>>;
+
+    /// Whether the bytes the handles name can be trusted, right now and with
+    /// no barrier: the claim check a read makes, without the read. Instant —
+    /// enqueue-time failures only. A device fault needs [`sync`](Self::sync),
+    /// which drains first.
+    fn check(
+        &mut self,
+        handles: Vec<BufferBinding>,
+        stream_id: StreamId,
+    ) -> Result<(), ServerError>;
 
     /// Executes the `kernel` over the given memory `handles`.
     ///
@@ -417,92 +684,122 @@ where
     /// and are responsible of determining which should be read or written.
     ///
     /// `launch_mode` says whether the kernel actually runs. On
-    /// [`LaunchMode::Skip`] the server must still do everything a first launch
+    /// [`LaunchMode::Compile`] the server must still do everything a first launch
     /// does short of dispatching — expand, compile, validate, fill its caches —
-    /// and then drop the launch; skipping the compilation instead would defeat
-    /// the whole point of a [dry run](crate::dry_run).
+    /// and then discard the launch; skipping the compilation instead would defeat
+    /// the whole point of an [override](crate::execution::ProcessModeOverride) that
+    /// drops launches.
     ///
     /// # Safety
     ///
     /// When executing with mode [`ExecutionMode::Unchecked`], out-of-bound reads and writes can happen.
     unsafe fn launch(
         &mut self,
-        kernel: Self::Kernel,
+        kernel: Box<dyn CubeKernel>,
         count: CubeCount,
         bindings: KernelArguments,
-        kind: ExecutionMode,
         stream_id: StreamId,
         launch_mode: LaunchMode,
     );
 
     /// Flush all outstanding tasks in the server.
+    ///
+    /// # Errors
+    ///
+    /// The device fault, when the context itself is broken — a launch failure
+    /// is not the flush's to report: it lives on the buffers the launch left
+    /// unwritten, and surfaces on any read, sync or check of them.
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError>;
 
-    /// Prepare `stream_id` for an upcoming graph capture: route allocations
-    /// into a stable pool and snapshot it, so every buffer allocated between
-    /// here and [`end_capture`](ComputeServer::end_capture) can be pinned for
-    /// the graph's lifetime. Call this **before** the warmup run so the capture
-    /// window itself needs no fresh device allocation — a device malloc inside
-    /// the capture is illegal.
+    /// Compiles every kernel a [`LaunchMode::Queue`] launch queued, now
+    /// rather than inside the next launch, so a measurement that follows
+    /// times its own kernels only.
     ///
-    /// Prefer having kernels already **autotuned before** this call: any
-    /// transient benchmark buffers autotune allocates while the window is armed
-    /// are forced into the persistent pool and pinned to the graph, so a graph
-    /// captured over a cold autotune cache retains more device memory than it
-    /// replays against. Warm the autotune cache first, then `graph_prepare` and
-    /// warm up only to populate the pool.
+    /// A kernel that fails to compile reports it when it is launched, as if
+    /// its launch had compiled it. A no-op by default, for a server that
+    /// queues nothing.
+    fn compile_queued(&mut self) {}
+
+    /// Prepare `stream_id` for an upcoming graph capture. Call this
+    /// **before** the warmup run: the capture window allocates nothing, so it
+    /// reuses what the warmup run left in the pools, and every page the
+    /// recording touches is guarded for the graph's lifetime.
     ///
-    /// A no-op by default (harmless on backends without graph support); a
-    /// hardware-graph backend enables its persistent pool + capture recording.
+    /// Prefer having kernels already **autotuned before** this call, so the
+    /// warmup run allocates what the recorded run asks for and nothing else.
+    ///
+    /// A no-op by default (harmless on backends without graph support).
     fn graph_prepare(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         let _ = stream_id;
         Ok(())
     }
 
     /// Begin recording the launches issued on `stream_id` into a graph instead
-    /// of executing them, so the sequence can later be [replayed](ComputeServer::replay)
-    /// as a single dispatch. Between this call and [`end_capture`](ComputeServer::end_capture)
-    /// the stream must not synchronize or allocate fresh device memory — call
-    /// [`graph_prepare`](ComputeServer::graph_prepare) and warm up first.
+    /// of executing them, so the sequence can later be
+    /// [replayed](Server::replay) without paying the launch path again.
+    /// Call [`graph_prepare`](Server::graph_prepare) and warm up first.
     ///
-    /// The default is unsupported; a backend with hardware graph support (CUDA,
-    /// HIP) overrides these methods.
+    /// Between this call and [`end_capture`](Server::end_capture) the
+    /// stream must not synchronize — a read, a sync or a profile either aborts
+    /// the capture or is refused — and should not allocate fresh device memory,
+    /// which `graph_prepare` plus a warmup run is what avoids. Whether an
+    /// operation the window cannot record fails the call or fails
+    /// `end_capture`, and whether a mid-window allocation is fatal, is the
+    /// backend's to say; see `StreamCapture` in `cubecl-server`.
+    ///
+    /// The default is unsupported. Two shapes of backend override it: a
+    /// **hardware graph** (CUDA, HIP), where the driver records a replayable
+    /// graph object, and a **software graph** (wgpu), where the runtime records
+    /// fully-resolved dispatches and re-encodes them on replay.
     fn begin_capture(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         let _ = stream_id;
-        Err(graph_capture_unsupported())
+        Err(ServerError::graph_capture_unsupported())
     }
 
-    /// Stop recording (see [`begin_capture`](ComputeServer::begin_capture)),
+    /// Stop recording (see [`begin_capture`](Server::begin_capture)),
     /// store the captured graph in the backend's registry, and return its
-    /// [`GraphId`], ready to [replay](ComputeServer::replay).
+    /// [`GraphId`], ready to [replay](Server::replay).
     fn end_capture(&mut self, stream_id: StreamId) -> Result<GraphId, ServerError> {
         let _ = stream_id;
-        Err(graph_capture_unsupported())
+        Err(ServerError::graph_capture_unsupported())
     }
 
-    /// Replay the graph identified by `graph` on `stream_id` — one dispatch that
-    /// re-runs the whole recorded launch sequence against its original buffers.
+    /// Replay the graph identified by `graph` on `stream_id`, re-running the
+    /// whole recorded launch sequence against its original buffers. A hardware
+    /// graph replays as a single dispatch; a software graph re-encodes the
+    /// recorded dispatches, which is still far cheaper than the launch path but
+    /// stays O(n) in recorded launches.
     ///
-    /// Fire-and-forget, like [`launch`](ComputeServer::launch): the call enqueues
-    /// the dispatch and returns without waiting, so a failure is **not** returned
-    /// here — it is pushed onto the stream's error queue and surfaces on the next
-    /// [`flush`](ComputeServer::flush)/[`sync`](ComputeServer::sync), which leaves
-    /// the server unhealthy until drained. A no-op by default: a [`GraphId`] can
-    /// only come from [`end_capture`](ComputeServer::end_capture), unsupported here.
-    fn replay(&mut self, graph: GraphId, stream_id: StreamId) {
+    /// The call enqueues the dispatch and returns without waiting for the
+    /// device; what it reports is the enqueue — an unknown or destroyed
+    /// graph, a refusal — since a caller replaying a graph is standing right
+    /// there. A failure also leaves the graph's write set carrying it, so a
+    /// read of those buffers fails until a replay lands. Unsupported by
+    /// default: a [`GraphId`] can only come from
+    /// [`end_capture`](Server::end_capture).
+    fn replay(&mut self, graph: GraphId, stream_id: StreamId) -> Result<(), ServerError> {
         let _ = (graph, stream_id);
+        Err(ServerError::graph_capture_unsupported())
     }
 
-    /// Release the graph identified by `graph`, destroying its executable and
-    /// unpinning the buffers it retained. The backend must ensure any in-flight
-    /// replay on `stream_id` has completed first (replay returns at enqueue
-    /// time). A no-op by default and for an unknown id.
+    /// Release the graph identified by `graph`, destroying whatever it recorded
+    /// and unpinning the buffers it retained. Replay returns at enqueue time,
+    /// so the backend must guarantee no in-flight replay can still read those
+    /// buffers once they return to the pool — by syncing `stream_id` where
+    /// nothing weaker will do (CUDA, HIP), or by relying on the queue ordering
+    /// that already places a submitted replay ahead of any later write (wgpu).
+    /// A no-op by default and for an unknown id.
     fn graph_destroy(&mut self, graph: GraphId, stream_id: StreamId) {
         let _ = (graph, stream_id);
     }
 
-    /// Memory usage of the given stream.
-    fn memory_usage(&mut self, stream_id: StreamId) -> Result<MemoryUsage, ServerError>;
+    /// Structured per-pool report of the given stream's **main GPU** memory:
+    /// each pool's shape, usage, and high-water marks, in allocation-routing
+    /// order. The read side of a measured memory plan — see
+    /// `MemoryManagement::memory_report` in `cubecl-server`.
+    ///
+    /// `None` when the stream was never created.
+    fn memory_report(&mut self, stream_id: StreamId) -> Option<StreamMemoryReport>;
 
     /// Stream ids the client should iterate to aggregate across the device.
     ///
@@ -514,29 +811,12 @@ where
     }
 
     /// Ask the server to release memory that it can release.
-    fn memory_cleanup(&mut self, stream_id: StreamId);
-
-    /// Install a new dynamic-pool layout for the device's **main GPU** memory.
     ///
-    /// The calling stream's pools are rebuilt in place (see
-    /// [`MemoryManagement::configure`](crate::memory_management::MemoryManagement::configure)
-    /// — a rebuild only happens when nothing is live in them), and the layout
-    /// becomes the one every stream created afterwards is built with. Pool
-    /// layouts are a purely programmatic, runtime setting — there is no
-    /// config-file pathway — so callers size them per workload (e.g. per model,
-    /// just before loading it).
+    /// # Errors
     ///
-    /// Returns `true` when the calling stream's pools were rebuilt now, and
-    /// `false` when they kept the old layout (something was still live in
-    /// them); the layout still applies to streams created afterwards.
-    ///
-    /// The default is a no-op returning `false` for servers without
-    /// configurable pools.
-    fn configure_memory_pools(&mut self, config: MemoryConfiguration, stream_id: StreamId) -> bool {
-        let _ = (config, stream_id);
-        log::warn!("Memory pool configuration isn't supported by this server; keeping defaults");
-        false
-    }
+    /// Refused while a stream records a graph: releasing memory waits on the
+    /// device, and a wait on a stream that records aborts its capture.
+    fn memory_cleanup(&mut self, stream_id: StreamId) -> Result<(), ServerError>;
 
     /// Enable collecting timestamps.
     fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError>;
@@ -548,8 +828,42 @@ where
         token: ProfilingToken,
     ) -> Result<ProfileDuration, ProfileError>;
 
+    /// Drop the window `token` opened without measuring it, for a caller that
+    /// will never close it with [`end_profile`](Self::end_profile).
+    ///
+    /// An open window is not free: depending on the backend it retains
+    /// command buffers, keeps timestamp writes on, or holds a device event.
+    ///
+    /// Every backend overrides this, and should: the default closes the window
+    /// and throws the measurement away, which is the most expensive way to be
+    /// rid of it — [`end_profile`](Self::end_profile) is where the syncing and
+    /// flushing live, and this is the one call that needs none of it.
+    fn abandon_profile(&mut self, stream_id: StreamId, token: ProfilingToken) {
+        let _ = self.end_profile(stream_id, token);
+    }
+
     /// Update the memory mode of allocation in the server.
     fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId);
+}
+
+/// The storage a server allocates from, and the native resources it hands
+/// out. Kept off [`Server`] so that trait is object-safe: a resource's
+/// type is the backend's own, and only a caller that names the backend can
+/// receive one.
+pub trait ServerStorage: Server {
+    /// The [storage](ComputeStorage) type defines how data is stored and accessed.
+    type Storage: ComputeStorage;
+    /// Given a resource handle, returns the storage resource.
+    ///
+    /// The same claim check a read makes guards this too: a buffer a failed
+    /// launch never filled reports the failure rather than handing back a
+    /// pointer to whatever was there before. It costs a field read on a slice
+    /// the resolution walks anyway.
+    fn get_resource(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<ManagedResource<<Self::Storage as ComputeStorage>::Resource>, ServerError>;
 }
 
 /// An ID unique to any unordered combination of devices.
@@ -563,10 +877,8 @@ impl From<Vec<DeviceId>> for CommunicationId {
     fn from(mut value: Vec<DeviceId>) -> Self {
         // Make sure that device ids are sorted so that any combination of the same devices uses the same communicator.
         value.sort();
-        let mut hasher = AHasher::default();
-        value.hash(&mut hasher);
         CommunicationId {
-            id: hasher.finish(),
+            id: FixedState::default().hash_one(value),
         }
     }
 }
@@ -581,10 +893,23 @@ pub enum ReduceOperation {
 
 /// Defines functions for optimized data transfer between servers, supporting custom communication
 /// mechanisms such as peer-to-peer communication or specialized implementations.
+///
+/// # Inside the tainted-buffer rules
+///
+/// A collective reads a source buffer and produces a destination one, and owes
+/// the same two answers the rest of the server gives: ask whether the source
+/// carries a failure on the way in (as [`read`](Server::read) does
+/// through
+/// `FailureStore::ensure_written` in `cubecl-server`),
+/// and taint the destination on the way out when the operation fails (as a
+/// failed [`launch`](Server::launch) does). Skipping either lets a
+/// collective reduce stale bytes across every device in the group, or leave a
+/// destination that reads back clean when nothing wrote it.
+///
+/// The default methods are for a runtime with no transport between its devices:
+/// each returns [`ServerError::NoDeviceTransport`] before touching any buffer, so
+/// there is no destination to taint.
 pub trait ServerCommunication {
-    /// Indicates whether server-to-server communication is enabled for this implementation.
-    const SERVER_COMM_ENABLED: bool;
-
     /// Ensure that all queued collective operations have been executed.
     ///
     /// # Arguments
@@ -594,9 +919,13 @@ pub trait ServerCommunication {
     /// # Returns
     ///
     /// Returns a `Result` containing an `ServerError` if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ServerError::NoDeviceTransport`].
     #[allow(unused_variables)]
     fn sync_collective(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
-        todo!() // For backends other than cuda.
+        Err(ServerError::no_device_transport(Collective::SyncCollective))
     }
 
     /// Initialize the communication between the devices in `device_ids`.
@@ -608,9 +937,13 @@ pub trait ServerCommunication {
     /// # Returns
     ///
     /// Returns a `Result` containing an `ServerError` if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ServerError::NoDeviceTransport`].
     #[allow(unused_variables)]
     fn comm_init(&mut self, device_ids: Vec<DeviceId>) -> Result<(), ServerError> {
-        unimplemented!()
+        Err(ServerError::no_device_transport(Collective::CommInit))
     }
 
     /// Performs an `all_reduce` operation on the input data and writes it to the output buffer.
@@ -628,17 +961,21 @@ pub trait ServerCommunication {
     /// # Returns
     ///
     /// Returns a `Result` containing an `ServerError` if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ServerError::NoDeviceTransport`].
     #[allow(unused_variables)]
     fn all_reduce(
         &mut self,
-        src: Binding,
-        dst: Binding,
+        src: BufferBinding,
+        dst: BufferBinding,
         dtype: ElemType,
         stream_id: StreamId,
         op: ReduceOperation,
         device_ids: Vec<DeviceId>,
     ) -> Result<(), ServerError> {
-        unimplemented!()
+        Err(ServerError::no_device_transport(Collective::AllReduce))
     }
 
     /// Sends data from this server to a destination server.
@@ -653,6 +990,20 @@ pub trait ServerCommunication {
     /// # Returns
     ///
     /// Returns a `Result` containing an `ServerError` if the operation fails.
+    ///
+    /// # Known limitation
+    ///
+    /// Send and recv are posted fire-and-forget on two devices and block for
+    /// each other, so a send that refuses — a source whose writer failed,
+    /// above all — leaves the peer's already-posted recv waiting on its
+    /// communication stream with no way to recall it from here. The refusal
+    /// is still right: completing the send would launder stale bytes onto a
+    /// handle that carries no claim on the other device. Cross-device
+    /// failure propagation needs a design pass of its own.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ServerError::NoDeviceTransport`].
     #[allow(unused_variables)]
     fn send(
         &mut self,
@@ -661,7 +1012,7 @@ pub trait ServerCommunication {
         stream_id: StreamId,
         device_id_dst: DeviceId,
     ) -> Result<(), ServerError> {
-        unimplemented!()
+        Err(ServerError::no_device_transport(Collective::Send))
     }
 
     /// Receive data from another server.
@@ -676,6 +1027,10 @@ pub trait ServerCommunication {
     /// # Returns
     ///
     /// Returns a `Result` containing an `ServerError` if the operation fails.
+    ///
+    /// # Errors
+    ///
+    /// The default returns [`ServerError::NoDeviceTransport`].
     #[allow(unused_variables)]
     fn recv(
         &mut self,
@@ -684,7 +1039,7 @@ pub trait ServerCommunication {
         stream_id: StreamId,
         device_id_src: DeviceId,
     ) -> Result<(), ServerError> {
-        unimplemented!()
+        Err(ServerError::no_device_transport(Collective::Recv))
     }
 }
 
@@ -755,7 +1110,7 @@ pub struct Reason {
     inner: ReasonInner,
 }
 
-#[cfg(std_io)]
+#[cfg(serializable)]
 mod _reason_serde {
     use super::*;
 
@@ -832,7 +1187,7 @@ impl From<String> for Reason {
 /// Error returned from `create`/`read`/`write` functions. Due to async execution not all errors
 /// are able to be caught, so some IO errors will still panic.
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum IoError {
     /// Buffer size exceeds the max available
     #[error("can't allocate buffer of size: {size}\n{backtrace}")]
@@ -840,7 +1195,7 @@ pub enum IoError {
         /// The size of the buffer in bytes.
         size: u64,
         /// The captured backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -858,29 +1213,42 @@ pub enum IoError {
         /// The size of the failed allocation in bytes.
         size: u64,
         /// The captured backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
-    /// A memory pool with a fixed capacity cap is exhausted.
+    /// No room for the allocation in the pages the memory holds, and the
+    /// reservation was not allowed to add one.
     ///
-    /// Unlike [`IoError::BufferTooBig`] (the allocation can *never* fit), this
-    /// means the working set exceeded the configured budget. Server execution
-    /// paths treat it as fatal — the budget is a hard contract, so failing
-    /// early beats silently growing — but callers that manage their own
-    /// working set may free pool memory and retry.
+    /// A stream recording a graph reserves this way: an allocation would
+    /// become part of the recording, and a hardware graph holding one cannot
+    /// be relaunched. The warmup before a capture is what leaves the pools
+    /// holding what the recorded run asks for.
     #[error(
-        "memory pool capacity exceeded: failed to reserve {size} bytes, pool is capped at {capacity} bytes ({in_use} bytes in use)\n{backtrace}"
+        "No room for {size} bytes in the memory held, and no page may be added (a graph capture is recording: warm up with the same workload first)\n{backtrace}"
     )]
-    PoolCapacityExceeded {
-        /// The size of the failed reservation in bytes.
+    PageUpdateForbidden {
+        /// The size of the allocation in bytes.
         size: u64,
-        /// The configured pool capacity in bytes (whole pages).
-        capacity: u64,
-        /// Bytes currently in use in the pool.
-        in_use: u64,
         /// The captured backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// An allocation needs pages of a new size, and the memory already holds
+    /// as many page sizes as it keeps track of.
+    ///
+    /// Every size a workload grew through keeps a pool until what lives on it
+    /// is freed or relocated. A cleanup relocates what it can, so reclaiming
+    /// and retrying is a reasonable response.
+    #[error(
+        "Can't allocate {size} bytes: every page size the memory tracks still holds live allocations\n{backtrace}"
+    )]
+    PageSizesExhausted {
+        /// The size of the allocation in bytes.
+        size: u64,
+        /// The captured backtrace.
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -888,7 +1256,7 @@ pub enum IoError {
     #[error("the provided strides are not supported for this operation\n{backtrace}")]
     UnsupportedStrides {
         /// The backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -896,19 +1264,54 @@ pub enum IoError {
     #[error("couldn't find resource for that handle: {reason}\n{backtrace}")]
     NotFound {
         /// The backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
         /// The reason the handle is invalid.
         reason: Reason,
     },
 
-    /// Handle wasn't found in the memory pool
-    #[error("couldn't free the handle, since it is currently in used. \n{backtrace}")]
-    FreeError {
+    /// The storage backend holds no allocation for a handle's storage id.
+    ///
+    /// One layer below [`IoError::NotFound`]: there the memory manager could
+    /// not route a binding to a slice, here the routing succeeded and the
+    /// allocation the slice names is gone. A handle outliving its page, or a
+    /// storage id a deallocation retired, reaches the storage this way.
+    #[error("the storage holds no allocation for that handle: {reason}\n{backtrace}")]
+    StorageHandleNotFound {
+        /// Which id was looked up, and in which storage.
+        reason: Reason,
         /// The backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+
+    /// An allocation carved lazily under a
+    /// [process mode](crate::execution::ProcessMode) that discards launches could
+    /// not be given real device backing when it was finally resolved.
+    ///
+    /// Distinct from the same failure at reservation time, and the distinction
+    /// is what a caller acts on: the memory was promised earlier, by a pass
+    /// that measured a plan without paying for it, and is only now being
+    /// charged for. A plan whose replay hits this was measured against more
+    /// device memory than the replay has — warm the tune caches first, or
+    /// measure a smaller one.
+    #[error(
+        "couldn't map storage for a deferred allocation of {size} bytes\nCaused by:\n  {source}"
+    )]
+    StorageMappingFailed {
+        /// The size of the allocation that could not be backed, in bytes.
+        size: u64,
+        /// Why the device allocation failed.
+        source: Box<IoError>,
+        /// The backtrace.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+
+    /// The device is poisoned: a kernel faulted in a way the driver makes
+    /// sticky (an illegal address, a trap, a hardware fault, etc.)
+    #[error("The device is poisoned: {0}")]
+    DevicePoisoned(#[from] DevicePoison),
 
     /// Unknown error happened during execution
     #[error("Unknown error happened during execution: {description}\n{backtrace}")]
@@ -916,7 +1319,7 @@ pub enum IoError {
         /// Details of the error
         description: String,
         /// The backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -924,13 +1327,39 @@ pub enum IoError {
     #[error("The current IO operation is not supported\n{backtrace}")]
     UnsupportedIoOperation {
         /// The backtrace.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+}
 
-    /// Can't perform the IO operation because of a runtime error.
-    #[error("Can't perform the IO operation because of a runtime error: {0}")]
-    Execution(#[from] Box<ServerError>),
+impl IoError {
+    /// Whether the device that emitted the error is poisoned.
+    pub fn is_device_poisoned(&self) -> bool {
+        match self {
+            Self::DevicePoisoned(_) => true,
+            Self::StorageMappingFailed { source, .. } => source.is_device_poisoned(),
+            _ => false,
+        }
+    }
+
+    /// Whether reclaiming memory could still make this allocation succeed.
+    ///
+    /// Out of memory *right now* is not out of memory for good: pool pages
+    /// whose slices have all been dropped are still resident, and the frees
+    /// that would release them may sit in a deferred drop queue. A transient
+    /// peak — a model build holding float weights while their quantized copies
+    /// allocate, an autotune sample on a full device — is rescued by a reclaim
+    /// and a second attempt.
+    ///
+    /// A buffer larger than any page the device can hold is the exception. It
+    /// never fits, so reclaiming would only spend the time. So is an
+    /// allocation while a graph records, where nothing may be released.
+    pub fn may_succeed_after_reclaim(&self) -> bool {
+        !matches!(
+            self,
+            IoError::BufferTooBig { .. } | IoError::PageUpdateForbidden { .. }
+        )
+    }
 }
 
 impl core::fmt::Debug for IoError {
@@ -942,19 +1371,30 @@ impl core::fmt::Debug for IoError {
 /// Arguments to execute a kernel.
 #[derive(Debug, Default)]
 pub struct KernelArguments {
-    /// Buffer bindings
-    pub buffers: Vec<Binding>,
+    /// Kernel bindings
+    pub resources: Vec<KernelResource>,
+    /// What the caller declared each resource is for, indexed like
+    /// `resources`.
+    ///
+    /// The compiled kernel's own answer is better when it exists — the
+    /// visibility analysis can prove a buffer write-only or dead, which a
+    /// caller cannot — but it only exists once the kernel compiles. This one
+    /// is stamped at the launch site from what the caller can see (a launch
+    /// generated from `&Tensor` versus `&mut Tensor` knows it statically), so
+    /// it survives the compile failing, which is exactly when it is needed: a
+    /// launch that never ran must not taint the buffers it was only going to
+    /// read. Missing entries read as [`ReadWrite`](BufferIOAttr::ReadWrite),
+    /// so a caller that declares nothing keeps the loud fallback.
+    pub declared_io: Vec<BufferIOAttr>,
     /// Packed scalars and metadata. First scalars sorted by type, then static metadata,
     /// then dynamic metadata.
     pub info: MetadataBindingInfo,
-    /// Tensor map bindings
-    pub tensor_maps: Vec<TensorMapBinding>,
 }
 
 impl core::fmt::Display for KernelArguments {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("KernelArguments")?;
-        for b in self.buffers.iter() {
+        for b in self.resources.iter() {
             f.write_fmt(format_args!("\n - buffer: {b:?}\n"))?;
         }
 
@@ -969,14 +1409,31 @@ impl KernelArguments {
     }
 
     /// Add a buffer binding
-    pub fn with_buffer(mut self, binding: Binding) -> Self {
-        self.buffers.push(binding);
+    pub fn with_buffer(mut self, binding: BufferBinding) -> Self {
+        self.resources.push(KernelResource::Buffer(binding));
+        self
+    }
+
+    /// Add a buffer binding, declaring what the kernel does with it.
+    ///
+    /// The declaration is what a launch that fails before running — a kernel
+    /// that does not compile above all — falls back on: only declared-writable
+    /// buffers take the failure, so the ones the kernel was only going to read
+    /// stay readable. Resources added without a declaration read as
+    /// [`ReadWrite`](BufferIOAttr::ReadWrite), and mixing the two keeps every
+    /// declaration on the resource it was made for.
+    pub fn with_buffer_io(mut self, binding: BufferBinding, io: BufferIOAttr) -> Self {
+        self.declared_io
+            .resize(self.resources.len(), BufferIOAttr::ReadWrite);
+        self.resources.push(KernelResource::Buffer(binding));
+        self.declared_io.push(io);
         self
     }
 
     /// Extend the buffers with `bindings`
-    pub fn with_buffers(mut self, bindings: Vec<Binding>) -> Self {
-        self.buffers.extend(bindings);
+    pub fn with_buffers(mut self, bindings: Vec<BufferBinding>) -> Self {
+        let bindings = bindings.into_iter().map(KernelResource::Buffer);
+        self.resources.extend(bindings);
         self
     }
 
@@ -988,14 +1445,89 @@ impl KernelArguments {
 
     /// Extend the tensor maps with `bindings`
     pub fn with_tensor_maps(mut self, bindings: Vec<TensorMapBinding>) -> Self {
-        self.tensor_maps.extend(bindings);
+        let bindings = bindings.into_iter().map(KernelResource::TensorMap);
+        self.resources.extend(bindings);
         self
+    }
+
+    /// The buffers this launch was given.
+    pub fn buffers(&self) -> impl Iterator<Item = &BufferBinding> {
+        self.resources.iter().map(|resource| match resource {
+            KernelResource::Buffer(binding) => binding,
+            KernelResource::TensorMap(tensor_map) => &tensor_map.binding,
+        })
+    }
+
+    /// The memory this launch was given.
+    pub fn memory_ids(&self) -> impl Iterator<Item = ManagedMemoryId> + '_ {
+        self.buffers().map(|binding| binding.memory.id())
+    }
+
+    /// The buffers this launch was given that the kernel writes, per the
+    /// compiled kernel's own answer — the ones a launch that fails taints,
+    /// and nothing else.
+    ///
+    /// `io` is what the compiler recorded from its visibility analysis,
+    /// indexed like `resources` (see
+    /// [`BufferIOAttr`](crate::kernel::BufferIOAttr)). An index it has no
+    /// answer for falls back to the caller's declaration in `declared_io` —
+    /// which is how a kernel that never compiled still taints only its
+    /// outputs — and an index neither answers reads as written: naming a
+    /// buffer the kernel only read fails a read that would have been fine,
+    /// loudly; missing one it writes hands back the bytes that were there
+    /// before, silently — so the last-resort fallback over-names.
+    pub fn buffers_written<'a>(
+        &'a self,
+        io: Option<&'a [BufferIOAttr]>,
+    ) -> impl Iterator<Item = &'a BufferBinding> {
+        self.buffers()
+            .enumerate()
+            .filter_map(move |(index, binding)| {
+                let written = self
+                    .io_attr(io, index)
+                    .map(|io| io.is_writable())
+                    .unwrap_or(true);
+                written.then_some(binding)
+            })
+    }
+
+    /// The buffers this launch was given that the kernel reads — the ones
+    /// whose contents have to be trustworthy before the launch runs, and the
+    /// only ones checked: a pure output is not read, so a relaunch into a
+    /// tainted buffer is exactly how the buffer gets repaired.
+    ///
+    /// The same fallback chain as [`buffers_written`](Self::buffers_written):
+    /// compiled answer, then the caller's declaration, then read — so a
+    /// kernel nobody kept an answer for is checked on everything rather than
+    /// checked on nothing.
+    pub fn buffers_read<'a>(
+        &'a self,
+        io: Option<&'a [BufferIOAttr]>,
+    ) -> impl Iterator<Item = &'a BufferBinding> {
+        self.buffers()
+            .enumerate()
+            .filter_map(move |(index, binding)| {
+                let read = self
+                    .io_attr(io, index)
+                    .map(|io| io.is_readable())
+                    .unwrap_or(true);
+                read.then_some(binding)
+            })
+    }
+
+    /// The answer for one resource: the compiled kernel's when it kept one,
+    /// the caller's declaration otherwise, `None` when neither answered.
+    fn io_attr(&self, compiled: Option<&[BufferIOAttr]>, index: usize) -> Option<BufferIOAttr> {
+        compiled
+            .and_then(|io| io.get(index))
+            .or_else(|| self.declared_io.get(index))
+            .copied()
     }
 }
 
 /// Binding of a set of scalars of the same type to execute a kernel.
 ///
-/// The [`ComputeServer`] is responsible to convert those info into actual [`Binding`] when launching
+/// The [`Server`] is responsible to convert those info into actual [`Binding`] when launching
 /// kernels.
 #[derive(new, Debug, Default)]
 pub struct MetadataBindingInfo {
@@ -1016,7 +1548,7 @@ impl MetadataBindingInfo {
 #[derive(new, Debug)]
 pub struct CopyDescriptor {
     /// Binding for the memory resource
-    pub handle: Binding,
+    pub handle: BufferBinding,
     /// Shape of the resource
     pub shape: Shape,
     /// Strides of the resource
@@ -1026,10 +1558,10 @@ pub struct CopyDescriptor {
 }
 
 /// A tensor map used with TMA ops
-#[derive(new, Debug)]
+#[derive(new, Clone, Debug)]
 pub struct TensorMapBinding {
     /// The binding for the backing tensor
-    pub binding: Binding,
+    pub binding: BufferBinding,
     /// The tensormap metadata
     pub map: TensorMapMeta,
 }
@@ -1052,8 +1584,8 @@ pub struct TensorMapMeta {
     pub prefetch: TensorMapPrefetch,
     /// OOB fill value
     pub oob_fill: OobFill,
-    /// Storage type
-    pub storage_ty: StorageType,
+    /// Element type
+    pub elem_ty: ElemType,
 }
 
 /// Specifieds the number of cubes to be dispatched for a kernel.
@@ -1064,7 +1596,7 @@ pub enum CubeCount {
     /// Dispatch a known count of x, y, z cubes.
     Static(u32, u32, u32),
     /// Dispatch an amount based on the values in this buffer. The buffer should contain a u32 array [x, y, z].
-    Dynamic(Binding),
+    Dynamic(BufferBinding),
 }
 
 /// Defines how to select cube count based on the number of cubes required.
@@ -1079,7 +1611,7 @@ pub enum CubeCountSelection {
 
 impl CubeCountSelection {
     /// Creates a [`CubeCount`] while respecting the hardware limits.
-    pub fn new<R: Runtime>(client: &ComputeClient<R>, num_cubes: u32) -> Self {
+    pub fn new(client: &Client, num_cubes: u32) -> Self {
         let cube_count = cube_count_spread(&client.properties().hardware.max_cube_count, num_cubes);
 
         let num_cubes_actual = cube_count[0] * cube_count[1] * cube_count[2];
@@ -1159,18 +1691,11 @@ impl Clone for CubeCount {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, From, PartialEq, Eq, Clone, Copy, Hash, Deref, DerefMut)]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 #[allow(missing_docs)]
 /// The number of units across all 3 axis totalling to the number of working units in a cube.
-pub struct CubeDim {
-    /// The number of units in the x axis.
-    pub x: u32,
-    /// The number of units in the y axis.
-    pub y: u32,
-    /// The number of units in the z axis.
-    pub z: u32,
-}
+pub struct CubeDim(pub Dim3);
 
 impl CubeDim {
     /// Creates a new [`CubeDim`] based on the maximum number of tasks that can be parellalized by units, in other words,
@@ -1180,7 +1705,7 @@ impl CubeDim {
     ///
     /// For complex problems, you probably want to have your own logic function to create the
     /// [`CubeDim`], but for simpler problems such as elemwise-operation, this is a great default.
-    pub fn new<R: Runtime>(client: &ComputeClient<R>, working_units: usize) -> Self {
+    pub fn new(client: &Client, working_units: usize) -> Self {
         let properties = client.properties();
         let plane_size = properties.hardware.plane_size_max;
         let plane_count = Self::calculate_plane_count_per_cube(
@@ -1218,33 +1743,33 @@ impl CubeDim {
 
     /// Create a new cube dim with x = y = z = 1.
     pub const fn new_single() -> Self {
-        Self { x: 1, y: 1, z: 1 }
+        Self(Dim3::new_single())
     }
 
     /// Create a new cube dim with the given x, and y = z = 1.
     pub const fn new_1d(x: u32) -> Self {
-        Self { x, y: 1, z: 1 }
+        Self(Dim3::new_1d(x))
     }
 
     /// Create a new cube dim with the given x and y, and z = 1.
     pub const fn new_2d(x: u32, y: u32) -> Self {
-        Self { x, y, z: 1 }
+        Self(Dim3::new_2d(x, y))
     }
 
     /// Create a new cube dim with the given x, y and z.
     /// This is equivalent to the [new](CubeDim::new) function.
     pub const fn new_3d(x: u32, y: u32, z: u32) -> Self {
-        Self { x, y, z }
+        Self(Dim3::new_3d(x, y, z))
     }
 
     /// Total numbers of units per cube
     pub const fn num_elems(&self) -> u32 {
-        self.x * self.y * self.z
+        self.0.num_elems()
     }
 
     /// Whether this `CubeDim` can fully contain `other`
     pub const fn can_contain(&self, other: CubeDim) -> bool {
-        self.x >= other.x && self.y >= other.y && self.z >= other.z
+        self.0.can_contain(other.0)
     }
 }
 
@@ -1260,17 +1785,10 @@ impl From<CubeDim> for (u32, u32, u32) {
     }
 }
 
-/// The kind of execution to be performed.
-#[derive(Default, Hash, PartialEq, Eq, Clone, Debug, Copy)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
-pub enum ExecutionMode {
-    /// Checked kernels are safe.
-    #[default]
-    Checked,
-    /// Validate OOB and alert if OOB access occurs
-    Validate,
-    /// Unchecked kernels are unsafe.
-    Unchecked,
+impl From<CubeDim> for Dim3 {
+    fn from(value: CubeDim) -> Self {
+        value.0
+    }
 }
 
 fn cube_count_spread(max: &(u32, u32, u32), num_cubes: u32) -> [u32; 3] {
@@ -1305,6 +1823,13 @@ fn cube_count_spread(max: &(u32, u32, u32), num_cubes: u32) -> [u32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    /// A service for handles that never reach a device.
+    fn service() -> cubecl_common::device::ServiceId {
+        cubecl_common::device::ServiceId::of::<()>(cubecl_common::device::DeviceId::new(0, 0))
+    }
 
     #[test_log::test]
     fn safe_num_cubes_even() {
@@ -1324,5 +1849,260 @@ mod tests {
         let actual = cube_count_spread(&max, required);
         let expected = [25, 32, 4];
         assert_eq!(actual, expected);
+    }
+
+    /// The compiled kernel's answer drives both sets exactly, in resource
+    /// order.
+    #[test_log::test]
+    fn buffer_io_drives_the_read_and_write_sets() {
+        use crate::kernel::BufferIOAttr;
+        use cubecl_environment::stream::StreamId;
+
+        let stream = StreamId { value: 0 };
+        let args = KernelArguments::new().with_buffers(vec![
+            Handle::new(service(), stream, 8).binding(),
+            Handle::new(service(), stream, 8).binding(),
+            Handle::new(service(), stream, 8).binding(),
+            Handle::new(service(), stream, 8).binding(),
+        ]);
+        let io = [
+            BufferIOAttr::ReadOnly,
+            BufferIOAttr::WriteOnly,
+            BufferIOAttr::ReadWrite,
+            BufferIOAttr::Dead,
+        ];
+
+        let written: Vec<_> = args.buffers_written(Some(&io)).collect();
+        assert_eq!(written.len(), 2, "WriteOnly and ReadWrite are written");
+        assert!(core::ptr::eq(written[0], args.buffers().nth(1).unwrap()));
+        assert!(core::ptr::eq(written[1], args.buffers().nth(2).unwrap()));
+
+        let read: Vec<_> = args.buffers_read(Some(&io)).collect();
+        assert_eq!(read.len(), 2, "ReadOnly and ReadWrite are read");
+        assert!(core::ptr::eq(read[0], args.buffers().next().unwrap()));
+        assert!(core::ptr::eq(read[1], args.buffers().nth(2).unwrap()));
+    }
+
+    /// A poisoned device is the one failure a caller must not retry.
+    ///
+    /// Loading the next kernel is the case that matters most: it arrives as a
+    /// compilation error, and read as a refusal it would have an autotuner
+    /// quietly drop the candidate and try the next one on a dead device.
+    #[test_log::test]
+    fn poisoned_device_read_through_every_path() {
+        use crate::server::{IoError, LaunchError};
+
+        let poison = || DevicePoison {
+            reason: String::from("cuEventSynchronize failed with status 700"),
+            backtrace: Default::default(),
+        };
+        let poisoned = [
+            ServerError::DevicePoisoned(poison()),
+            ServerError::Launch(LaunchError::DevicePoisoned(poison())),
+            ServerError::Launch(LaunchError::CompilationError(
+                CompilationError::DevicePoisoned(poison()),
+            )),
+            ServerError::Io(IoError::DevicePoisoned(poison())),
+            ServerError::Io(IoError::StorageMappingFailed {
+                size: 1 << 20,
+                source: alloc::boxed::Box::new(IoError::DevicePoisoned(poison())),
+                backtrace: Default::default(),
+            }),
+        ];
+        let refused =
+            ServerError::Launch(LaunchError::CompilationError(CompilationError::Generic {
+                reason: "no such intrinsic on this target".into(),
+                backtrace: Default::default(),
+            }));
+        let transient = ServerError::Generic {
+            reason: "the copy failed".into(),
+            backtrace: Default::default(),
+        };
+
+        for error in &poisoned {
+            assert!(error.is_device_poisoned(), "{error}");
+            assert!(
+                !error.is_refusal(),
+                "a poisoned device is not a refusal: {error}"
+            );
+        }
+        assert!(!refused.is_device_poisoned());
+        assert!(!transient.is_device_poisoned());
+
+        let unwritten = ServerError::Unwritten {
+            failure: 1,
+            claimed: 1,
+            chain: Vec::new(),
+            root: alloc::boxed::Box::new(poisoned[1].clone()),
+            backtrace: Default::default(),
+        };
+        assert!(unwritten.is_device_poisoned());
+        let group = ServerError::Several {
+            errors: vec![refused, unwritten],
+            backtrace: Default::default(),
+        };
+        assert!(group.is_device_poisoned());
+        assert!(!group.is_refusal());
+    }
+
+    /// A refusal is the kernel being turned down, and nothing else is.
+    ///
+    /// The direction that matters is the false positive: a harness that takes
+    /// a device fault for a refusal reports a broken run as a skipped one, and
+    /// the test goes green. So a group answers yes only when every root does.
+    #[test_log::test]
+    fn only_a_refused_kernel_reads_as_a_refusal() {
+        use crate::server::{LaunchError, ResourceLimitError};
+
+        let refused =
+            ServerError::Launch(LaunchError::CompilationError(CompilationError::Generic {
+                reason: "no such intrinsic on this target".into(),
+                backtrace: Default::default(),
+            }));
+        let over_budget = ServerError::Launch(LaunchError::TooManyResources(
+            ResourceLimitError::SharedMemory {
+                requested: 1 << 20,
+                max: 1 << 15,
+                backtrace: Default::default(),
+            },
+        ));
+        let fault = ServerError::Generic {
+            reason: "the device faulted".into(),
+            backtrace: Default::default(),
+        };
+
+        let panicked = ServerError::Launch(LaunchError::CompilationError(
+            CompilationError::ExpansionPanicked {
+                kernel: "kernel".into(),
+                message: "an assertion failed".into(),
+                backtrace: Default::default(),
+            },
+        ));
+
+        assert!(refused.is_refusal());
+        assert!(over_budget.is_refusal());
+        assert!(!fault.is_refusal(), "a fault is not a refusal");
+        assert!(
+            !panicked.is_refusal(),
+            "a kernel that panicked while expanding is a defect, not a refusal"
+        );
+
+        // A read reports the failure that stopped the buffer's writer, so the
+        // question has to reach through the report to the root.
+        let unwritten = |root: &ServerError| ServerError::Unwritten {
+            failure: 1,
+            claimed: 1,
+            chain: Vec::new(),
+            root: alloc::boxed::Box::new(root.clone()),
+            backtrace: Default::default(),
+        };
+        assert!(unwritten(&refused).is_refusal());
+        assert!(!unwritten(&fault).is_refusal());
+        assert!(!unwritten(&panicked).is_refusal());
+
+        let group = |errors: Vec<ServerError>| ServerError::Several {
+            errors,
+            backtrace: Default::default(),
+        };
+        assert!(group(vec![unwritten(&refused), unwritten(&over_budget)]).is_refusal());
+        assert!(
+            !group(vec![unwritten(&refused), unwritten(&fault)]).is_refusal(),
+            "one real failure among refusals is still a real failure"
+        );
+        assert!(
+            !group(Vec::new()).is_refusal(),
+            "an empty group refuses nothing"
+        );
+    }
+
+    /// Every fallback over-names: a kernel the compiler kept no answer for,
+    /// and a resource past what the answer covers, read as both read and
+    /// written. Naming a buffer the kernel only read fails a read that would
+    /// have been fine, loudly; missing one it writes hands back the bytes
+    /// that were there before, silently.
+    #[test_log::test]
+    fn missing_io_reads_as_everything_read_and_written() {
+        use crate::kernel::BufferIOAttr;
+        use cubecl_environment::stream::StreamId;
+
+        let stream = StreamId { value: 0 };
+        let args = KernelArguments::new().with_buffers(vec![
+            Handle::new(service(), stream, 8).binding(),
+            Handle::new(service(), stream, 8).binding(),
+        ]);
+
+        assert_eq!(args.buffers_written(None).count(), 2);
+        assert_eq!(args.buffers_read(None).count(), 2);
+
+        let short = [BufferIOAttr::Dead];
+        assert_eq!(
+            args.buffers_written(Some(&short)).count(),
+            1,
+            "the uncovered resource reads as written"
+        );
+        assert_eq!(args.buffers_read(Some(&short)).count(), 1);
+    }
+
+    /// The caller's declaration answers when the compiled kernel kept none —
+    /// which is what a launch that fails to compile falls back on, so it
+    /// taints only its declared outputs — and the compiled answer still wins
+    /// where it exists, since only the visibility analysis can prove a buffer
+    /// write-only or dead.
+    #[test_log::test]
+    fn declared_io_answers_when_the_compiled_kernel_kept_none() {
+        use crate::kernel::BufferIOAttr;
+        use cubecl_environment::stream::StreamId;
+
+        let stream = StreamId { value: 0 };
+        let args = KernelArguments::new()
+            .with_buffer_io(
+                Handle::new(service(), stream, 8).binding(),
+                BufferIOAttr::ReadOnly,
+            )
+            .with_buffer_io(
+                Handle::new(service(), stream, 8).binding(),
+                BufferIOAttr::ReadOnly,
+            )
+            .with_buffer_io(
+                Handle::new(service(), stream, 8).binding(),
+                BufferIOAttr::WriteOnly,
+            );
+
+        // No compiled answer: the declaration decides. The inputs are not
+        // written, so a failed compile leaves them readable.
+        let written: Vec<_> = args.buffers_written(None).collect();
+        assert_eq!(written.len(), 1, "only the declared output is written");
+        assert!(core::ptr::eq(written[0], args.buffers().nth(2).unwrap()));
+        assert_eq!(args.buffers_read(None).count(), 2);
+
+        // A compiled answer overrides the declaration where it has one and
+        // falls back to it where it does not.
+        let compiled = [BufferIOAttr::ReadWrite];
+        let written: Vec<_> = args.buffers_written(Some(&compiled)).collect();
+        assert_eq!(written.len(), 2, "compiled ReadWrite plus declared output");
+        assert!(core::ptr::eq(written[0], args.buffers().next().unwrap()));
+        assert!(core::ptr::eq(written[1], args.buffers().nth(2).unwrap()));
+    }
+
+    /// Declarations stay on the resource they were made for when declared and
+    /// undeclared resources mix, and the undeclared ones keep the loud
+    /// fallback.
+    #[test_log::test]
+    fn an_undeclared_resource_among_declared_ones_over_names() {
+        use crate::kernel::BufferIOAttr;
+        use cubecl_environment::stream::StreamId;
+
+        let stream = StreamId { value: 0 };
+        let args = KernelArguments::new()
+            .with_buffer(Handle::new(service(), stream, 8).binding())
+            .with_buffer_io(
+                Handle::new(service(), stream, 8).binding(),
+                BufferIOAttr::ReadOnly,
+            );
+
+        let written: Vec<_> = args.buffers_written(None).collect();
+        assert_eq!(written.len(), 1, "the undeclared resource reads as written");
+        assert!(core::ptr::eq(written[0], args.buffers().next().unwrap()));
+        assert_eq!(args.buffers_read(None).count(), 2);
     }
 }

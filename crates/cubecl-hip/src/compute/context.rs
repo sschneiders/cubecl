@@ -1,353 +1,84 @@
+//! The device context: its loaded kernels, and its open profiles.
+//!
+//! Compilation is memoized here rather than per stream, because a module is
+//! loaded into the context and every stream sharing it can launch from the
+//! same one. What a compiled kernel answers for beyond its entry point is
+//! which of its bindings it writes, which is what a launch stages its write
+//! scope from.
+
 use super::storage::gpu::GpuResource;
-use crate::runtime::HipCompiler;
-use crate::{compute::stream::Stream, runtime::HipComputeKernel};
-use cubecl_core::{
-    server::ResourceLimitError,
-    {ir::DeviceProperties, prelude::*},
-};
-use cubecl_cpp::formatter::format_cpp;
-use cubecl_cpp::shared::CompilationOptions;
+use crate::compiler::{HipBackend, HipCompilationOptions};
+use crate::compute::artifact::HipArtifactCompiler;
+use crate::compute::events::EventProfiler;
+use crate::compute::modules::{HipCompiledKernel, HipModules};
+use crate::compute::status::checked;
+use crate::compute::stream::Stream;
+use cubecl_core::{ir::DeviceProperties, prelude::*};
 use cubecl_environment::backtrace::BackTrace;
-use cubecl_environment::persistence::Store;
-use cubecl_hip_sys::{HIP_SUCCESS, get_hip_include_path, hiprtcResult_HIPRTC_SUCCESS};
-use cubecl_runtime::compiler::{CompilationCache, compilation_store, store_compiled};
-use cubecl_runtime::timestamp_profiler::TimestampProfiler;
-use cubecl_runtime::{
-    compiler::CompilationError,
-    validation::{validate_cube_dim, validate_units},
-};
-use cubecl_runtime::{
-    compiler::{CubeTask, KernelCacheKey},
-    logging::ServerLogger,
-};
-use serde::Deserialize;
-use serde::Serialize;
-use std::ffi::CStr;
-use std::ffi::CString;
-use std::sync::Arc;
+use cubecl_server::compiler::{ArtifactId, KernelLoader};
+use cubecl_server::kernel::CubeKernel;
+use cubecl_server::logging::ServerLogger;
 
 #[derive(Debug)]
 pub(crate) struct HipContext {
-    /// The modules loaded on the device, in front of
-    /// [`Self::compilation_cache`].
-    ///
-    /// An environment switch drops these, and nothing unloads the modules they
-    /// name: see [`HipContext::is_loaded`].
-    modules: CompilationCache<KernelId, HipCompiledKernel>,
-    pub timestamps: TimestampProfiler,
-    pub compilation_options: CompilationOptions,
-    pub properties: DeviceProperties,
-    pub compilation_cache: Option<Store<KernelCacheKey, CompilationCacheEntry>>,
-}
-
-#[derive(Debug)]
-pub struct HipCompiledKernel {
-    _module: cubecl_hip_sys::hipModule_t,
-    func: cubecl_hip_sys::hipFunction_t,
-    cube_dim: CubeDim,
-    shared_mem_bytes: usize,
-}
-
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
-pub struct CompilationCacheEntry {
-    entrypoint_name: String,
-    shared_mem_bytes: usize,
-    binary: Vec<i8>,
+    /// The modules loaded on the device, and how to load another.
+    kernels: KernelLoader<HipModules>,
+    pub profiler: EventProfiler,
 }
 
 impl HipContext {
-    /// `fingerprint` is the one the runtime already published on
-    /// [`DeviceProperties::identity`], rather than one rebuilt here: the
-    /// namespace a kernel is cached under and the identity a bundle is stamped
-    /// with have to be the same string, and the only way to guarantee that is
-    /// for there to be one string.
+    /// `fingerprint` and `backend` name where compiled kernels are stored; see
+    /// [`HipModules::new`].
+    ///
+    /// An environment switch drops every loaded kernel, so the new
+    /// environment's store is filled rather than bypassed. The modules those
+    /// kernels named stay resident: nothing calls `hipModuleUnload`, here or
+    /// anywhere else in this context, and unloading one a stream still has
+    /// queued work against would be unsound. A process that switches
+    /// environments a handful of times at startup pays a bounded price; one
+    /// that switches repeatedly grows its resident modules without bound — see
+    /// [`cubecl_environment::environment::activate`].
     pub fn new(
-        compilation_options: CompilationOptions,
+        compilation_options: HipCompilationOptions,
         properties: DeviceProperties,
         fingerprint: String,
+        backend: HipBackend,
     ) -> Self {
-        let compilation_cache = compilation_store("hip", fingerprint);
-
+        let compiler = HipArtifactCompiler::new(properties, compilation_options);
         Self {
-            modules: CompilationCache::mirroring(&compilation_cache),
-            timestamps: TimestampProfiler::default(),
-            compilation_options,
-            compilation_cache,
-            properties,
+            kernels: KernelLoader::new(HipModules::new(compiler, fingerprint, backend)),
+            profiler: EventProfiler::default(),
         }
     }
 
-    /// Whether `kernel_id` is already loaded on the device.
-    ///
-    /// An environment switch drops the whole cache, so the new environment's
-    /// store is filled rather than bypassed. The modules those entries named
-    /// stay resident: nothing calls `hipModuleUnload`, here or anywhere else in
-    /// this context, and unloading one a stream still has queued work against
-    /// would be unsound. A process that switches environments a handful of
-    /// times at startup pays a bounded price; one that switches repeatedly
-    /// grows its resident modules without bound — see
-    /// [`cubecl_environment::environment::activate`].
-    pub fn is_loaded(&mut self, kernel_id: &KernelId) -> bool {
-        self.modules.contains(kernel_id)
-    }
-
-    /// Compiles a kernel.
-    pub fn compile_kernel(
+    /// Loads `kernel`, whose id is `id`, on the device, compiling it first
+    /// when no store holds it. A kernel already loaded costs a map lookup.
+    pub fn load_kernel(
         &mut self,
-        kernel_id: &KernelId,
-        cube_kernel: Box<dyn CubeTask<HipCompiler>>,
-        mode: ExecutionMode,
-        logger: Arc<ServerLogger>,
-    ) -> Result<(), LaunchError> {
-        let definition = cube_kernel.define();
-
-        let key = if let Some(cache) = self.compilation_cache.as_mut() {
-            let key = KernelCacheKey::new(kernel_id, &definition);
-            if let Some(entry) = cache.remove(&key) {
-                log::trace!("Using compilation cache");
-                self.load_compiled_binary(
-                    entry.binary,
-                    kernel_id.clone(),
-                    entry.entrypoint_name,
-                    kernel_id.cube_dim,
-                    entry.shared_mem_bytes,
-                )?;
-                return Ok(());
-            }
-            Some(key)
-        } else {
-            None
-        };
-
-        validate_cube_dim(&self.properties, kernel_id)?;
-        validate_units(&self.properties, kernel_id)?;
-
-        // CubeCL compilation
-        // jitc = just-in-time compiled
-        let mut jitc_kernel = cube_kernel.compile(
-            definition,
-            &mut Default::default(),
-            &self.compilation_options,
-            mode,
-            cube_kernel.address_type(),
-        )?;
-
-        self.validate_shared(&jitc_kernel.repr)?;
-
-        if logger.compilation_source_activated() {
-            jitc_kernel.debug_info = Some(DebugInformation::new("cpp", kernel_id.clone()));
-
-            if let Ok(formatted) = format_cpp(&jitc_kernel.source) {
-                jitc_kernel.source = formatted;
-            }
-        }
-        logger.log_compilation(&jitc_kernel);
-
-        // Create HIP Program
-        // SAFETY: Calling HIP RTC FFI to create a program from source. The `CString` ensures
-        // the source is null-terminated. The returned `program` handle is valid on success.
-        let program = unsafe {
-            let source = CString::new(jitc_kernel.source.clone()).unwrap();
-            let mut program: cubecl_hip_sys::hiprtcProgram = std::ptr::null_mut();
-
-            let status = cubecl_hip_sys::hiprtcCreateProgram(
-                &mut program,
-                source.as_ptr(),
-                std::ptr::null(), // program name seems unnecessary
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                Err(CompilationError::Generic {
-                    reason: format!(
-                        "Unable to create the program from the source: HIP STATUS: {status}"
-                    ),
-                    backtrace: BackTrace::capture(),
-                })?;
-            }
-
-            program
-        };
-        // Compile HIP program
-        // options
-        let include_path = get_hip_include_path().unwrap();
-        let include_option = format!("-I{include_path}");
-        let include_option_cstr = CString::new(include_option).unwrap();
-        // needed for rocWMMA extension to compile
-        let cpp_std_option_cstr = CString::new("--std=c++17").unwrap();
-        let optimization_level = CString::new("-O3").unwrap();
-        let mut options = vec![
-            cpp_std_option_cstr.as_ptr(),
-            include_option_cstr.as_ptr(),
-            optimization_level.as_ptr(),
-        ];
-        // SAFETY: `program` is a valid RTC program handle created above. The `options` vector
-        // contains valid null-terminated `CString` pointers that outlive this call. On failure,
-        // we retrieve and report the compilation log before returning an error.
-        unsafe {
-            let options_ptr = options.as_mut_ptr();
-            let status =
-                cubecl_hip_sys::hiprtcCompileProgram(program, options.len() as i32, options_ptr);
-
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                let mut log_size: usize = 0;
-                let status =
-                    cubecl_hip_sys::hiprtcGetProgramLogSize(program, &mut log_size as *mut usize);
-
-                if status != hiprtcResult_HIPRTC_SUCCESS {
-                    Err(CompilationError::Generic {
-                        reason: format!(
-                            "An error during compilation happened, but we're unable to fetch the error log size. STATUS: {status}"
-                        ),
-                        backtrace: BackTrace::capture(),
-                    })?;
-                }
-
-                let mut log_buffer = vec![0; log_size];
-                let status = cubecl_hip_sys::hiprtcGetProgramLog(program, log_buffer.as_mut_ptr());
-
-                if status != hiprtcResult_HIPRTC_SUCCESS {
-                    Err(CompilationError::Generic {
-                        reason: format!(
-                            "An error during compilation happened, but we're unable to fetch the error log content. STATUS: {status}"
-                        ),
-                        backtrace: BackTrace::capture(),
-                    })?;
-                }
-
-                let log = CStr::from_ptr(log_buffer.as_ptr());
-                let mut message = "[Compilation Error] ".to_string();
-                if log_size > 0 {
-                    for line in log.to_string_lossy().split('\n') {
-                        if !line.is_empty() {
-                            message += format!("\n    {line}").as_str();
-                        }
-                    }
-                } else {
-                    message += "\n No compilation logs found!";
-                }
-                Err(CompilationError::Generic {
-                    reason: format!("{message}\n[Source]  \n{}", jitc_kernel.source),
-                    backtrace: BackTrace::capture(),
-                })?;
-            }
-        };
-
-        // Get HIP compiled code from program
-        let mut code_size: usize = 0;
-        // SAFETY: `program` was successfully compiled above. `code_size` is a valid mutable
-        // pointer to receive the size of the compiled binary.
-        unsafe {
-            let status = cubecl_hip_sys::hiprtcGetCodeSize(program, &mut code_size);
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                Err(CompilationError::Generic {
-                    reason: format!(
-                        "Unable to get the size of the compiled code. STATUS: {status}"
-                    ),
-                    backtrace: BackTrace::capture(),
-                })?;
-            }
-        }
-        let mut code = vec![0; code_size];
-        // SAFETY: `code` is allocated with `code_size` bytes as reported by `hiprtcGetCodeSize`.
-        // `program` is a valid compiled program handle.
-        unsafe {
-            let status = cubecl_hip_sys::hiprtcGetCode(program, code.as_mut_ptr());
-
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                Err(CompilationError::Generic {
-                    reason: format!("Unable to get the compiled code. STATUS: {status}"),
-                    backtrace: BackTrace::capture(),
-                })?;
-            }
-        }
-
-        let repr = jitc_kernel.repr.unwrap();
-
-        if let Some(cache) = self.compilation_cache.as_mut() {
-            store_compiled(
-                cache,
-                key.unwrap(),
-                CompilationCacheEntry {
-                    entrypoint_name: jitc_kernel.entrypoint_name.clone(),
-                    shared_mem_bytes: repr.shared_memory_size(),
-                    binary: code.clone(),
-                },
-            );
-        }
-
-        self.load_compiled_binary(
-            code,
-            kernel_id.clone(),
-            jitc_kernel.entrypoint_name,
-            jitc_kernel.cube_dim,
-            repr.shared_memory_size(),
-        )?;
-        Ok(())
+        kernel: &dyn CubeKernel,
+        id: &ArtifactId<()>,
+        logger: &ServerLogger,
+    ) -> Result<HipCompiledKernel, LaunchError> {
+        self.kernels.load(kernel, id, logger)
     }
 
-    fn load_compiled_binary(
-        &mut self,
-        code: Vec<i8>,
-        kernel_id: KernelId,
-        entrypoint_name: String,
-        cube_dim: CubeDim,
-        shared_mem_bytes: usize,
-    ) -> Result<(), CompilationError> {
-        let func_name = CString::new(entrypoint_name.clone()).unwrap();
+    /// Compiles every queued kernel now, rather than inside the next launch.
+    pub fn compile_queued(&mut self, logger: &ServerLogger) {
+        self.kernels.compile_queued(logger);
+    }
 
-        // Create the HIP module
-        let mut module: cubecl_hip_sys::hipModule_t = std::ptr::null_mut();
-        // SAFETY: `code` contains a valid compiled binary obtained from `hiprtcGetCode`.
-        // `module` receives the loaded module handle on success.
-        unsafe {
-            let codeptr = code.as_ptr();
-            let status = cubecl_hip_sys::hipModuleLoadData(&mut module, codeptr as *const _);
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                return Err(CompilationError::Generic {
-                    reason: format!("Unable to load the compiled module. STATUS: {status}"),
-                    backtrace: BackTrace::capture(),
-                });
-            }
-        }
-        // Retrieve the HIP module function
-        let mut func: cubecl_hip_sys::hipFunction_t = std::ptr::null_mut();
-        // SAFETY: `module` is a valid loaded module from `hipModuleLoadData` above.
-        // `func_name` is a null-terminated `CString` matching the kernel entry point.
-        unsafe {
-            let status =
-                cubecl_hip_sys::hipModuleGetFunction(&mut func, module, func_name.as_ptr());
-            if status != hiprtcResult_HIPRTC_SUCCESS {
-                return Err(CompilationError::Generic {
-                    reason: format!(
-                        "Unable to load the function in the compiled module. STATUS: {status}"
-                    ),
-                    backtrace: BackTrace::capture(),
-                });
-            }
-        }
-
-        // register module
-        self.modules.insert(
-            kernel_id.clone(),
-            HipCompiledKernel {
-                _module: module,
-                func,
-                cube_dim,
-                shared_mem_bytes,
-            },
-        );
-
-        Ok(())
+    /// Queues `kernel` to be compiled with others, by the next kernel
+    /// loaded for a launch.
+    pub fn queue_kernel(&mut self, kernel: Box<dyn CubeKernel>) {
+        self.kernels.enqueue(kernel, ());
     }
 
     /// Executes a task on the given stream.
     pub fn execute_task(
         &mut self,
         stream: &mut Stream,
-        kernel_id: KernelId,
+        kernel_id: &KernelId,
+        kernel: &HipCompiledKernel,
         dispatch_count: (u32, u32, u32),
         resources: &[GpuResource],
     ) -> Result<(), LaunchError> {
@@ -356,7 +87,6 @@ impl HipContext {
             .map(|memory| memory.binding)
             .collect::<Vec<_>>();
 
-        let kernel = self.modules.get(&kernel_id).unwrap();
         let cube_dim = kernel.cube_dim;
 
         // SAFETY: `kernel.func` is a valid function handle from a loaded module.
@@ -380,36 +110,22 @@ impl HipContext {
                 std::ptr::null_mut(),
             );
 
-            if status == cubecl_hip_sys::hipError_t_hipErrorOutOfMemory {
-                Err(LaunchError::OutOfMemory {
-                    reason: format!("Out of memory when launching kernel: {kernel_id:?}"),
+            // Out of memory is told apart from the rest because the caller
+            // can act on it — reclaim and relaunch — where nothing else here
+            // is worth retrying.
+            match checked("hipModuleLaunchKernel", status) {
+                Ok(()) => Ok(()),
+                Err(_) if status == cubecl_hip_sys::hipError_t_hipErrorOutOfMemory => {
+                    Err(LaunchError::OutOfMemory {
+                        reason: format!("out of memory launching kernel {kernel_id:?}"),
+                        backtrace: BackTrace::capture(),
+                    })
+                }
+                Err(err) => Err(LaunchError::Unknown {
+                    reason: format!("{err}, launching kernel {kernel_id:?}"),
                     backtrace: BackTrace::capture(),
-                })
-            } else if status != HIP_SUCCESS {
-                Err(LaunchError::Unknown {
-                    reason: format!("Unable to launch kernel {kernel_id:?} with status {status:?}"),
-                    backtrace: BackTrace::capture(),
-                })
-            } else {
-                Ok(())
+                }),
             }
-        }
-    }
-
-    fn validate_shared(&self, repr: &Option<HipComputeKernel>) -> Result<(), LaunchError> {
-        let requested = repr.as_ref().map(|repr| repr.shared_memory_size());
-        let max = self.properties.hardware.max_shared_memory_size;
-        if let Some(requested) = requested
-            && requested > max
-        {
-            Err(ResourceLimitError::SharedMemory {
-                requested,
-                max,
-                backtrace: BackTrace::capture(),
-            }
-            .into())
-        } else {
-            Ok(())
         }
     }
 }

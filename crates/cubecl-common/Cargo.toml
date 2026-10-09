@@ -30,7 +30,7 @@ tracing = ["cubecl-environment/tracing"]
 
 
 [dependencies]
-cubecl-environment = { path = "../cubecl-environment", version = "=0.11.0-pre.2", default-features = false }
+cubecl-environment = { workspace = true }
 
 # Runtime Deps
 log = { workspace = true }
@@ -79,9 +79,7 @@ spin = { workspace = true, features = [
 cfg_aliases = { workspace = true }
 
 [dev-dependencies]
-ciborium = { workspace = true, features = ["std"] }
 criterion = { workspace = true }
-dashmap = { workspace = true }
 tempfile = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 

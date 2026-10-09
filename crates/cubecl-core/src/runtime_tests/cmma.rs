@@ -1,3 +1,4 @@
+use cubecl_runtime::runtime::Runtime;
 use std::println;
 
 use crate::{
@@ -11,46 +12,14 @@ use cubecl::{
 };
 
 use alloc::{vec, vec::Vec};
-use cubecl_common::{e2m1, e2m1x2, ue8m0};
-use cubecl_ir::features::{MmaConfig, ScaledMmaConfig};
-use cubecl_ir::{MatrixIdent, MatrixLayout};
+use cubecl_common::{e2m1, e2m1x2, e4m3, ue8m0};
+use cubecl_ir::{
+    OpaqueType,
+    features::{MmaConfig, ScaledMmaConfig},
+    types::{MatrixIdent, MatrixLayout},
+};
 use half::{bf16, f16};
 use num_traits::NumCast;
-
-#[cube(launch)]
-/// Executes Out = Lhs @ Rhs.T
-pub fn kernel_simple_f16_m16n16k16_gmem(lhs: &[f16], rhs: &[f16], out: &mut [f32]) {
-    let a = cmma::Matrix::<f16>::from_slice(
-        cmma::MatrixIdent::A,
-        16usize,
-        16usize,
-        16usize,
-        cmma::MatrixLayout::RowMajor,
-        lhs,
-        16,
-    );
-    let b = cmma::Matrix::<f16>::from_slice(
-        cmma::MatrixIdent::B,
-        16usize,
-        16usize,
-        16usize,
-        cmma::MatrixLayout::ColMajor,
-        rhs,
-        16,
-    );
-    let c = cmma::Matrix::<f32>::from_value(
-        cmma::MatrixIdent::Accumulator,
-        16usize,
-        16usize,
-        16usize,
-        cmma::MatrixLayout::Undefined,
-        0.0,
-    );
-
-    cmma::execute(&a, &b, &c, &c);
-
-    cmma::store(out, &c, 16, cmma::MatrixLayout::RowMajor);
-}
 
 #[cube(launch)]
 /// Executes Out = Lhs @ Rhs.T
@@ -381,11 +350,11 @@ pub fn cast_matrix_bf16(input: &[f32], out: &mut [bf16]) {
     cmma::store(out, &output, 16, cmma::MatrixLayout::RowMajor);
 }
 
-pub fn test_simple_1_vectorized<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+pub fn test_simple_1_vectorized<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::F16).into(),
-        b_type: ElemType::Float(FloatKind::F16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::F16),
+        b_type: ElemType::Float(FloatKind::F16),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: 16,
         k: 16,
         n: 16,
@@ -419,14 +388,11 @@ pub fn test_simple_1_vectorized<R: Runtime>(client: ComputeClient<R>, cube_dimen
     assert_eq!(test_simple_1_expected(), actual);
 }
 
-pub fn test_simple_1_vectorized_offset<R: Runtime>(
-    client: ComputeClient<R>,
-    cube_dimensions: CubeDim,
-) {
+pub fn test_simple_1_vectorized_offset<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::F16).into(),
-        b_type: ElemType::Float(FloatKind::F16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::F16),
+        b_type: ElemType::Float(FloatKind::F16),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: 16,
         k: 16,
         n: 16,
@@ -478,11 +444,49 @@ pub fn test_simple_1_vectorized_offset<R: Runtime>(
     );
 }
 
-pub fn test_simple_1<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+#[cube(launch)]
+/// Executes Out = Lhs @ Rhs.T with the accumulator declaring a layout.
+///
+/// An accumulator's layout is its own and never reaches the product, so declaring
+/// one must compile and change nothing.
+pub fn kernel_accumulator_row_major(lhs: &[f16], rhs: &[f16], out: &mut [f32]) {
+    let a = cmma::Matrix::<f16>::from_slice(
+        cmma::MatrixIdent::A,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::RowMajor,
+        lhs,
+        16,
+    );
+    let b = cmma::Matrix::<f16>::from_slice(
+        cmma::MatrixIdent::B,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::ColMajor,
+        rhs,
+        16,
+    );
+    let c = cmma::Matrix::<f32>::from_value(
+        cmma::MatrixIdent::Accumulator,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::RowMajor,
+        0.0,
+    );
+
+    cmma::execute(&a, &b, &c, &c);
+
+    cmma::store(out, &c, 16, cmma::MatrixLayout::RowMajor);
+}
+
+pub fn test_accumulator_row_major<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::F16).into(),
-        b_type: ElemType::Float(FloatKind::F16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::F16),
+        b_type: ElemType::Float(FloatKind::F16),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: 16,
         k: 16,
         n: 16,
@@ -499,7 +503,7 @@ pub fn test_simple_1<R: Runtime>(client: ComputeClient<R>, cube_dimensions: Cube
     let out = client.empty(core::mem::size_of::<f32>() * 256);
 
     unsafe {
-        kernel_simple_f16_m16n16k16_gmem::launch(
+        kernel_accumulator_row_major::launch(
             &client,
             CubeCount::Static(1, 1, 1),
             cube_dimensions,
@@ -513,6 +517,132 @@ pub fn test_simple_1<R: Runtime>(client: ComputeClient<R>, cube_dimensions: Cube
     let actual = f32::from_bytes(&actual);
 
     assert_eq!(test_simple_1_expected(), actual);
+}
+
+pub fn test_simple_1<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
+    test_simple_1_typed::<R, f16, f32>(client, cube_dimensions);
+}
+
+#[cube(launch)]
+/// Executes Out = Lhs @ Rhs.T, with `I` operands accumulating in `A`.
+pub fn kernel_simple_m16n16k16_gmem<I: Float, A: Float>(lhs: &[I], rhs: &[I], out: &mut [A]) {
+    let a = cmma::Matrix::<I>::from_slice(
+        cmma::MatrixIdent::A,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::RowMajor,
+        lhs,
+        16,
+    );
+    let b = cmma::Matrix::<I>::from_slice(
+        cmma::MatrixIdent::B,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::ColMajor,
+        rhs,
+        16,
+    );
+    let c = cmma::Matrix::<A>::from_value(
+        cmma::MatrixIdent::Accumulator,
+        16usize,
+        16usize,
+        16usize,
+        cmma::MatrixLayout::Undefined,
+        A::from_int(0),
+    );
+
+    cmma::execute(&a, &b, &c, &c);
+
+    cmma::store(out, &c, 16, cmma::MatrixLayout::RowMajor);
+}
+
+/// [`test_simple_1`] on `I` operands accumulating in `A`, where the device has that form.
+/// The operands are small integers, exact in any half-precision type; the products are summed
+/// in `A`, so a 16-bit accumulator is checked to its own precision.
+pub fn test_simple_1_typed<R: Runtime, I: Float + CubeElement, A: Float + CubeElement>(
+    client: Client,
+    cube_dimensions: CubeDim,
+) {
+    if !client.features().matmul.cmma.contains(&MmaConfig {
+        a_type: I::cube_type(),
+        b_type: I::cube_type(),
+        cd_type: A::cube_type(),
+        m: 16,
+        k: 16,
+        n: 16,
+    }) {
+        println!("Unsupported, skipping");
+        return;
+    }
+
+    let lhs: Vec<I> = (0..256).map(|i| I::from_int(i)).collect();
+    let rhs: Vec<I> = (0..256).map(|i| I::from_int(i % 8)).collect();
+
+    let lhs = client.create_from_slice(I::as_bytes(&lhs));
+    let rhs = client.create_from_slice(I::as_bytes(&rhs));
+    let out = client.empty(core::mem::size_of::<A>() * 256);
+
+    kernel_simple_m16n16k16_gmem::launch::<I, A>(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        cube_dimensions,
+        unsafe { BufferArg::from_raw_parts(lhs, 256) },
+        unsafe { BufferArg::from_raw_parts(rhs, 256) },
+        unsafe { BufferArg::from_raw_parts(out.clone(), 256) },
+    );
+
+    let actual = client.read_one_unchecked(out);
+    let actual = A::from_bytes(&actual);
+    assert_eq!(actual.len(), 256, "a failed launch reads back nothing");
+
+    let epsilon = A::EPSILON.to_f32().unwrap();
+    for (i, (expected, actual)) in test_simple_1_expected().into_iter().zip(actual).enumerate() {
+        let actual = actual.to_f32().unwrap();
+        // Sixteen roundings of a running sum, each within half an ulp of it.
+        let tolerance = expected * epsilon * 8.0;
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "element {i}: expected {expected}, got {actual}"
+        );
+    }
+}
+
+#[cube(launch)]
+pub fn kernel_unsupported_fragment(out: &mut [f32]) {
+    let acc = cmma::Matrix::<f32>::from_value(
+        cmma::MatrixIdent::Accumulator,
+        3usize,
+        5usize,
+        7usize,
+        cmma::MatrixLayout::Undefined,
+        0.0,
+    );
+    cmma::store(out, &acc, 5, cmma::MatrixLayout::RowMajor);
+}
+
+pub fn test_unsupported_fragment<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
+    let out = client.empty(core::mem::size_of::<f32>() * 16);
+
+    kernel_unsupported_fragment::launch(
+        &client,
+        CubeCount::Static(1, 1, 1),
+        cube_dimensions,
+        unsafe { BufferArg::from_raw_parts(out.clone(), 16) },
+    );
+
+    // The compile failure claims the buffer the launch was given; reading it
+    // is what reports the error — a launch failure is not the flush's to
+    // report any more.
+    let error = client
+        .read_one(out)
+        .expect_err("a fragment shape no device advertises must fail compilation");
+    let message = alloc::format!("{error:?}");
+    assert!(
+        message.contains("cooperative matrix fragment"),
+        "expected a cooperative matrix validation error, got: {message}"
+    );
 }
 
 pub fn test_simple_1_expected() -> Vec<f32> {
@@ -541,9 +671,9 @@ pub fn test_simple_1_expected() -> Vec<f32> {
     ]
 }
 
-pub fn test_simple_cube<R: Runtime>(client: ComputeClient<R>, cube_dimensions: u32) {
-    let ab_ty = ElemType::Float(FloatKind::F16).into();
-    let cd_ty = ElemType::Float(FloatKind::F32).into();
+pub fn test_simple_cube<R: Runtime>(client: Client, cube_dimensions: u32) {
+    let ab_ty = ElemType::Float(FloatKind::F16);
+    let cd_ty = ElemType::Float(FloatKind::F32);
     let config = client.features().matmul.cube_mma.iter().find(|cfg| {
         cfg.a_type == ab_ty
             && cfg.b_type == ab_ty
@@ -597,9 +727,9 @@ pub fn test_simple_cube<R: Runtime>(client: ComputeClient<R>, cube_dimensions: u
     assert_eq!(test_simple_cube_expected(m, n, k), actual);
 }
 
-pub fn test_simple_cube_tensor<R: Runtime>(client: ComputeClient<R>, cube_dimensions: u32) {
-    let ab_ty = ElemType::Float(FloatKind::F16).into();
-    let cd_ty = ElemType::Float(FloatKind::F32).into();
+pub fn test_simple_cube_tensor<R: Runtime>(client: Client, cube_dimensions: u32) {
+    let ab_ty = ElemType::Float(FloatKind::F16);
+    let cd_ty = ElemType::Float(FloatKind::F32);
     let config = client.features().matmul.cube_mma.iter().find(|cfg| {
         cfg.a_type == ab_ty
             && cfg.b_type == ab_ty
@@ -688,7 +818,7 @@ pub fn test_simple_cube_expected(m: usize, n: usize, k: usize) -> Vec<f32> {
 }
 
 // pub fn test_simple_2<R: Runtime>(
-//     client: ComputeClient<R>,
+//     client: Client,
 //     cube_dimensions: CubeDim,
 // ) {
 //     if !client.features().matmul.cmma.contains(&MmaConfig {
@@ -729,11 +859,11 @@ pub fn test_simple_cube_expected(m: usize, n: usize, k: usize) -> Vec<f32> {
 //     assert_eq!(expected, actual);
 // }
 
-pub fn test_cmma_cast_f16<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+pub fn test_cmma_cast_f16<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::F16).into(),
-        b_type: ElemType::Float(FloatKind::F16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::F16),
+        b_type: ElemType::Float(FloatKind::F16),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: 16,
         k: 16,
         n: 16,
@@ -763,22 +893,24 @@ pub fn test_cmma_cast_f16<R: Runtime>(client: ComputeClient<R>, cube_dimensions:
     assert_eq!(actual, expected);
 }
 
-pub fn test_cmma_cast_bf16<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+/// Casting an `f32` accumulator to `bf16` needs a `bf16` accumulator fragment, which only some
+/// devices have (RDNA's WMMA does, NVIDIA's does not).
+pub fn test_cmma_cast_bf16<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::BF16).into(),
-        b_type: ElemType::Float(FloatKind::BF16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::BF16),
+        b_type: ElemType::Float(FloatKind::BF16),
+        cd_type: ElemType::Float(FloatKind::BF16),
         m: 16,
         k: 16,
         n: 16,
     }) {
-        // We can't execute the test, skip.
+        println!("Unsupported, skipping");
         return;
     }
 
     let input: Vec<f32> = (0..256).map(|i| i as f32).collect();
     let input = client.create_from_slice(f32::as_bytes(&input));
-    let out = client.empty(core::mem::size_of::<f16>() * 256);
+    let out = client.empty(core::mem::size_of::<bf16>() * 256);
 
     unsafe {
         cast_matrix_bf16::launch(
@@ -797,11 +929,11 @@ pub fn test_cmma_cast_bf16<R: Runtime>(client: ComputeClient<R>, cube_dimensions
     assert_eq!(actual, expected);
 }
 
-pub fn test_simple_tf32<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+pub fn test_simple_tf32<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::TF32).into(),
-        b_type: ElemType::Float(FloatKind::TF32).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::TF32),
+        b_type: ElemType::Float(FloatKind::TF32),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: 16,
         k: 8,
         n: 16,
@@ -895,14 +1027,14 @@ pub fn kernel_strided(
     cmma::store(out, &c, 16, cmma::MatrixLayout::RowMajor);
 }
 
-pub fn test_cmma_strided<R: Runtime>(client: ComputeClient<R>, cube_dimensions: CubeDim) {
+pub fn test_cmma_strided<R: Runtime>(client: Client, cube_dimensions: CubeDim) {
     // Lhs (row major) will have strided tiles
     let (m, n, k) = (16, 16, 32);
     let (t_m, t_n, t_k) = (16, 16, 16);
     if !client.features().matmul.cmma.contains(&MmaConfig {
-        a_type: ElemType::Float(FloatKind::F16).into(),
-        b_type: ElemType::Float(FloatKind::F16).into(),
-        cd_type: ElemType::Float(FloatKind::F32).into(),
+        a_type: ElemType::Float(FloatKind::F16),
+        b_type: ElemType::Float(FloatKind::F16),
+        cd_type: ElemType::Float(FloatKind::F32),
         m: t_m as u32,
         k: t_k as u32,
         n: t_n as u32,
@@ -1068,7 +1200,7 @@ pub fn test_cmma_manual<
     B: CubeElement + Scalar + NumCast,
     CD: CubeElement + Numeric,
 >(
-    client: ComputeClient<R>,
+    client: Client,
     cube_dimensions: CubeDim,
     (m, n, k): (usize, usize, usize),
 ) {
@@ -1106,7 +1238,7 @@ pub fn test_cmma_manual<
     let out = client.create_from_slice(CD::as_bytes(&acc));
 
     unsafe {
-        kernel_manual::launch::<A, B, CD, R>(
+        kernel_manual::launch::<A, B, CD>(
             &client,
             CubeCount::Static(1, 1, 1),
             cube_dimensions,
@@ -1173,7 +1305,7 @@ pub fn kernel_manual_ldmatrix<AB: Numeric, CD: Numeric, N: Size>(
     let def = cmma::MmaDefinition::<AB, AB, CD>::new(size_m, size_n, size_k);
     let lane_id = UNIT_POS_PLANE as usize;
 
-    let elem_size = AB::type_size();
+    let elem_size = AB::size();
     let width = comptime![16 / elem_size];
 
     let mut stage_a = Shared::new_aligned_slice(size_m * size_k, 16usize);
@@ -1245,7 +1377,7 @@ pub fn test_cmma_manual_ldmatrix<
     AB: CubeElement + Numeric,
     CD: CubeElement + Numeric,
 >(
-    client: ComputeClient<R>,
+    client: Client,
     cube_dimensions: CubeDim,
     (m, n, k): (usize, usize, usize),
 ) {
@@ -1267,6 +1399,13 @@ pub fn test_cmma_manual_ldmatrix<
         return;
     }
 
+    // The kernel stages both operands through shared memory with a barrier, so a runtime with
+    // the matrix instructions but not the barrier cannot run it either.
+    if !client.properties().supports_type(OpaqueType::Barrier) {
+        println!("Skipping test: the runtime has no barrier to stage the operands through");
+        return;
+    }
+
     // LHS: matrix where each element = (row_index * 2) + column_index
     let lhs: Vec<AB> = (0..m)
         .flat_map(|i| (0..k).map(move |j| AB::from_int((i * 2 + j) as i64)))
@@ -1283,7 +1422,7 @@ pub fn test_cmma_manual_ldmatrix<
     let out = client.create_from_slice(CD::as_bytes(&acc));
 
     unsafe {
-        kernel_manual_ldmatrix::launch::<AB, CD, R>(
+        kernel_manual_ldmatrix::launch::<AB, CD>(
             &client,
             CubeCount::Static(1, 1, 1),
             cube_dimensions,
@@ -1356,24 +1495,20 @@ pub fn kernel_scaled<A: Scalar, B: Scalar, CD: Numeric, S: Scalar, NA: Size, NB:
         cmma::MmaDefinition::<A, B, CD>::new_scaled::<S>(size_m, size_n, size_k, scales_factor);
     let lane_id = UNIT_POS_PLANE;
 
-    let elem_count_a = def.elems_per_lane(MatrixIdent::A);
     let vector_size_a = def.vector_size(MatrixIdent::A);
-    let vector_count_a = comptime!(elem_count_a / vector_size_a);
+    let vector_count_a = def.vectors_per_lane(MatrixIdent::A);
     let mut registers_a = Array::<Vector<A, NA>>::new(vector_count_a);
 
-    let elem_count_b = def.elems_per_lane(MatrixIdent::B);
     let vector_size_b = def.vector_size(MatrixIdent::B);
-    let vector_count_b = comptime!(elem_count_b / vector_size_b);
+    let vector_count_b = def.vectors_per_lane(MatrixIdent::B);
     let mut registers_b = Array::<Vector<B, NB>>::new(vector_count_b);
 
-    let elem_count_c = def.elems_per_lane(MatrixIdent::Accumulator);
     let vector_size_c = def.vector_size(MatrixIdent::Accumulator);
-    let vector_count_c = comptime!(elem_count_c / vector_size_c);
+    let vector_count_c = def.vectors_per_lane(MatrixIdent::Accumulator);
     let mut registers_c = Array::<Vector<CD, NC>>::new(vector_count_c);
 
-    let elem_count_d = def.elems_per_lane(MatrixIdent::Accumulator);
     let vector_size_d = def.vector_size(MatrixIdent::Accumulator);
-    let vector_count_d = comptime!(elem_count_d / vector_size_d);
+    let vector_count_d = def.vectors_per_lane(MatrixIdent::Accumulator);
 
     let scales_count = def.scales_count();
     let size!(NS) = def.scales_vector_size();
@@ -1448,7 +1583,7 @@ pub fn test_cmma_scaled<
     A: CubeElement + Scalar + NumCast,
     B: CubeElement + Scalar + NumCast,
 >(
-    client: ComputeClient<R>,
+    client: Client,
     cube_dimensions: CubeDim,
     (m, n, k): (usize, usize, usize),
     scales_factor: usize,
@@ -1510,7 +1645,7 @@ pub fn test_cmma_scaled<
     let out = client.create_from_slice(f32::as_bytes(&out));
 
     unsafe {
-        kernel_scaled::launch::<A, B, f32, S, R>(
+        kernel_scaled::launch::<A, B, f32, S>(
             &client,
             CubeCount::Static(1, 1, 1),
             cube_dimensions,
@@ -1559,17 +1694,44 @@ pub fn test_cmma_scaled<
         }
     }
 
-    assert_equals_approx::<R, f32>(&client, out, &expected, 0.03);
+    assert_equals_approx::<f32>(&client, out, &expected, 0.03);
 }
 
-pub fn test_cmma_scaled_fp4<R: Runtime>(
-    client: ComputeClient<R>,
+/// A block scale a scaled matrix instruction reads, as the fp4 test builds and checks one.
+pub trait BlockScale: CubeElement + Scalar {
+    /// The `n`th of a run of distinct positive scales.
+    fn nth(n: usize) -> Self;
+    fn to_f32(self) -> f32;
+}
+
+impl BlockScale for ue8m0 {
+    fn nth(n: usize) -> Self {
+        ue8m0::from_bits(120 + (n % 16) as u8)
+    }
+
+    fn to_f32(self) -> f32 {
+        ue8m0::to_f32(self)
+    }
+}
+
+/// The scale of NVFP4, read unsigned by the instruction: kept positive so the reference agrees.
+impl BlockScale for e4m3 {
+    fn nth(n: usize) -> Self {
+        e4m3::from_bits(0x30 + (n % 32) as u8)
+    }
+
+    fn to_f32(self) -> f32 {
+        e4m3::to_f32(self)
+    }
+}
+
+pub fn test_cmma_scaled_fp4<R: Runtime, S: BlockScale>(
+    client: Client,
     cube_dimensions: CubeDim,
     (m, n, k): (usize, usize, usize),
     scales_factor: usize,
 ) {
     type AB = e2m1x2;
-    type S = ue8m0;
 
     let ab_elem = AB::cube_type();
     let ab_vector_size = 32 / ab_elem.size_bits();
@@ -1605,7 +1767,7 @@ pub fn test_cmma_scaled_fp4<R: Runtime>(
     //println!("lhs: {lhs_data:?}");
     let lhs = e2m1x2::from_f32_slice(&lhs_data);
     let lhs_scales_data: Vec<S> = (0..m)
-        .flat_map(|i| (0..scales_factor).map(move |j| S::from_bits((i * 2 + j + 120) as u8)))
+        .flat_map(|i| (0..scales_factor).map(move |j| S::nth(i * 2 + j)))
         .collect();
 
     // RHS: matrix where each element = (row_index * 3) + column_index, col-major
@@ -1614,7 +1776,7 @@ pub fn test_cmma_scaled_fp4<R: Runtime>(
         .collect();
     let rhs = e2m1x2::from_f32_slice(&rhs_data);
     let rhs_scales_data: Vec<S> = (0..n)
-        .flat_map(|j| (0..scales_factor).map(move |i| S::from_bits((i * 3 + j + 120) as u8)))
+        .flat_map(|j| (0..scales_factor).map(move |i| S::nth(i * 3 + j)))
         .collect();
 
     let out = vec![0.0; m * n];
@@ -1626,7 +1788,7 @@ pub fn test_cmma_scaled_fp4<R: Runtime>(
     let out = client.create_from_slice(f32::as_bytes(&out));
 
     unsafe {
-        kernel_scaled::launch::<AB, AB, f32, S, R>(
+        kernel_scaled::launch::<AB, AB, f32, S>(
             &client,
             CubeCount::Static(1, 1, 1),
             cube_dimensions,
@@ -1675,7 +1837,7 @@ pub fn test_cmma_scaled_fp4<R: Runtime>(
         }
     }
 
-    assert_equals_approx::<R, f32>(&client, out, &expected, 0.03);
+    assert_equals_approx::<f32>(&client, out, &expected, 0.03);
 }
 
 #[allow(missing_docs)]
@@ -1693,6 +1855,27 @@ macro_rules! testgen_cmma {
         }
 
         #[$crate::runtime_tests::test_log::test]
+        fn test_cmma_simple_1_bf16() {
+            let client = TestRuntime::client(&Default::default());
+            let cube_dimensions = cube_dim::<TestRuntime>(&client);
+            cubecl_core::runtime_tests::cmma::test_simple_1_typed::<TestRuntime, half::bf16, f32>(
+                client,
+                cube_dimensions,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_cmma_simple_1_bf16_accumulator() {
+            let client = TestRuntime::client(&Default::default());
+            let cube_dimensions = cube_dim::<TestRuntime>(&client);
+            cubecl_core::runtime_tests::cmma::test_simple_1_typed::<
+                TestRuntime,
+                half::bf16,
+                half::bf16,
+            >(client, cube_dimensions);
+        }
+
+        #[$crate::runtime_tests::test_log::test]
         fn test_cmma_simple_1_vectorized() {
             let client = TestRuntime::client(&Default::default());
             let cube_dimensions = cube_dim::<TestRuntime>(&client);
@@ -1707,6 +1890,26 @@ macro_rules! testgen_cmma {
             let client = TestRuntime::client(&Default::default());
             let cube_dimensions = cube_dim::<TestRuntime>(&client);
             cubecl_core::runtime_tests::cmma::test_simple_1_vectorized_offset::<TestRuntime>(
+                client,
+                cube_dimensions,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_cmma_accumulator_row_major() {
+            let client = TestRuntime::client(&Default::default());
+            let cube_dimensions = cube_dim::<TestRuntime>(&client);
+            cubecl_core::runtime_tests::cmma::test_accumulator_row_major::<TestRuntime>(
+                client,
+                cube_dimensions,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_cmma_unsupported_fragment() {
+            let client = TestRuntime::client(&Default::default());
+            let cube_dimensions = cube_dim::<TestRuntime>(&client);
+            cubecl_core::runtime_tests::cmma::test_unsupported_fragment::<TestRuntime>(
                 client,
                 cube_dimensions,
             );
@@ -1762,7 +1965,6 @@ macro_rules! testgen_cmma {
             );
         }
 
-        #[ignore = "Technically invalid because bf16 Acc matrix doesn't exist"]
         #[$crate::runtime_tests::test_log::test]
         fn test_cmma_cast_bf16() {
             let client = TestRuntime::client(&Default::default());
@@ -1811,6 +2013,8 @@ macro_rules! testgen_cmma {
             test::<tf32, tf32, f32>(16, 8, 8);
             test::<f16, f16, f32>(16, 8, 16);
             test::<bf16, bf16, f32>(16, 8, 16);
+            test::<f16, f16, f32>(16, 8, 8);
+            test::<bf16, bf16, f32>(16, 8, 8);
             test::<e5m2, e5m2, f32>(16, 8, 32);
             test::<e4m3, e4m3, f32>(16, 8, 32);
             test::<e5m2, e4m3, f32>(16, 8, 32);
@@ -1882,10 +2086,15 @@ macro_rules! testgen_cmma {
         fn test_cmma_scaled_fp4() {
             use cubecl_common::*;
 
-            fn test(m: usize, n: usize, k: usize, factor: usize) {
+            fn test<S: cubecl_core::runtime_tests::cmma::BlockScale>(
+                m: usize,
+                n: usize,
+                k: usize,
+                factor: usize,
+            ) {
                 let client = TestRuntime::client(&Default::default());
                 let cube_dimensions = cube_dim::<TestRuntime>(&client);
-                cubecl_core::runtime_tests::cmma::test_cmma_scaled_fp4::<TestRuntime>(
+                cubecl_core::runtime_tests::cmma::test_cmma_scaled_fp4::<TestRuntime, S>(
                     client,
                     cube_dimensions,
                     (m, n, k),
@@ -1893,11 +2102,13 @@ macro_rules! testgen_cmma {
                 )
             }
 
-            // FP4 needs more design for transferring properly as packed values
-            test(16, 8, 64, 2);
+            // MXFP4: a power-of-two scale every 32 values.
+            test::<ue8m0>(16, 8, 64, 2);
+            // NVFP4: an `e4m3` scale every 16 values.
+            test::<e4m3>(16, 8, 64, 4);
         }
 
-        fn cube_dim<R: Runtime>(client: &ComputeClient<R>) -> CubeDim {
+        fn cube_dim<R: Runtime>(client: &Client) -> CubeDim {
             let plane_dim = client.properties().hardware.plane_size_max;
             CubeDim::new_1d(plane_dim)
         }

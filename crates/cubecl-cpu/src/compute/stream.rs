@@ -6,27 +6,26 @@ use cubecl_common::{bytes::Bytes, profile::ProfileDuration};
 use cubecl_core::{
     MemoryConfiguration,
     ir::MemoryDeviceProperties,
-    server::{
-        Binding, CopyDescriptor, IoError, ProfileError, ProfilingToken, ServerError,
-        StreamErrorMode,
-    },
+    server::{BufferBinding, CopyDescriptor, IoError, ProfileError, ProfilingToken, ServerError},
 };
-use cubecl_environment::backtrace::BackTrace;
-use cubecl_runtime::{
+use cubecl_environment::stream::StreamId;
+use cubecl_server::memory_management::relocation::{
+    HostCopies, RelocatableStream, RelocationNeed, RelocationReason,
+};
+use cubecl_server::memory_management::{Cleanup, PageUpdate};
+use cubecl_server::{
     logging::ServerLogger,
     memory_management::{
-        ManagedMemoryHandle, MemoryAllocationMode, MemoryManagement, MemoryManagementOptions,
+        ErrorGraph, FailureId, ManagedMemoryHandle, MemoryAllocationMode, MemoryManagement,
+        MemoryManagementOptions,
     },
     storage::{BytesResource, BytesStorage},
+    stream::StreamMemory,
     timestamp_profiler::TimestampProfiler,
 };
 use std::sync::{Arc, atomic::AtomicU64};
 
 pub struct CpuStream {
-    // TEMP: only read by the disabled unit-limit check in `enqueue_task`. Kept so
-    // the plumbing stays in place; remove the attribute when the check is restored.
-    #[allow(dead_code)]
-    pub(crate) max_units_per_cube: u32,
     pub(crate) memory_management: MemoryManagement<BytesStorage>,
     /// Dedicated pool for per-launch shared memory.
     ///
@@ -36,10 +35,54 @@ pub struct CpuStream {
     /// slice to shared memory, aliasing an input and corrupting it in place.
     pub(crate) shared_memory_management: MemoryManagement<BytesStorage>,
     pub(crate) timestamps: TimestampProfiler,
-    errors: Vec<ServerError>,
     threadpool: &'static spin::Mutex<Threadpool>,
     next_counter_step: u64,
     atomic_counter: Arc<CachePadded<AtomicU64>>,
+}
+
+impl StreamMemory for CpuStream {
+    fn failure(&self, binding: &BufferBinding) -> Option<FailureId> {
+        self.memory_management
+            .failure(&binding.memory, binding.range())
+    }
+
+    fn taint(&mut self, binding: &BufferBinding, failure: FailureId, failures: &mut ErrorGraph) {
+        self.memory_management
+            .taint(&binding.memory, binding.range(), failure, failures)
+    }
+
+    fn written(&mut self, binding: &BufferBinding, failures: &mut ErrorGraph) {
+        self.memory_management
+            .written(&binding.memory, binding.range(), failures)
+    }
+}
+
+impl RelocatableStream for CpuStream {
+    /// Never: the CPU records no graphs.
+    fn recording(&self) -> bool {
+        false
+    }
+
+    fn has_outdated(&self) -> bool {
+        self.memory_management.has_outdated()
+    }
+
+    fn relocation_need(&self) -> RelocationNeed {
+        self.memory_management.relocation_need()
+    }
+
+    fn bytes_allocated(&self) -> u64 {
+        self.memory_management.bytes_allocated()
+    }
+
+    fn relocate(&mut self, reason: RelocationReason, failures: &mut ErrorGraph) {
+        self.memory_management
+            .relocate(&mut HostCopies, reason, failures);
+    }
+
+    fn cleanup_memory(&mut self, failures: &mut ErrorGraph) {
+        self.memory_management.cleanup(Cleanup::Explicit, failures);
+    }
 }
 
 impl core::fmt::Debug for CpuStream {
@@ -50,16 +93,13 @@ impl core::fmt::Debug for CpuStream {
 
 impl CpuStream {
     pub fn new(
-        max_units_per_cube: u32,
         memory_properties: MemoryDeviceProperties,
         memory_config: MemoryConfiguration,
         logger: Arc<ServerLogger>,
     ) -> Self {
         // `memory_config` shapes the main pool only; the shared pool below is
         // left alone, as it has a deliberate configuration that must not be
-        // overridden. Pool layout overrides reach GPU runtimes through
-        // `configure_memory_pools`; the CPU runtime has no such override and
-        // keeps the config it's handed.
+        // overridden.
         let memory_management = MemoryManagement::from_configuration(
             BytesStorage::default(),
             &memory_properties,
@@ -78,128 +118,121 @@ impl CpuStream {
         let next_counter_step = 0;
         let atomic_counter = Arc::new(CachePadded::new(AtomicU64::new(0)));
         Self {
-            max_units_per_cube,
             memory_management,
             shared_memory_management,
             timestamps: TimestampProfiler::default(),
-            errors: Vec::new(),
             threadpool,
             next_counter_step,
             atomic_counter,
         }
     }
 
-    pub fn enqueue_task(&mut self, task: ScheduleTask) {
-        self.flush_uncheck();
+    pub fn enqueue_task(&mut self, task: ScheduleTask, failures: &mut ErrorGraph) {
+        // Launches pipeline: `ComputeTask::is_ready` orders tasks and the
+        // launch's resources ride in `SharedData::keepalive`, so the client
+        // only drains where that protocol does not cover:
+        // * a host `Write`, which copies on this thread and would race a
+        //   queued kernel reading the buffer;
+        // * a shared-memory kernel, whose pool reservations are released at
+        //   enqueue — sound only while one such launch has the pool to itself.
         match task {
             ScheduleTask::Write { data, mut buffer } => {
+                self.submit();
                 buffer.resource_mut().write().copy_from_slice(&data);
             }
             ScheduleTask::Execute {
-                mlir_engine,
+                pliron_engine,
                 bindings,
                 cube_dim,
                 cube_count,
+                ..
             } => {
-                let requested = cube_dim.num_elems();
-                // TEMP: the threadpool now grows to fit any cube_dim (it spawns one
-                // worker per unit for barrier kernels, see Threadpool::execute_data),
-                // so the per-launch unit-count limit is disabled. Uncomment to restore
-                // the hard cap (also re-add the LaunchError/ResourceLimitError imports).
-                // let max = self.max_units_per_cube;
-                // if requested > max {
-                //     let launch_error: LaunchError = ResourceLimitError::MaxUnitPerCube {
-                //         requested,
-                //         max,
-                //         backtrace: BackTrace::capture(),
-                //     }
-                //     .into();
-                //     self.error(launch_error.into());
-                //     return;
-                // }
-
+                if !pliron_engine
+                    .requirements()
+                    .shared_memories
+                    .blocks
+                    .is_empty()
+                {
+                    self.submit();
+                }
+                // No unit cap: the threadpool grows to fit any cube_dim, one
+                // worker per unit for barrier kernels.
+                let units = cube_dim.num_elems();
                 self.threadpool.lock().execute_data(
-                    mlir_engine,
+                    pliron_engine,
                     bindings,
                     cube_dim,
                     cube_count,
                     &mut self.shared_memory_management,
+                    failures,
                     self.next_counter_step,
                     &self.atomic_counter,
                 );
-                self.next_counter_step += requested as u64;
+                self.next_counter_step += units as u64;
             }
         }
     }
 
-    fn flush_uncheck(&mut self) {
+    /// Wait for the queued work and surface nothing.
+    ///
+    /// For the pooled paths that flush the stream without any logical stream
+    /// asking — a full task queue, the ordering barrier before a write, the
+    /// scheduler aligning streams. Whatever is queued stays queued, for the
+    /// flush of the stream that owns it.
+    pub fn submit(&mut self) {
+        // Spin briefly, then yield between polls: the client is not pinned,
+        // and a pure spin parked on a worker's logical CPU keeps that worker
+        // off it until the next timer tick (~3 ms unit-start stalls).
+        const SPINS_BEFORE_YIELD: u32 = 1_000;
+        let mut spins = 0u32;
         while self
             .atomic_counter
             .load(std::sync::atomic::Ordering::Acquire)
             != self.next_counter_step
         {
-            std::hint::spin_loop();
-        }
-    }
-
-    pub fn flush(&mut self, mode: StreamErrorMode) -> Result<(), ServerError> {
-        self.flush_uncheck();
-        self.flush_errors(mode)
-    }
-
-    fn flush_errors(&mut self, mode: StreamErrorMode) -> Result<(), ServerError> {
-        if mode.flush {
-            let errors = self.flush_errors_queue();
-
-            if !mode.ignore && !errors.is_empty() {
-                let error = ServerError::ServerUnhealthy {
-                    errors,
-                    backtrace: BackTrace::capture(),
-                };
-                return Err(error);
+            spins += 1;
+            if spins < SPINS_BEFORE_YIELD {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
             }
-        } else if !mode.ignore && !self.errors.is_empty() {
-            let error = ServerError::ServerUnhealthy {
-                errors: self.errors.clone(),
-                backtrace: BackTrace::capture(),
-            };
-            return Err(error);
         }
+    }
 
+    /// Wait for the queued work. A launch failure is not the flush's to
+    /// report: it lives on the buffers the launch left unwritten, and
+    /// surfaces on any read, sync or check of them.
+    pub fn flush(&mut self, _owner: StreamId) -> Result<(), ServerError> {
+        self.submit();
         Ok(())
     }
 
-    pub(crate) fn flush_errors_queue(&mut self) -> Vec<ServerError> {
-        let errors = core::mem::take(&mut self.errors);
-
-        if !errors.is_empty() {
-            self.timestamps.error(ProfileError::Unknown {
-                reason: alloc::format!("{:?}", errors),
-                backtrace: BackTrace::capture(),
-            });
-        }
-
-        errors
-    }
-
-    /// Returns whether the stream can accept new tasks.
-    pub fn is_healthy(&self) -> bool {
-        self.errors.is_empty()
-    }
-
-    /// Registers a new error into the error sink.
-    pub fn error(&mut self, error: ServerError) {
-        self.errors.push(error);
+    /// Mark every open profile invalid: a failure inside a profiling window
+    /// invalidates the measurement. A no-op with no profile open.
+    pub fn profile_failure(&mut self, error: &ServerError) {
+        self.timestamps.failure(error);
     }
 
     /// Allocates a new empty buffer using the main memory pool.
-    pub fn empty(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
-        self.memory_management.reserve(size)
+    pub fn empty(
+        &mut self,
+        size: u64,
+        failures: &mut ErrorGraph,
+    ) -> Result<ManagedMemoryHandle, IoError> {
+        self.memory_management
+            .reserve(size, PageUpdate::Allow, failures)
     }
 
     /// Maps handles to their corresponding buffers.
-    pub fn bind(&mut self, reserved: ManagedMemoryHandle, new: ManagedMemoryHandle) {
-        self.memory_management.bind(reserved, new, 0).unwrap();
+    pub fn bind(
+        &mut self,
+        reserved: ManagedMemoryHandle,
+        new: ManagedMemoryHandle,
+        failures: &mut ErrorGraph,
+    ) {
+        self.memory_management
+            .bind(reserved, new, 0, failures)
+            .unwrap();
     }
 
     pub fn read_async(
@@ -222,32 +255,39 @@ impl CpuStream {
         async move { res }
     }
 
-    pub fn sync(&mut self) -> Result<(), ServerError> {
-        self.flush(StreamErrorMode {
-            ignore: false,
-            flush: true,
-        })
-    }
-
-    pub fn start_profile(&mut self) -> Result<ProfilingToken, ServerError> {
-        self.sync()?;
+    pub fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError> {
+        self.flush(stream_id)?;
 
         Ok(self.timestamps.start())
     }
 
-    pub fn end_profile(&mut self, token: ProfilingToken) -> Result<ProfileDuration, ProfileError> {
-        if let Err(err) = self.sync() {
+    pub fn end_profile(
+        &mut self,
+        token: ProfilingToken,
+        stream_id: StreamId,
+    ) -> Result<ProfileDuration, ProfileError> {
+        if let Err(err) = self.flush(stream_id) {
             self.timestamps.error(ProfileError::Server(Box::new(err)));
         }
 
         self.timestamps.stop(token)
     }
 
+    /// Drop `token`'s window without measuring it.
+    ///
+    /// Does not flush, which is the difference from
+    /// [`end_profile`](Self::end_profile): the flush is there to put the work
+    /// being measured behind the closing instant, and nothing is going to read
+    /// this one.
+    pub fn abandon_profile(&mut self, token: ProfilingToken) {
+        self.timestamps.abandon(token);
+    }
+
     pub fn allocation_mode(&mut self, mode: MemoryAllocationMode) {
         self.memory_management.mode(mode);
     }
 
-    pub fn get_resource(&mut self, binding: Binding) -> Result<BytesResource, IoError> {
+    pub fn get_resource(&mut self, binding: BufferBinding) -> Result<BytesResource, IoError> {
         self.memory_management.get_resource(
             binding.memory,
             binding.offset_start,

@@ -1,3 +1,4 @@
+use cubecl_runtime::runtime::Runtime;
 use std::{println, vec::Vec};
 
 use crate::{self as cubecl};
@@ -9,7 +10,7 @@ use cubecl_ir::features::AtomicUsage;
 pub enum NumericAtomicOp {
     Load,
     Store,
-    Swap,
+    Exchange,
     Add,
     Sub,
     Min,
@@ -24,24 +25,20 @@ pub enum IntAtomicOp {
     CompareExchange,
 }
 
-fn supports_feature<R: Runtime, F: Numeric>(
-    client: &ComputeClient<R>,
-    feat: AtomicUsage,
-    vector_size: usize,
-) -> bool {
-    let ty = Type::atomic(F::as_type_native_unchecked().with_vector_size(vector_size));
+fn supports_feature<F: Numeric>(client: &Client, feat: AtomicUsage, vector_size: usize) -> bool {
+    let ty = Type::atomic(F::elem_type_native().with_vector_size(vector_size));
     client.properties().atomic_type_usage(ty).contains(feat)
 }
 
-fn require_feature<R: Runtime, F: Numeric>(
-    client: &ComputeClient<R>,
+fn require_feature<F: Numeric>(
+    client: &Client,
     feat: AtomicUsage,
     vector_size: usize,
     operation: &str,
 ) -> bool {
-    let ty = Atomic::<F>::as_type_native_unchecked().with_vector_size(vector_size);
+    let ty = Type::atomic(F::elem_type_native().with_vector_size(vector_size));
 
-    if supports_feature::<R, F>(client, feat, vector_size) {
+    if supports_feature::<F>(client, feat, vector_size) {
         println!("{ty} {operation} supported - running");
         true
     } else {
@@ -68,7 +65,7 @@ fn numeric_op_name(op: NumericAtomicOp) -> &'static str {
     match op {
         NumericAtomicOp::Load => "Load",
         NumericAtomicOp::Store => "Store",
-        NumericAtomicOp::Swap => "Swap",
+        NumericAtomicOp::Exchange => "Swap",
         NumericAtomicOp::Add => "Add",
         NumericAtomicOp::Sub => "Sub",
         NumericAtomicOp::Min => "Min",
@@ -78,9 +75,8 @@ fn numeric_op_name(op: NumericAtomicOp) -> &'static str {
 
 fn numeric_op_feature(op: NumericAtomicOp) -> AtomicUsage {
     match op {
-        NumericAtomicOp::Load | NumericAtomicOp::Store | NumericAtomicOp::Swap => {
-            AtomicUsage::LoadStore
-        }
+        NumericAtomicOp::Load | NumericAtomicOp::Store => AtomicUsage::LoadStore,
+        NumericAtomicOp::Exchange => AtomicUsage::Exchange,
         NumericAtomicOp::Add | NumericAtomicOp::Sub => AtomicUsage::Add,
         NumericAtomicOp::Min | NumericAtomicOp::Max => AtomicUsage::MinMax,
     }
@@ -90,7 +86,7 @@ fn numeric_expected(op: NumericAtomicOp) -> i64 {
     match op {
         NumericAtomicOp::Load => 12,
         NumericAtomicOp::Store => 5,
-        NumericAtomicOp::Swap => 5,
+        NumericAtomicOp::Exchange => 5,
         NumericAtomicOp::Add => 17,
         NumericAtomicOp::Sub => 7,
         NumericAtomicOp::Min => 5,
@@ -134,8 +130,8 @@ pub fn kernel_atomic_numeric<I: Numeric, N: Size>(
         match op {
             NumericAtomicOp::Load => output[0] = atomics[0].load(),
             NumericAtomicOp::Store => atomics[0].store(input[0]),
-            NumericAtomicOp::Swap => {
-                atomics[0].swap(Vector::from_int(5));
+            NumericAtomicOp::Exchange => {
+                atomics[0].exchange(Vector::from_int(5));
             }
             NumericAtomicOp::Add => {
                 atomics[0].fetch_add(Vector::from_int(5));
@@ -154,11 +150,11 @@ pub fn kernel_atomic_numeric<I: Numeric, N: Size>(
 }
 
 pub fn test_kernel_atomic_numeric<R: Runtime, F: Numeric + CubeElement>(
-    client: ComputeClient<R>,
+    client: Client,
     vector_size: usize,
     op: NumericAtomicOp,
 ) {
-    if !require_feature::<R, F>(
+    if !require_feature::<F>(
         &client,
         numeric_op_feature(op),
         vector_size,
@@ -171,7 +167,7 @@ pub fn test_kernel_atomic_numeric<R: Runtime, F: Numeric + CubeElement>(
     let atomic_handle = client.create_from_slice(F::as_bytes(&filled_data::<F>(vector_size, 12)));
     let output_handle = client.create_from_slice(F::as_bytes(&filled_data::<F>(vector_size, 0)));
 
-    kernel_atomic_numeric::launch::<F, R>(
+    kernel_atomic_numeric::launch::<F>(
         &client,
         CubeCount::new_single(),
         CubeDim::new_1d(1),
@@ -192,7 +188,7 @@ pub fn test_kernel_atomic_numeric<R: Runtime, F: Numeric + CubeElement>(
 }
 
 pub fn test_kernel_atomic_numeric_all_sizes<R: Runtime, F: Numeric + CubeElement>(
-    client: ComputeClient<R>,
+    client: Client,
     op: NumericAtomicOp,
 ) {
     for vector_size in [1, 2, 4] {
@@ -224,18 +220,15 @@ pub fn kernel_atomic_int<I: Int>(
     }
 }
 
-pub fn test_kernel_atomic_int<R: Runtime, I: Int + CubeElement>(
-    client: ComputeClient<R>,
-    op: IntAtomicOp,
-) {
-    if !require_feature::<R, I>(&client, int_op_feature(op), 1, int_op_name(op)) {
+pub fn test_kernel_atomic_int<R: Runtime, I: Int + CubeElement>(client: Client, op: IntAtomicOp) {
+    if !require_feature::<I>(&client, int_op_feature(op), 1, int_op_name(op)) {
         return;
     }
 
     let handle = client.create_from_slice(I::as_bytes(&[I::from_int(int_atomic_initial_value())]));
     let output_handle = client.create_from_slice(I::as_bytes(&[I::from_int(0)]));
 
-    kernel_atomic_int::launch::<I, R>(
+    kernel_atomic_int::launch::<I>(
         &client,
         CubeCount::new_single(),
         CubeDim::new_1d(1),
@@ -263,10 +256,8 @@ pub fn kernel_atomic_max_contention<I: Numeric>(atomics: &[Atomic<I>]) {
 }
 
 /// Many threads race `fetch_max` into one cell. The result must be the largest contribution.
-pub fn test_kernel_atomic_max_contention<R: Runtime, I: Numeric + CubeElement>(
-    client: ComputeClient<R>,
-) {
-    if !require_feature::<R, I>(&client, AtomicUsage::MinMax, 1, "Max contention") {
+pub fn test_kernel_atomic_max_contention<R: Runtime, I: Numeric + CubeElement>(client: Client) {
+    if !require_feature::<I>(&client, AtomicUsage::MinMax, 1, "Max contention") {
         return;
     }
 
@@ -278,7 +269,7 @@ pub fn test_kernel_atomic_max_contention<R: Runtime, I: Numeric + CubeElement>(
 
     let handle = client.create_from_slice(I::as_bytes(&[I::from_int(0)]));
 
-    kernel_atomic_max_contention::launch::<I, R>(
+    kernel_atomic_max_contention::launch::<I>(
         &client,
         CubeCount::new_1d(cube_count),
         CubeDim::new_1d(cube_dim),
@@ -332,7 +323,7 @@ macro_rules! testgen_atomic_int {
         );
         test_numeric_op!(
             test_atomic_swap_int,
-            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Swap
+            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Exchange
         );
         test_numeric_op!(
             test_atomic_add_int,
@@ -421,7 +412,7 @@ macro_rules! testgen_atomic_uint {
         );
         test_numeric_op!(
             test_atomic_swap_uint,
-            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Swap
+            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Exchange
         );
         test_numeric_op!(
             test_atomic_add_uint,
@@ -499,7 +490,7 @@ macro_rules! testgen_atomic_float {
 
         test_numeric_op!(
             test_atomic_swap_float,
-            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Swap
+            cubecl_core::runtime_tests::atomic::NumericAtomicOp::Exchange
         );
 
         test_numeric_op!(

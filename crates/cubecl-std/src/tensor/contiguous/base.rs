@@ -11,7 +11,7 @@ use crate::{
 use cubecl::prelude::*;
 use cubecl_core::{
     self as cubecl, calculate_cube_count_elemwise,
-    ir::{StorageType, VectorSize},
+    ir::VectorSize,
     tensor_vector_size_parallel,
     zspace::{Strides, strides},
 };
@@ -98,7 +98,7 @@ fn copy_kernel<T: Numeric, N: Size>(
     output: &mut [Vector<T, N>],
     out_layout: LinearLayout,
     #[comptime] elems_per_thread: usize,
-    #[define(T)] _elem: StorageType,
+    #[define(T)] _elem: ElemType,
 ) {
     let offset_linear = ABSOLUTE_POS * elems_per_thread;
 
@@ -123,7 +123,7 @@ fn copy_kernel_pack<T: Numeric, N: Size>(
     output: &mut [Vector<T, N>],
     out_layout: LinearLayout,
     #[comptime] elems_per_thread: usize,
-    #[define(T)] _elem: StorageType,
+    #[define(T)] _elem: ElemType,
 ) {
     let vector_size = output.vector_size().comptime();
     let vectors_per_thread = elems_per_thread / vector_size;
@@ -164,7 +164,7 @@ fn index_packed<N: Int>(
     #[comptime] packing: usize,
     #[comptime] rank: usize,
 ) -> N {
-    let type_size_bits = N::type_size_bits().comptime();
+    let type_size_bits = N::size_bits().comptime();
     let bits_per_elem = type_size_bits / packing;
     let mask = (1u32 << bits_per_elem) - 1;
     let mask = N::cast_from(mask);
@@ -208,7 +208,7 @@ fn copy_kernel_packed<T: Int, N: Size>(
     #[comptime] packing: usize,
     #[comptime] rank: usize,
     #[comptime] elems_per_thread: usize,
-    #[define(T)] _elem: StorageType,
+    #[define(T)] _elem: ElemType,
 ) {
     let vector_size = output.vector_size().comptime();
     let vectors_per_thread = elems_per_thread / vector_size;
@@ -247,21 +247,21 @@ fn copy_kernel_packed<T: Int, N: Size>(
 }
 
 /// Make a jit tensor contiguous, using the pitched allocator if available.
-/// See [`create_tensor`](cubecl_runtime::client::ComputeClient::create_tensor).
+/// See [`create_tensor`](cubecl_runtime::client::Client::create_tensor).
 /// Handles unpacking and repacking packed tensors (i.e. quantized values).
 /// `shape` refers to the actual (unpacked) shape of the tensor, while `packing` specifies the
 /// number of elements in each storage element.
 ///
 /// # Warning
 /// This assumes `u32` or `u8` packing.
-pub fn into_contiguous_packed<R: Runtime>(
-    client: &ComputeClient<R>,
-    input: TensorBinding<R>,
+pub fn into_contiguous_packed(
+    client: &Client,
+    input: TensorBinding,
     packed_dim: usize,
     shape: &[usize],
     packing: usize,
-    dtype: StorageType,
-) -> TensorHandle<R> {
+    dtype: ElemType,
+) -> TensorHandle {
     let rank = shape.len();
     if rank <= 1 {
         return into_contiguous(client, input, dtype);
@@ -287,12 +287,7 @@ pub fn into_contiguous_packed<R: Runtime>(
 }
 
 /// Make a jit tensor contiguous.
-pub fn copy_gpu_ref<R: Runtime>(
-    client: &ComputeClient<R>,
-    input: TensorBinding<R>,
-    output: TensorBinding<R>,
-    dtype: StorageType,
-) {
+pub fn copy_gpu_ref(client: &Client, input: TensorBinding, output: TensorBinding, dtype: ElemType) {
     let num_elems: usize = input.shape.iter().product();
 
     // Vectorization is only enabled when the last dimension is contiguous.
@@ -381,14 +376,14 @@ pub fn copy_gpu_ref<R: Runtime>(
 }
 
 /// Make a jit tensor contiguous.
-pub fn into_contiguous_packed_ref<R: Runtime>(
-    client: &ComputeClient<R>,
-    input: TensorBinding<R>,
-    output: TensorBinding<R>,
+pub fn into_contiguous_packed_ref(
+    client: &Client,
+    input: TensorBinding,
+    output: TensorBinding,
     packed_dim: usize,
     shape: &[usize],
     packing: usize,
-    dtype: StorageType,
+    dtype: ElemType,
 ) {
     let num_elems: usize = input.shape.iter().product();
 

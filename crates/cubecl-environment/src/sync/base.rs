@@ -6,9 +6,9 @@ use std::sync::{
 };
 
 #[cfg(not(feature = "std"))]
-pub use spin::{Lazy, RwLockReadGuard, RwLockWriteGuard};
+pub use spin::{LazyLock, RwLockReadGuard, RwLockWriteGuard};
 #[cfg(feature = "std")]
-pub use std::sync::{LazyLock as Lazy, RwLockReadGuard, RwLockWriteGuard};
+pub use std::sync::{LazyLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// A spin-based one-time initialization cell, identical on every target.
 ///
@@ -69,6 +69,23 @@ impl<T> Mutex<T> {
         {
             self.inner
                 .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    /// Consumes the mutex, returning the value it protected. A poisoned lock
+    /// is recovered, as in [`lock`](Self::lock).
+    #[inline(always)]
+    pub fn into_inner(self) -> T {
+        #[cfg(not(feature = "std"))]
+        {
+            self.inner.into_inner()
+        }
+
+        #[cfg(feature = "std")]
+        {
+            self.inner
+                .into_inner()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
     }

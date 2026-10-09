@@ -1,0 +1,48 @@
+use super::{base::horner, exponential::exp};
+use cubecl_core as cubecl;
+use cubecl_core::prelude::*;
+
+// Degree-four Remez fit of tanh(x)/x in x² over [0, 1/4].
+const TANH_0: f32 = 1.0;
+const TANH_1: f32 = -0.3333307;
+const TANH_2: f32 = 0.1332478;
+const TANH_3: f32 = -0.052986074;
+const TANH_4: f32 = 0.017135007;
+
+/// Threshold between the series and exponential approximations.
+const SERIES_LIMIT: f32 = 0.5;
+
+#[cube]
+pub fn tanh<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
+    let x = Vector::<f32, N>::cast_from(x);
+
+    let square = x * x;
+    let series = x * horner(square, comptime![[TANH_0, TANH_1, TANH_2, TANH_3, TANH_4]]);
+
+    let magnitude = x.abs();
+    let doubled = exp(magnitude + magnitude);
+    let saturating = Vector::new(1.0f32) - Vector::new(2.0f32) / (doubled + Vector::new(1.0f32));
+    let saturating = select_many(x.less_than(&Vector::new(0.0f32)), -saturating, saturating);
+
+    Vector::<F, N>::cast_from(select_many(
+        magnitude.less_than(&Vector::new(SERIES_LIMIT)),
+        series,
+        saturating,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::base::{evaluate, worst_relative_error};
+    use super::*;
+
+    #[test]
+    fn the_series_fits_the_tangent_around_zero() {
+        let limit = SERIES_LIMIT as f64;
+        let worst = worst_relative_error(-limit, limit, f64::tanh, |x| {
+            x * evaluate(&[TANH_0, TANH_1, TANH_2, TANH_3, TANH_4], x * x)
+        });
+
+        assert!(worst < 4e-8, "worst relative error {worst}");
+    }
+}

@@ -4,44 +4,60 @@ use core::{default::Default, ops::Deref};
 use serde::{Deserialize, Serialize};
 
 /// Describes a quantization scheme/configuration.
+///
+/// Scales come at up to two levels, each an optional field set through
+/// [`per_tensor`](Self::per_tensor) and [`per_block`](Self::per_block) in any order:
+///
+/// ```
+/// # use cubecl_common::quant::scheme::{QuantScheme, ScaleDtype};
+/// // One scale for the whole tensor, stored as f32. Also what a scheme with no level resolves to.
+/// QuantScheme::default().per_tensor(ScaleDtype::F32);
+///
+/// // One scale per block of 32 values.
+/// QuantScheme::default().per_block([32], ScaleDtype::F32);
+///
+/// // Two levels: ue4m3 block scales, normalized by a single per-tensor f32 scale.
+/// QuantScheme::default()
+///     .per_block([16], ScaleDtype::UE4M3)
+///     .per_tensor(ScaleDtype::F32);
+/// ```
+///
+/// A two-level scheme exists so block scales can live in a narrow type: the global per-tensor scale
+/// absorbs the tensor's dynamic range, and the block dtype only covers the spread between blocks.
+/// That spread is still bounded: a block whose scale falls further below the largest one than the
+/// block dtype can express is stored at that dtype's smallest value, far too coarse for it, and
+/// every value in the block quantizes to zero. [`ScaleDtype::UE4M3`] spans about 2^18 this way, so
+/// a tensor holding a genuine outlier can lose its ordinary values.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct QuantScheme {
-    /// The logical data type of quantized input values (e.g., `QInt8`).
+    /// The logical data type of quantized input values (e.g., [`QuantValue::Q8F`]).
     ///
     /// This defines how values are interpreted during computation, independent of how they're stored.
     pub value: QuantValue,
-    /// Precision used for quantization parameters (e.g., scale and biases).
-    ///
-    /// This is the only param a one-level scheme has. [`QuantLevel::BlockTensor`] adds a second one
-    /// for its per-tensor scale, so a consumer that reads this field alone will miss that factor.
-    pub param: QuantParam,
     /// Data type used for storing quantized values.
     pub store: QuantStore,
-    /// Granularity level of quantization (e.g., per-tensor).
-    pub level: QuantLevel,
     /// Quantization mode (e.g., symmetric).
     pub mode: QuantMode,
+    /// The per-tensor scale level. Private with [`tensor_scale`](Self::tensor_scale) as the
+    /// reader, which resolves a scheme storing no level at all to a per-tensor f32 scale.
+    tensor: Option<ScaleDtype>,
+    /// The per-block scale level, the innermost when both levels are present.
+    block: Option<BlockScale>,
 }
 
 impl Default for QuantScheme {
     fn default() -> Self {
         Self {
             value: QuantValue::Q8F,
-            param: QuantParam::F32,
             store: QuantStore::PackedU32(0),
-            level: QuantLevel::Tensor,
             mode: QuantMode::Symmetric,
+            tensor: None,
+            block: None,
         }
     }
 }
 
 impl QuantScheme {
-    /// Set the quantization level.
-    pub fn with_level(mut self, level: QuantLevel) -> Self {
-        self.level = level;
-        self
-    }
-
     /// Set the quantization mode.
     pub fn with_mode(mut self, mode: QuantMode) -> Self {
         self.mode = mode;
@@ -60,10 +76,74 @@ impl QuantScheme {
         self
     }
 
-    /// Set the precision used for quantization parameters
-    pub fn with_param(mut self, param: QuantParam) -> Self {
-        self.param = param;
+    /// Set the per-tensor scale level, stored as `dtype`.
+    pub fn per_tensor(mut self, dtype: ScaleDtype) -> Self {
+        self.tensor = Some(dtype);
         self
+    }
+
+    /// Set the per-block scale level: one scale per block of `block` values, stored as `dtype`.
+    pub fn per_block(mut self, block: impl AsRef<[u8]>, dtype: ScaleDtype) -> Self {
+        self.block = Some(BlockScale {
+            size: BlockSize::new(block),
+            dtype,
+        });
+        self
+    }
+
+    /// The per-tensor scale level, the global level when a block level is present.
+    ///
+    /// A scheme storing no level at all resolves here to a per-tensor f32 scale; the resolution
+    /// is not stored, so such a scheme compares equal to [`Default`], not to an explicit
+    /// `per_tensor(F32)`.
+    pub fn tensor_scale(&self) -> Option<ScaleDtype> {
+        if self.tensor.is_none() && self.block.is_none() {
+            return Some(ScaleDtype::F32);
+        }
+        self.tensor
+    }
+
+    /// The per-block scale level, the innermost when both levels are present.
+    pub fn block_scale(&self) -> Option<BlockScale> {
+        self.block
+    }
+
+    /// The number of scale levels: as many scale tensors ride along with the values.
+    pub fn num_levels(&self) -> usize {
+        self.block_scale().is_some() as usize + self.tensor_scale().is_some() as usize
+    }
+
+    /// The innermost level's scale dtype, the type the per-position scales are stored in.
+    pub fn scale_dtype(&self) -> ScaleDtype {
+        self.block
+            .map(|block| block.dtype)
+            .or(self.tensor)
+            .unwrap_or(ScaleDtype::F32)
+    }
+
+    /// The block level's size, or [`None`] for per-tensor quantization.
+    pub fn block_size(&self) -> Option<BlockSize> {
+        self.block.map(|block| block.size)
+    }
+
+    /// Swap two tensor dimensions in the block level, mirroring `shape.swap(dim0, dim1)`. The
+    /// per-tensor level is unaffected.
+    ///
+    /// `dim0`/`dim1` are bare indices on purpose, mirroring `[T]::swap`'s own signature.
+    pub fn swap_block_dims(&mut self, rank: usize, dim0: usize, dim1: usize) {
+        let mut axes: Vec<usize> = (0..rank).collect();
+        axes.swap(dim0, dim1);
+        self.permute_block_dims(rank, &axes);
+    }
+
+    /// Permute the block level, mirroring a permutation of the tensor's axes. The per-tensor
+    /// level is unaffected.
+    pub fn permute_block_dims(&mut self, rank: usize, axes: &[usize]) {
+        if let Some(block) = &mut self.block {
+            let dims = block.size.to_dim_vec(rank);
+            let permuted: Vec<u8> = axes.iter().map(|&axis| dims[axis]).collect();
+            block.size = BlockSize::new(permuted);
+        }
     }
 
     /// Returns the size of the quantization storage type in bits.
@@ -107,96 +187,37 @@ impl QuantScheme {
     }
 }
 
-/// Level or granularity of quantization.
-///
-/// Append new variants, never insert. Some transports serialize this with a format that encodes
-/// variants by position rather than by name, so inserting one silently reinterprets streams and
-/// stored schemes written by an older build.
+/// The per-block scale level of a [`QuantScheme`]: one scale per block of values.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum QuantLevel {
-    /// Quantize the whole tensor using a single tensor.
-    Tensor,
-    /// Quantize a tensor using multiple blocks.
-    Block(BlockSize),
-    /// Quantize a tensor using multiple blocks whose scales are themselves normalized by a single
-    /// per-tensor scale.
-    ///
-    /// See [`QuantLevel::block_tensor`] for what that buys and what it does not.
-    BlockTensor {
-        /// Size of each block. The block scales use [`QuantScheme::param`].
-        block: BlockSize,
-        /// Precision of the per-tensor scale. Only a param with more range than the block scales
-        /// use is meaningful.
-        global: QuantParam,
-    },
+pub struct BlockScale {
+    /// The block of values sharing one scale.
+    pub size: BlockSize,
+    /// The dtype the level's scales are stored in.
+    pub dtype: ScaleDtype,
 }
 
-impl QuantLevel {
-    /// Converting constructor for [`QuantLevel::Block`]
-    pub fn block(values: impl AsRef<[u8]>) -> Self {
-        QuantLevel::Block(BlockSize::new(values))
-    }
-
-    /// Converting constructor for [`QuantLevel::BlockTensor`].
-    ///
-    /// The per-tensor scale absorbs the tensor's dynamic range, which is what lets the block scales
-    /// live in a narrow type. Without it a block scale has to cover that range on its own, and a
-    /// type like [`QuantParam::UE4M3`] underflows to zero for small values.
-    ///
-    /// What the block param covers is then the spread between blocks, which is still bounded. A
-    /// block whose scale falls further below the largest one than the block param can express is
-    /// stored at that param's smallest value, far too coarse for it, and every value in the block
-    /// quantizes to zero. [`QuantParam::UE4M3`] spans about 2^18 this way, from its smallest
-    /// subnormal to 448, so a tensor holding a genuine outlier can lose its ordinary values.
-    ///
-    /// The kernels in `cubecl-std` do not implement this level yet and reject it at launch rather
-    /// than reconstruct values short by the per-tensor factor.
-    pub fn block_tensor(values: impl AsRef<[u8]>, global: QuantParam) -> Self {
-        QuantLevel::BlockTensor {
-            block: BlockSize::new(values),
-            global,
-        }
-    }
-
-    /// The block size, for the levels that quantize in blocks.
-    pub fn block_size(&self) -> Option<BlockSize> {
-        match self {
-            QuantLevel::Tensor => None,
-            QuantLevel::Block(block) | QuantLevel::BlockTensor { block, .. } => Some(*block),
-        }
-    }
-
-    /// The precision of the per-tensor scale, for the levels that have one.
-    pub fn global_param(&self) -> Option<QuantParam> {
-        match self {
-            QuantLevel::Tensor | QuantLevel::Block(_) => None,
-            QuantLevel::BlockTensor { global, .. } => Some(*global),
-        }
-    }
-}
-
-impl QuantParam {
-    /// The largest finite value representable by the parameter type.
+impl ScaleDtype {
+    /// The largest finite value representable by the dtype.
     ///
     /// A two-level scheme picks its per-tensor scale so that the largest block scale lands here,
     /// which is what keeps the block scales inside the range their type can express. That recipe
-    /// only holds for a block param narrower than the scale it divides: dividing by
-    /// [`QuantParam::F32`]'s or [`QuantParam::UE8M0`]'s maximum drives the per-tensor scale
+    /// only holds for a block dtype narrower than the scale it divides: dividing by
+    /// [`ScaleDtype::F32`]'s or [`ScaleDtype::UE8M0`]'s maximum drives the per-tensor scale
     /// subnormal and the renormalized block scales to infinity. A two-level scheme has nothing to
     /// gain from those params anyway, since their block scales already reach the full range.
     pub fn max_representable(&self) -> f32 {
         match self {
-            QuantParam::F32 => f32::MAX,
-            QuantParam::F16 => half::f16::MAX.to_f32(),
-            QuantParam::BF16 => half::bf16::MAX.to_f32(),
+            ScaleDtype::F32 => f32::MAX,
+            ScaleDtype::F16 => half::f16::MAX.to_f32(),
+            ScaleDtype::BF16 => half::bf16::MAX.to_f32(),
             // Spelled out because `ue8m0` and `e4m3` sit behind the `fp8` feature and this
             // function is not gated. The tests check both against those types when it is on.
-            QuantParam::UE8M0 => f32::from_bits(0x7F00_0000), // 2^127
-            QuantParam::UE4M3 => 448.0,
+            ScaleDtype::UE8M0 => f32::from_bits(0x7F00_0000), // 2^127
+            ScaleDtype::UE4M3 => 448.0,
         }
     }
 
-    /// The smallest value representable by the parameter type that is not below `scale`.
+    /// The smallest value representable by the dtype that is not below `scale`.
     ///
     /// Storing a quantization scale wants this rather than the nearest value. Rounding down puts
     /// the scale below what calibration asked for, so every value at the block maximum clips to
@@ -209,20 +230,22 @@ impl QuantParam {
     /// `scale` must not be negative. Symmetric quantization only produces non-negative scales,
     /// and the stepping below walks away from zero for a negative input.
     ///
-    /// [`QuantParam::UE8M0`] answers [`None`]. Its minimum is 2^-127, subnormal in f32, where the
-    /// grid below no longer holds.
-    pub fn round_up(&self, scale: f32) -> Option<f32> {
+    /// [`ScaleDtype::UE8M0`] takes its own path rather than the shared grid below: its range runs
+    /// to 2^-127, which is subnormal in f32, so the two ends need clamping before the bit stepping
+    /// is meaningful. Between them the rule is the same one — a ue8m0 value is a bare exponent, so
+    /// rounding up to it is rounding up to a power of two.
+    pub fn round_up(&self, scale: f32) -> f32 {
         match self {
-            QuantParam::F32 => {
-                return Some(scale);
+            ScaleDtype::F32 => {
+                return scale;
             }
-            QuantParam::UE8M0 => {
-                return None;
+            ScaleDtype::UE8M0 => {
+                return round_up_to_power_of_two(scale);
             }
             _ => {}
         }
         if scale.is_nan() {
-            return Some(scale);
+            return scale;
         }
         debug_assert!(scale >= 0.0, "a quantization scale is never negative");
 
@@ -230,7 +253,7 @@ impl QuantParam {
         // for the params that have one, which would make every reconstructed value NaN.
         let max = self.max_representable();
         if scale >= max {
-            return Some(max);
+            return max;
         }
 
         let grid = self.f32_grid();
@@ -240,15 +263,13 @@ impl QuantParam {
         {
             // Below the minimum normal the spacing stops halving, so the answer is a count of steps.
             // Qualified call: the inherent `f32::ceil` lives in std, and this crate builds no_std.
-            return Some(num_traits::Float::ceil(scale / subnormals.spacing) * subnormals.spacing);
+            return num_traits::Float::ceil(scale / subnormals.spacing) * subnormals.spacing;
         }
 
-        Some(f32::from_bits(
-            (scale.to_bits() + grid.round_up_bias()) & grid.truncate_mask(),
-        ))
+        f32::from_bits((scale.to_bits() + grid.round_up_bias()) & grid.truncate_mask())
     }
 
-    /// The param's grid, expressed on the f32 bit pattern. See [`F32Grid`].
+    /// The dtype's grid, expressed on the f32 bit pattern. See [`F32Grid`].
     ///
     /// bf16 reports no subnormal range because it does not need the separate treatment: its pattern
     /// is f32's top half all the way down, so the bit step stays right where the others stop. Its
@@ -257,55 +278,123 @@ impl QuantParam {
     ///
     /// # Panics
     ///
-    /// For [`QuantParam::F32`], which is the grid itself, and [`QuantParam::UE8M0`], which is not
-    /// yet supported.
+    /// For [`ScaleDtype::F32`], which is the grid itself.
     pub fn f32_grid(&self) -> F32Grid {
-        /// One f32 ulp per param ulp: the mantissa bits f32 carries and the param does not.
+        /// One f32 ulp per dtype ulp: the mantissa bits f32 carries and the dtype does not.
         const fn bit_step(mantissa_digits: u32) -> u32 {
             1 << (f32::MANTISSA_DIGITS - mantissa_digits)
         }
 
         match self {
-            QuantParam::F16 => F32Grid {
+            ScaleDtype::F16 => F32Grid {
                 bit_step: bit_step(half::f16::MANTISSA_DIGITS),
                 subnormals: Some(SubnormalRange {
                     min_normal: half::f16::MIN_POSITIVE.to_f32(),
                     spacing: half::f16::MIN_POSITIVE_SUBNORMAL.to_f32(),
                 }),
             },
-            QuantParam::BF16 => F32Grid {
+            ScaleDtype::BF16 => F32Grid {
                 bit_step: bit_step(half::bf16::MANTISSA_DIGITS),
                 subnormals: None,
             },
             // Spelled out rather than read off `e4m3`, which sits behind the `fp8` feature while
             // this is not gated. The tests check them against that type when it is on.
-            QuantParam::UE4M3 => F32Grid {
+            ScaleDtype::UE4M3 => F32Grid {
                 bit_step: bit_step(4),
                 subnormals: Some(SubnormalRange {
                     min_normal: 0.015625, // 2^-6
                     spacing: 0.001953125, // 2^-9
                 }),
             },
-            QuantParam::F32 => {
+            ScaleDtype::F32 => {
                 unimplemented!("F32 is the grid, it has no narrower one to round onto")
             }
-            QuantParam::UE8M0 => unimplemented!("UE8M0 scales are not yet supported"),
+            // No mantissa at all: the grid is the powers of two, so the step clears every f32
+            // mantissa bit. `subnormals` stays `None` because ue8m0 has no subnormal *ladder* —
+            // its bottom is the single value 2^-127, which the callers clamp to.
+            ScaleDtype::UE8M0 => F32Grid {
+                bit_step: bit_step(1),
+                subnormals: None,
+            },
         }
     }
+
+    /// The smallest and largest values [`ScaleDtype::UE8M0`] represents: 2^-127 and 2^127.
+    ///
+    /// The minimum is subnormal in f32 and the maximum is the largest power of two it holds, so
+    /// both are spelled as bit patterns rather than computed.
+    pub const UE8M0_MIN: f32 = f32::from_bits(0x0040_0000);
+    /// See [`ScaleDtype::UE8M0_MIN`].
+    pub const UE8M0_MAX: f32 = f32::from_bits(0x7F00_0000);
+}
+
+/// A `ue8m0` scale as its stored byte: the code is the exponent, biased by 127.
+///
+/// Rounds up, which is both the storage rule for a scale and what the host `ue8m0` codec and
+/// CUDA's `__nv_cvt_bfloat16raw_to_e8m0` (at `cudaRoundPosInf`) already do — a scale rounded down
+/// puts the block's largest value outside the quantization range.
+///
+/// Lives here rather than on the `ue8m0` type so it is available without the `float4` feature:
+/// serialization needs it, and `ue8m0` is a bare exponent, so the byte is the whole of it.
+/// (`ue8m0` itself is behind `fp8`, but its *conversions* come from `float4`, which is the gate
+/// that would otherwise reach serialization.) It has to keep answering what those conversions
+/// answer, which `the_ue8m0_codec_matches_the_storage_type` checks wherever they are compiled in.
+pub fn f32_to_ue8m0(scale: f32) -> u8 {
+    let rounded = round_up_to_power_of_two(scale);
+    if rounded.is_nan() {
+        return 0xFF;
+    }
+    // Codes 1..=254 are f32's own exponent field; the clamping above keeps the shift in range,
+    // and 2^-127 is subnormal in f32, so it lands on the exponent field 0 that code 0 names.
+    (rounded.to_bits() >> 23) as u8
+}
+
+/// The value a `ue8m0` byte stands for. Inverse of [`f32_to_ue8m0`] on every code it produces.
+pub fn ue8m0_to_f32(code: u8) -> f32 {
+    match code {
+        // f32 has no exponent field 0 to spare: its own is the subnormals.
+        0 => ScaleDtype::UE8M0_MIN,
+        0xFF => f32::NAN,
+        code => f32::from_bits((code as u32) << 23),
+    }
+}
+
+/// The smallest power of two not below `scale`, saturated into ue8m0's range.
+///
+/// A ue8m0 code *is* an exponent, so this is the whole storage rule for that dtype. Clamping both
+/// ends first is what lets the middle be the same mantissa-clearing step the other dtypes use:
+/// below 2^-127 there is nothing to round onto, and above 2^127 the step would carry into f32's
+/// infinity and take every value scaled by it with it. Zero clamps up to the minimum — ue8m0 has
+/// no zero, and a zero scale reconstructs an all-zero block correctly at any scale.
+fn round_up_to_power_of_two(scale: f32) -> f32 {
+    if scale.is_nan() {
+        return scale;
+    }
+    debug_assert!(scale >= 0.0, "a quantization scale is never negative");
+
+    if scale <= ScaleDtype::UE8M0_MIN {
+        return ScaleDtype::UE8M0_MIN;
+    }
+    if scale >= ScaleDtype::UE8M0_MAX {
+        return ScaleDtype::UE8M0_MAX;
+    }
+
+    let grid = ScaleDtype::UE8M0.f32_grid();
+    f32::from_bits((scale.to_bits() + grid.round_up_bias()) & grid.truncate_mask())
 }
 
 /// A narrower float format's grid, laid over the f32 bit pattern.
 ///
-/// f32 carries every param this exists for exactly, so the grid can be walked there rather than
-/// through the storage type. A value representable in the param leaves the low f32 mantissa bits
-/// zero, so one param ulp is an increment at that position and the carry into the exponent falls
+/// f32 carries every dtype this exists for exactly, so the grid can be walked there rather than
+/// through the storage type. A value representable in the dtype leaves the low f32 mantissa bits
+/// zero, so one dtype ulp is an increment at that position and the carry into the exponent falls
 /// out on its own. Working in f32 also keeps the grid available to backends with no narrow integer,
 /// and to builds without the `fp8` feature.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct F32Grid {
     /// One step up in the normal range, as an increment on the f32 bit pattern.
     pub bit_step: u32,
-    /// The param's subnormals, for the formats whose subnormals land in f32's normal range.
+    /// The dtype's subnormals, for the formats whose subnormals land in f32's normal range.
     pub subnormals: Option<SubnormalRange>,
 }
 
@@ -319,13 +408,13 @@ pub struct SubnormalRange {
 }
 
 impl F32Grid {
-    /// Clears the mantissa bits the param does not carry, truncating a bit pattern onto the grid.
+    /// Clears the mantissa bits the dtype does not carry, truncating a bit pattern onto the grid.
     pub fn truncate_mask(&self) -> u32 {
         !(self.bit_step - 1)
     }
 
     /// Added to a bit pattern before [`truncate_mask`](Self::truncate_mask) to turn that truncation
-    /// into a round up. The carry it can produce is only safe below the param's maximum, which is
+    /// into a round up. The carry it can produce is only safe below the dtype's maximum, which is
     /// why callers saturate there first.
     pub fn round_up_bias(&self) -> u32 {
         self.bit_step - 1
@@ -438,14 +527,17 @@ pub enum QuantStore {
 pub enum QuantMode {
     /// Symmetric or scale quantization.
     Symmetric,
+    /// The stored field is an index into a lookup table of `2^bits` floats, not a number: a read
+    /// reconstructs `table[field] * scale`. (Known as a codebook in the quantization literature —
+    /// NF4, K-quants, and vector quantizers all decode this way.) The table travels as its own
+    /// binding beside the values and scales; only the field's bit width is read from
+    /// [`QuantScheme::value`], since an index has no sign or float semantics of its own.
+    Lookup,
 }
 
-/// Quantization floating-point precision.
-///
-/// This is used to represent the floating-point precision of quantization parameters like the scale(s)
-/// or the accumulation precision used during operations like matrix multiplication.
+/// The data type a scale level stores its scales in.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum QuantParam {
+pub enum ScaleDtype {
     /// Full precision.
     F32,
     /// Half precision.
@@ -461,10 +553,24 @@ pub enum QuantParam {
 const MAX_DIMS: usize = 5;
 
 /// Copyable block size, specialized version of `SmallVec`.
-#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockSize {
     storage: [u8; MAX_DIMS],
     len: u8,
+}
+
+/// Hand-written: `storage` precedes `len`, so a derived `Ord` would compare filler bytes before
+/// length.
+impl PartialOrd for BlockSize {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BlockSize {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (self.len, self.as_slice()).cmp(&(other.len, other.as_slice()))
+    }
 }
 
 impl core::fmt::Debug for BlockSize {
@@ -478,8 +584,21 @@ impl BlockSize {
     pub const MAX_DIMS: usize = MAX_DIMS;
 
     /// Create a new blocksize from a set of values. The number of values must be `<= MAX_DIMS`.
+    ///
+    /// The result is canonical, so equal rank-relative blocks compare and hash equal however they
+    /// are spelled: leading unit dimensions are dropped, since the missing-dimension fill restates
+    /// them. In particular, `[1, 32]` canonicalizes to `[32]`. Whole-tensor granularity is a
+    /// scheme's per-tensor level, not a block size.
     pub fn new(values: impl AsRef<[u8]>) -> Self {
-        let values = values.as_ref();
+        Self::canonicalize(values.as_ref())
+    }
+
+    fn canonicalize(values: &[u8]) -> Self {
+        let skip = values
+            .iter()
+            .position(|&value| value != 1)
+            .unwrap_or(values.len());
+        let values = &values[skip..];
         debug_assert!(
             values.len() <= MAX_DIMS,
             "Tried creating a block size larger than the cap"
@@ -493,14 +612,6 @@ impl BlockSize {
         }
     }
 
-    /// Create a new blocksize from a set of values. The number of values must be `<= MAX_DIMS`.
-    /// Trims any leading zeros.
-    pub fn new_trim(values: impl AsRef<[u8]>) -> Self {
-        let values = values.as_ref();
-        let first_value = values.iter().position(|s| *s != 1).unwrap_or(0);
-        Self::new(&values[first_value..])
-    }
-
     /// Return a slice of only the initialized values
     pub fn as_slice(&self) -> &[u8] {
         &self.storage[..self.len as usize]
@@ -511,7 +622,7 @@ impl BlockSize {
         self.storage[..self.len as usize].to_vec()
     }
 
-    /// Returns `N` dimensions, unsqueezing if necessary.
+    /// Returns `N` dimensions, unsqueezing if necessary. Missing leading dimensions fill with `1`.
     pub fn as_dim<const N: usize>(&self) -> [u8; N] {
         let data_len = N.min(self.len as usize);
         let data_start = N - data_len;
@@ -520,7 +631,8 @@ impl BlockSize {
         out
     }
 
-    /// Returns a vector of `len` dimensions, unsqueezing if necessary.
+    /// Returns a vector of `len` dimensions, unsqueezing if necessary. Missing leading dimensions
+    /// fill with `1`.
     pub fn to_dim_vec(&self, len: usize) -> Vec<u8> {
         let data_len = len.min(self.len as usize);
         let data_start = len - data_len;
@@ -529,12 +641,22 @@ impl BlockSize {
         out
     }
 
+    /// How many blocks cover each dimension of `shape`, which is the shape of the scale grid:
+    /// one scale per block.
+    pub fn num_blocks(&self, shape: &[usize]) -> Vec<usize> {
+        self.to_dim_vec(shape.len())
+            .into_iter()
+            .zip(shape)
+            .map(|(block, &dim)| dim.div_ceil(block as usize))
+            .collect()
+    }
+
     /// Create an iterator over all stored dimensions
     pub fn iter(&self) -> impl Iterator<Item = &u8> {
         self.as_slice().iter()
     }
 
-    /// Returns the total number of elements in each block
+    /// Returns the total number of elements in each block.
     pub fn num_elements(&self) -> usize {
         self.iter().map(|it| *it as usize).product()
     }
@@ -559,15 +681,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn blocks_remain_rank_relative() {
+        assert_ne!(BlockSize::new([32]), BlockSize::new([32, 32]));
+        assert_eq!(BlockSize::new([32]).to_dim_vec(2), vec![1, 32]);
+        assert_eq!(BlockSize::new([32, 32]).to_dim_vec(2), vec![32, 32]);
+    }
+
+    #[test]
+    fn leading_unit_dimensions_canonicalize_away() {
+        assert_eq!(BlockSize::new([1, 32]), BlockSize::new([32]));
+    }
+
+    #[test]
+    fn leading_unit_dimensions_beyond_the_cap_still_canonicalize() {
+        assert_eq!(
+            BlockSize::new([1, 1, 8, 4, 2, 3]),
+            BlockSize::new([8, 4, 2, 3])
+        );
+    }
+
+    #[test]
+    fn there_is_one_block_per_scale() {
+        assert_eq!(BlockSize::new([32]).num_blocks(&[8, 64]), vec![8, 2]);
+        assert_eq!(BlockSize::new([4, 32]).num_blocks(&[8, 64]), vec![2, 2]);
+        assert_eq!(BlockSize::new([32]).num_blocks(&[4, 8, 64]), vec![4, 8, 2]);
+    }
+
+    #[test]
+    fn a_partial_block_still_takes_a_scale() {
+        assert_eq!(BlockSize::new([32]).num_blocks(&[8, 70]), vec![8, 3]);
+    }
+
+    #[test]
+    fn the_default_scheme_resolves_to_per_tensor_f32() {
+        let scheme = QuantScheme::default();
+        assert_eq!(scheme.tensor_scale(), Some(ScaleDtype::F32));
+        assert_eq!(scheme.block_scale(), None);
+        assert_eq!(scheme.scale_dtype(), ScaleDtype::F32);
+        assert_eq!(scheme.block_size(), None);
+        assert_eq!(scheme.num_levels(), 1);
+    }
+
+    #[test]
+    fn a_block_level_stands_alone() {
+        let scheme = QuantScheme::default().per_block([32], ScaleDtype::F16);
+        assert_eq!(scheme.tensor_scale(), None);
+        assert_eq!(scheme.scale_dtype(), ScaleDtype::F16);
+        assert_eq!(scheme.block_size(), Some(BlockSize::new([32])));
+        assert_eq!(scheme.num_levels(), 1);
+    }
+
+    #[test]
+    fn both_levels_nest_the_block_inside_the_tensor() {
+        let scheme = QuantScheme::default()
+            .per_block([16], ScaleDtype::UE4M3)
+            .per_tensor(ScaleDtype::F32);
+        assert_eq!(scheme.scale_dtype(), ScaleDtype::UE4M3);
+        assert_eq!(scheme.tensor_scale(), Some(ScaleDtype::F32));
+        assert_eq!(scheme.num_levels(), 2);
+    }
+
+    #[test]
+    fn levels_set_in_any_order_are_the_same_scheme() {
+        assert_eq!(
+            QuantScheme::default()
+                .per_block([16], ScaleDtype::UE4M3)
+                .per_tensor(ScaleDtype::F32),
+            QuantScheme::default()
+                .per_tensor(ScaleDtype::F32)
+                .per_block([16], ScaleDtype::UE4M3),
+        );
+    }
+
+    #[test]
+    fn swapping_dims_rewrites_the_block_and_leaves_the_tensor_level_alone() {
+        let mut scheme = QuantScheme::default()
+            .per_block([4, 32], ScaleDtype::F16)
+            .per_tensor(ScaleDtype::F32);
+        scheme.swap_block_dims(2, 0, 1);
+        assert_eq!(
+            scheme,
+            QuantScheme::default()
+                .per_block([32, 4], ScaleDtype::F16)
+                .per_tensor(ScaleDtype::F32)
+        );
+
+        let mut per_tensor = QuantScheme::default();
+        per_tensor.swap_block_dims(2, 0, 1);
+        assert_eq!(per_tensor, QuantScheme::default());
+    }
+
+    #[test]
+    fn swapping_dims_canonicalizes_the_block() {
+        let mut scheme = QuantScheme::default().per_block([32, 1], ScaleDtype::F32);
+        scheme.swap_block_dims(2, 0, 1);
+        assert_eq!(scheme.block_size(), Some(BlockSize::new([32])));
+    }
+
+    #[test]
+    fn permuting_dims_rewrites_the_block() {
+        let mut scheme = QuantScheme::default().per_block([1, 4, 32], ScaleDtype::F16);
+        scheme.permute_block_dims(3, &[2, 0, 1]);
+        assert_eq!(scheme.block_size(), Some(BlockSize::new([32, 1, 4])));
+    }
+
+    #[test]
     fn round_up_never_lands_below_the_scale() {
-        for param in [QuantParam::F16, QuantParam::BF16, QuantParam::UE4M3] {
+        for dtype in [ScaleDtype::F16, ScaleDtype::BF16, ScaleDtype::UE4M3] {
             for exp in -12..8 {
                 for step in 1..17 {
                     let scale = (step as f32 / 16.0) * 2f32.powi(exp);
-                    let up = param.round_up(scale).unwrap();
+                    let up = dtype.round_up(scale);
                     assert!(
                         up >= scale,
-                        "{param:?}: {up} is below {scale}, which clips the block maximum"
+                        "{dtype:?}: {up} is below {scale}, which clips the block maximum"
                     );
                 }
             }
@@ -576,35 +803,124 @@ mod tests {
 
     #[test]
     fn round_up_saturates_rather_than_stepping_off_the_top() {
-        for param in [QuantParam::F16, QuantParam::BF16, QuantParam::UE4M3] {
-            let max = param.max_representable();
-            assert_eq!(param.round_up(max).unwrap(), max);
-            assert!(param.round_up(max * 2.0).unwrap().is_finite());
+        for dtype in [ScaleDtype::F16, ScaleDtype::BF16, ScaleDtype::UE4M3] {
+            let max = dtype.max_representable();
+            assert_eq!(dtype.round_up(max), max);
+            assert!(dtype.round_up(max * 2.0).is_finite());
         }
     }
 
-    /// Every variant is dispatched somewhere, so none of them may panic here.
+    /// Every variant is dispatched somewhere, so none of them may panic here, and every answer is
+    /// a scale something can be divided by.
     #[test]
     fn round_up_answers_for_every_param() {
-        for param in [
-            QuantParam::F32,
-            QuantParam::F16,
-            QuantParam::BF16,
-            QuantParam::UE8M0,
-            QuantParam::UE4M3,
+        for dtype in [
+            ScaleDtype::F32,
+            ScaleDtype::F16,
+            ScaleDtype::BF16,
+            ScaleDtype::UE8M0,
+            ScaleDtype::UE4M3,
         ] {
+            let up = dtype.round_up(0.3);
+            assert!(up.is_finite() && up > 0.0, "{dtype:?} answered {up:e}");
+        }
+    }
+
+    /// 2^`exp`, from the exponent field rather than through `powi`.
+    ///
+    /// `powi` is only ever approximate — Miri returns a value a few ulp off, deliberately, so
+    /// nothing comes to depend on one host's precision — and a power of two that is a hair off is
+    /// a different power of two once its mantissa is cleared. Only for exponents f32 has a normal
+    /// for: -126..=127.
+    fn power_of_two(exp: i32) -> f32 {
+        f32::from_bits(((exp + 127) as u32) << 23)
+    }
+
+    /// `ue8m0` stores a bare exponent, so rounding up to it is rounding up to a power of two.
+    #[test]
+    fn ue8m0_rounds_up_to_a_power_of_two() {
+        for exp in -120..120 {
+            let power = power_of_two(exp);
+            // Already a power of two: nothing to round.
+            assert_eq!(ScaleDtype::UE8M0.round_up(power), power, "2^{exp}");
+            // Anything above it goes to the next one up, however little above.
+            for scale in [power * 1.0001, power * 1.5, power * 1.9999] {
+                assert_eq!(
+                    ScaleDtype::UE8M0.round_up(scale),
+                    power * 2.0,
+                    "{scale} (2^{exp} scaled)"
+                );
+            }
+        }
+    }
+
+    /// Both ends saturate. The bottom is the reason `ue8m0` needs its own path at all: 2^-127 is
+    /// subnormal in f32, and zero — which a fully-zero block calibrates to — is not a `ue8m0`
+    /// value in the first place.
+    #[test]
+    fn ue8m0_saturates_at_both_ends() {
+        let min = ScaleDtype::UE8M0_MIN;
+        let max = ScaleDtype::UE8M0_MAX;
+
+        for scale in [0.0, f32::MIN_POSITIVE * 0.5, min * 0.5, min] {
+            assert_eq!(ScaleDtype::UE8M0.round_up(scale), min, "{scale:e}");
+        }
+        for scale in [max, max * 2.0, f32::MAX, f32::INFINITY] {
+            assert_eq!(ScaleDtype::UE8M0.round_up(scale), max, "{scale:e}");
+        }
+    }
+
+    /// Every byte stands for a value that encodes back to it — the codec is a bijection on the
+    /// codes, which is what serializing a scale and reading it back depends on.
+    #[test]
+    fn every_ue8m0_code_round_trips() {
+        for code in 0..=0xFEu8 {
+            let value = ue8m0_to_f32(code);
             assert_eq!(
-                param.round_up(0.3).is_some(),
-                param != QuantParam::UE8M0,
-                "{param:?}"
+                f32_to_ue8m0(value),
+                code,
+                "code {code} decoded to {value:e}"
             );
+        }
+        assert!(ue8m0_to_f32(0xFF).is_nan());
+    }
+
+    /// The codec agrees with `round_up`, so a scale stored through either lands on the same value.
+    #[test]
+    fn the_ue8m0_codec_agrees_with_the_round_up_rule() {
+        for exp in -130..130 {
+            for factor in [1.0, 1.3, 1.9] {
+                let scale = factor * 2f32.powi(exp);
+                assert_eq!(
+                    ue8m0_to_f32(f32_to_ue8m0(scale)),
+                    ScaleDtype::UE8M0.round_up(scale),
+                    "{scale:e}"
+                );
+            }
+        }
+    }
+
+    /// The answer is always representable, so rounding it again changes nothing.
+    #[test]
+    fn ue8m0_round_up_is_idempotent() {
+        for exp in -130..130 {
+            for factor in [1.0, 1.3, 1.7] {
+                let scale = factor * 2f32.powi(exp);
+                let up = ScaleDtype::UE8M0.round_up(scale);
+                assert_eq!(
+                    ScaleDtype::UE8M0.round_up(up),
+                    up,
+                    "not idempotent at {scale:e}"
+                );
+                assert!(up >= scale.min(ScaleDtype::UE8M0_MAX), "{up:e} < {scale:e}");
+            }
         }
     }
 
     #[test]
     fn round_up_is_the_identity_for_f32() {
         for scale in [1.0e-30, 0.1, 1.0, 12345.678, f32::MAX] {
-            assert_eq!(QuantParam::F32.round_up(scale).unwrap(), scale);
+            assert_eq!(ScaleDtype::F32.round_up(scale), scale);
         }
     }
 
@@ -616,18 +932,18 @@ mod tests {
         #[test]
         fn round_up_is_the_nearest_representable_value_not_below() {
             // Rounding up must not overshoot: stepping down from the answer has to land below.
-            for param in [QuantParam::F16, QuantParam::BF16, QuantParam::UE4M3] {
+            for dtype in [ScaleDtype::F16, ScaleDtype::BF16, ScaleDtype::UE4M3] {
                 for exp in -8..6 {
                     let scale = 1.7 * 2f32.powi(exp);
-                    let up = param.round_up(scale).unwrap();
+                    let up = dtype.round_up(scale);
                     assert_eq!(
                         up,
-                        param.round_up(up).unwrap(),
-                        "{param:?}: not idempotent at {scale}"
+                        dtype.round_up(up),
+                        "{dtype:?}: not idempotent at {scale}"
                     );
                     assert!(
-                        step(param, up, -1) < scale,
-                        "{param:?}: {up} overshoots {scale} by at least a step"
+                        step(dtype, up, -1) < scale,
+                        "{dtype:?}: {up} overshoots {scale} by at least a step"
                     );
                 }
             }
@@ -639,39 +955,39 @@ mod tests {
         /// down below it, and still looks idempotent.
         #[test]
         fn f32_grid_matches_the_storage_types() {
-            for param in [QuantParam::F16, QuantParam::BF16, QuantParam::UE4M3] {
-                let grid = param.f32_grid();
+            for dtype in [ScaleDtype::F16, ScaleDtype::BF16, ScaleDtype::UE4M3] {
+                let grid = dtype.f32_grid();
 
                 // bf16 deliberately reports no subnormal range, since its bit step covers them too.
                 if let Some(subnormals) = grid.subnormals {
                     assert_eq!(
                         subnormals.min_normal,
-                        min_normal(param),
-                        "{param:?}: minimum normal"
+                        min_normal(dtype),
+                        "{dtype:?}: minimum normal"
                     );
                     assert_eq!(
                         subnormals.spacing,
-                        step(param, 0.0, 1),
-                        "{param:?}: subnormal spacing"
+                        step(dtype, 0.0, 1),
+                        "{dtype:?}: subnormal spacing"
                     );
                 }
 
                 // Walk the whole normal range: one step on the f32 pattern has to be one step in
                 // the type, at every exponent.
-                let mut value = min_normal(param);
-                let max = param.max_representable();
+                let mut value = min_normal(dtype);
+                let max = dtype.max_representable();
                 while value < max {
                     let stepped = f32::from_bits(value.to_bits() + grid.bit_step);
                     assert_eq!(
                         stepped,
-                        step(param, value, 1),
-                        "{param:?}: step above {value}"
+                        step(dtype, value, 1),
+                        "{dtype:?}: step above {value}"
                     );
                     value = stepped;
                 }
                 assert_eq!(
                     value, max,
-                    "{param:?}: the grid has to land exactly on the maximum"
+                    "{dtype:?}: the grid has to land exactly on the maximum"
                 );
             }
         }
@@ -679,7 +995,7 @@ mod tests {
         #[test]
         fn max_representable_matches_the_e4m3_type() {
             assert_eq!(
-                QuantParam::UE4M3.max_representable(),
+                ScaleDtype::UE4M3.max_representable(),
                 crate::e4m3::MAX.to_f32()
             );
         }
@@ -689,38 +1005,74 @@ mod tests {
         #[test]
         fn max_representable_matches_the_e8m0_type() {
             assert_eq!(
-                QuantParam::UE8M0.max_representable(),
-                crate::ue8m0::MAX as f32
+                ScaleDtype::UE8M0.max_representable(),
+                crate::ue8m0::MAX.to_f32()
             );
         }
 
-        /// `offset` representable steps from `value` in `param`, for positive values. Counted on
-        /// the storage type's own bit pattern, so this is an oracle independent of the grid under
-        /// test.
-        fn step(param: QuantParam, value: f32, offset: i32) -> f32 {
-            match param {
-                QuantParam::F16 => half::f16::from_bits(
-                    (half::f16::from_f32(value).to_bits() as i32 + offset) as u16,
-                )
-                .to_f32(),
-                QuantParam::BF16 => half::bf16::from_bits(
-                    (half::bf16::from_f32(value).to_bits() as i32 + offset) as u16,
-                )
-                .to_f32(),
-                QuantParam::UE4M3 => crate::e4m3::from_bits(
-                    (crate::e4m3::from_f32(value).to_bits() as i32 + offset) as u8,
-                )
-                .to_f32(),
-                QuantParam::F32 | QuantParam::UE8M0 => unreachable!(),
+        /// [`f32_to_ue8m0`] and [`ue8m0_to_f32`] restate what the `ue8m0` type already does, so
+        /// that this module stays usable without the `fp8` feature. Restating it is only safe
+        /// while the two agree: a scale written through one and read through the other has to be
+        /// the same scale, and the two ends of that trip are on opposite sides of the gate.
+        ///
+        /// Includes the rounding, which is the part that could plausibly drift — `ue8m0` rounds
+        /// up, where a conversion would normally round to nearest.
+        ///
+        /// Gated on `float4` rather than on this module's `fp8`, because that is where `ue8m0`'s
+        /// conversions live — and it is exactly that split which is the reason the pair above
+        /// exists at all.
+        #[test]
+        #[cfg(feature = "fp4")]
+        fn the_ue8m0_codec_matches_the_storage_type() {
+            for code in 0..=0xFFu8 {
+                let ours = ue8m0_to_f32(code);
+                let theirs = crate::ue8m0::from_bits(code).to_f32();
+                if theirs.is_nan() {
+                    assert!(ours.is_nan(), "code {code}: {ours:e} is not a NaN");
+                } else {
+                    assert_eq!(ours.to_bits(), theirs.to_bits(), "code {code}");
+                }
+            }
+
+            for exp in -130..130 {
+                for factor in [1.0, 1.25, 1.5, 1.9] {
+                    let scale = factor * 2f32.powi(exp);
+                    assert_eq!(
+                        f32_to_ue8m0(scale),
+                        crate::ue8m0::from_f32(scale).to_bits(),
+                        "{scale:e}"
+                    );
+                }
             }
         }
 
-        fn min_normal(param: QuantParam) -> f32 {
-            match param {
-                QuantParam::F16 => half::f16::MIN_POSITIVE.to_f32(),
-                QuantParam::BF16 => half::bf16::MIN_POSITIVE.to_f32(),
-                QuantParam::UE4M3 => crate::e4m3::MIN_POSITIVE.to_f32(),
-                QuantParam::F32 | QuantParam::UE8M0 => unreachable!(),
+        /// `offset` representable steps from `value` in `dtype`, for positive values. Counted on
+        /// the storage type's own bit pattern, so this is an oracle independent of the grid under
+        /// test.
+        fn step(dtype: ScaleDtype, value: f32, offset: i32) -> f32 {
+            match dtype {
+                ScaleDtype::F16 => half::f16::from_bits(
+                    (half::f16::from_f32(value).to_bits() as i32 + offset) as u16,
+                )
+                .to_f32(),
+                ScaleDtype::BF16 => half::bf16::from_bits(
+                    (half::bf16::from_f32(value).to_bits() as i32 + offset) as u16,
+                )
+                .to_f32(),
+                ScaleDtype::UE4M3 => crate::e4m3::from_bits(
+                    (crate::e4m3::from_f32(value).to_bits() as i32 + offset) as u8,
+                )
+                .to_f32(),
+                ScaleDtype::F32 | ScaleDtype::UE8M0 => unreachable!(),
+            }
+        }
+
+        fn min_normal(dtype: ScaleDtype) -> f32 {
+            match dtype {
+                ScaleDtype::F16 => half::f16::MIN_POSITIVE.to_f32(),
+                ScaleDtype::BF16 => half::bf16::MIN_POSITIVE.to_f32(),
+                ScaleDtype::UE4M3 => crate::e4m3::MIN_POSITIVE.to_f32(),
+                ScaleDtype::F32 | ScaleDtype::UE8M0 => unreachable!(),
             }
         }
     }

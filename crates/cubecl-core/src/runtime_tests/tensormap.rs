@@ -2,8 +2,9 @@ use crate::{self as cubecl, prelude::barrier::Barrier};
 use alloc::{fmt::Debug, vec, vec::Vec};
 use cubecl::prelude::*;
 use cubecl_ir::features::Tma;
+use cubecl_runtime::runtime::Runtime;
 use cubecl_runtime::{
-    server::{ComputeServer, CopyDescriptor, MemoryLayout},
+    server::{CopyDescriptor, MemoryLayout, ServerStorage},
     storage::ComputeStorage,
 };
 use cubecl_zspace::{Shape, shape, strides};
@@ -15,7 +16,7 @@ fn tensormap_load<F: Float, N: Size>(input: &TensorMap<F, Tiled>, output: &mut [
     sync_async_proxy_shared();
     let mut stage: Shared<[Vector<F, N>]> = Shared::new_aligned_slice(32usize * 16, 128usize);
 
-    let type_size = F::type_size();
+    let type_size = F::size();
     let expected = select(UNIT_POS == 0, comptime![32 * 16 * type_size] as u32, 0);
     if UNIT_POS == 0 {
         barrier.tma_load_2d(input, stage.as_mut_slice(), 0, 8);
@@ -40,7 +41,7 @@ fn tensormap_store<F: Float, N: Size>(input: &[Vector<F, N>], output: &mut Tenso
     if UNIT_POS == 0 {
         tma_store_2d(shared.as_slice(), output, 16, 8);
         tma_group_commit();
-        tma_group_wait_read(0u32);
+        tma_group_wait_read(0usize);
     }
 }
 
@@ -63,7 +64,7 @@ fn tensormap_im2col_load<F: Float, N: Size>(
     let mut stage: Shared<[Vector<F, N>]> =
         Shared::new_aligned_slice(tile_k * tile_width, 128usize);
 
-    let type_size = F::type_size();
+    let type_size = F::size();
     let expected = select(
         UNIT_POS == 0,
         comptime![tile_width * tile_k * type_size] as u32,
@@ -110,9 +111,9 @@ fn tensormap_metadata<F: Float, N: Size>(
     output_2[3] = output_2.shape(0) as u32;
 }
 
-pub fn test_tensormap_load<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>)
+pub fn test_tensormap_load<R: Runtime, F: Float + CubeElement>(client: Client)
 where
-    <<R::Server as ComputeServer>::Storage as ComputeStorage>::Resource: Debug,
+    <<R::Server as ServerStorage>::Storage as ComputeStorage>::Resource: Debug,
 {
     if !client.features().tma.contains(Tma::Base) {
         println!("Skipped test_tensormap_load due to unavailability");
@@ -128,7 +129,7 @@ where
     let input = unsafe { TensorArg::from_raw_parts(handle.clone(), strides, shape) };
     let out = client.empty(16 * 32 * size_of::<F>());
 
-    tensormap_load::launch::<F, R>(
+    tensormap_load::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_2d(32, 16),
@@ -138,7 +139,7 @@ where
                 tile_size: shape![16, 32],
             },
             input,
-            F::as_type_native_unchecked(),
+            F::elem_type_native(),
         ),
         unsafe { BufferArg::from_raw_parts(out.clone(), 32 * 16) },
     );
@@ -153,9 +154,9 @@ where
     assert_eq!(actual, &expected);
 }
 
-pub fn test_tensormap_store<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>)
+pub fn test_tensormap_store<R: Runtime, F: Float + CubeElement>(client: Client)
 where
-    <<R::Server as ComputeServer>::Storage as ComputeStorage>::Resource: Debug,
+    <<R::Server as ServerStorage>::Storage as ComputeStorage>::Resource: Debug,
 {
     if !client.features().tma.contains(Tma::Base) {
         println!("Skipped test_tensormap_load due to unavailability");
@@ -171,7 +172,7 @@ where
         size_of::<F>(),
     );
 
-    tensormap_store::launch::<F, R>(
+    tensormap_store::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_2d(32, 16),
@@ -184,7 +185,7 @@ where
             unsafe {
                 TensorArg::from_raw_parts(out.memory.clone(), out.strides.clone(), [64, 64].into())
             },
-            F::as_type_native_unchecked(),
+            F::elem_type_native(),
         ),
     );
 
@@ -209,9 +210,9 @@ where
     assert_eq!(actual, &expected);
 }
 
-pub fn test_tensormap_load_im2col<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>)
+pub fn test_tensormap_load_im2col<R: Runtime, F: Float + CubeElement>(client: Client)
 where
-    <<R::Server as ComputeServer>::Storage as ComputeStorage>::Resource: Debug,
+    <<R::Server as ServerStorage>::Storage as ComputeStorage>::Resource: Debug,
 {
     if !client.features().tma.contains(Tma::Base) {
         println!("Skipped test_tensormap_load due to unavailability");
@@ -251,7 +252,7 @@ where
     let out_strides = [tile_m, 1];
     let out = client.empty(out_size * size_of::<F>());
 
-    tensormap_im2col_load::launch::<F, R>(
+    tensormap_im2col_load::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_2d(tile_m as u32 * c as u32, kernel_h as u32 * kernel_w as u32),
@@ -264,7 +265,7 @@ where
                 pixels_per_column: tile_m as u32,
             },
             input,
-            F::as_type_native_unchecked(),
+            F::elem_type_native(),
         ),
         unsafe { TensorArg::from_raw_parts(out.clone(), out_strides.into(), out_shape.into()) },
         tile_m,
@@ -299,9 +300,9 @@ where
     assert_eq!(actual, &expected_actual);
 }
 
-pub fn test_tensormap_metadata<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>)
+pub fn test_tensormap_metadata<R: Runtime, F: Float + CubeElement>(client: Client)
 where
-    <<R::Server as ComputeServer>::Storage as ComputeStorage>::Resource: Debug,
+    <<R::Server as ServerStorage>::Storage as ComputeStorage>::Resource: Debug,
 {
     if !client.features().tma.contains(Tma::Base) {
         println!("Skipped test_tensormap_load due to unavailability");
@@ -320,7 +321,7 @@ where
     let output_2 =
         unsafe { TensorArg::from_raw_parts(out_handle_2.clone(), strides, [8, 9].into()) };
 
-    tensormap_metadata::launch::<F, R>(
+    tensormap_metadata::launch::<F>(
         &client,
         CubeCount::Static(1, 1, 1),
         CubeDim::new_2d(32, 16),
@@ -331,14 +332,14 @@ where
                 tile_size: shape![16, 16],
             },
             output_1,
-            F::as_type_native_unchecked(),
+            F::elem_type_native(),
         ),
         TensorMapArg::new(
             TiledArgs {
                 tile_size: shape![16, 32],
             },
             input_2,
-            F::as_type_native_unchecked(),
+            F::elem_type_native(),
         ),
         output_2,
     );

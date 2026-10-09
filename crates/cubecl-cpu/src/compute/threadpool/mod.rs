@@ -1,16 +1,19 @@
 use crossbeam_utils::CachePadded;
 use cubecl_core::CubeDim;
-use cubecl_runtime::{memory_management::MemoryManagement, storage::BytesStorage};
+use cubecl_server::memory_management::PageUpdate;
+use cubecl_server::{
+    memory_management::{ErrorGraph, MemoryManagement},
+    storage::BytesStorage,
+};
 use std::sync::{Arc, OnceLock, atomic::AtomicU64};
 
-use crate::{
-    compiler::{mlir_data::MlirData, mlir_engine::MlirEngine},
-    compute::{
-        schedule::BindingsResource,
-        threadpool::{
-            compute_task::ComputeTask,
-            scheduler::{Scheduler, SchedulerVariant},
-        },
+use cubecl_llvm::{PlironData, PlironEngine, SharedMemories};
+
+use crate::compute::{
+    schedule::BindingsResource,
+    threadpool::{
+        compute_task::ComputeTask,
+        scheduler::{Scheduler, SchedulerVariant},
     },
 };
 
@@ -46,26 +49,41 @@ impl Threadpool {
     #[allow(clippy::too_many_arguments)]
     pub fn execute_data(
         &mut self,
-        mlir_engine: MlirEngine,
+        pliron_engine: PlironEngine,
         bindings: BindingsResource,
         cube_dim: CubeDim,
         cube_count: [u32; 3],
         memory: &mut MemoryManagement<BytesStorage>,
+        failures: &mut ErrorGraph,
         next_counter_step: u64,
         atomic_counter: &Arc<CachePadded<AtomicU64>>,
     ) {
-        let mlir_data = MlirData::new(
-            bindings,
-            &mlir_engine.0.shared_memories,
-            memory,
-            cube_dim,
-            cube_count,
-        );
+        let requirements = pliron_engine.requirements().clone();
 
-        // A `sync_cube` barrier only resolves when every unit of the cube runs
-        // on its own thread, so grow the pool to one worker per unit. Kernels
-        // without a barrier load-balance and need no extra workers.
-        if mlir_engine.0.needs_parallelism {
+        let BindingsResource { resources, info } = bindings;
+        let mut buffer_ptrs: Vec<*mut std::ffi::c_void> = resources
+            .iter()
+            .map(|resource| {
+                resource.resource().get_write_ptr_and_length().0 as *mut std::ffi::c_void
+            })
+            .collect();
+        reserve_shared_memories(
+            memory,
+            failures,
+            &requirements.shared_memories,
+            &mut buffer_ptrs,
+        );
+        // Pin the resources for the launch's lifetime (see
+        // `SharedData::keepalive`).
+        let keepalive: Vec<Box<dyn std::any::Any + Send>> = resources
+            .into_iter()
+            .map(|resource| Box::new(resource) as Box<dyn std::any::Any + Send>)
+            .collect();
+        let base_data = PlironData::new(buffer_ptrs, info.data, cube_count, keepalive);
+
+        // A cube barrier only completes if every unit of the cube is running, so such a kernel
+        // needs as many workers as the cube has units.
+        if requirements.needs_parallelism {
             self.scheduler.ensure_workers(cube_dim.num_elems() as usize);
         }
 
@@ -73,15 +91,14 @@ impl Threadpool {
         for unit_pos_x in 0..cube_dim.x {
             for unit_pos_y in 0..cube_dim.y {
                 for unit_pos_z in 0..cube_dim.z {
-                    let unit_pos = [unit_pos_x, unit_pos_y, unit_pos_z];
-                    let mlir_engine = mlir_engine.clone();
-                    let mut mlir_data = mlir_data.clone();
-                    mlir_data.builtin.set_unit_pos(unit_pos);
+                    let pliron_engine = pliron_engine.clone();
+                    let mut pliron_data = base_data.clone();
+                    pliron_data.set_unit_pos([unit_pos_x, unit_pos_y, unit_pos_z]);
 
                     let atomic_counter = Arc::clone(atomic_counter);
                     let compute_task = ComputeTask {
-                        mlir_engine,
-                        mlir_data,
+                        pliron_engine,
+                        pliron_data,
                         next_counter_step,
                         atomic_counter,
                     };
@@ -90,5 +107,49 @@ impl Threadpool {
                 }
             }
         }
+    }
+}
+
+/// Reserves the shared memory of a launch out of the stream's dedicated pool, and writes each
+/// block into the slot of `table` the kernel reads it from. Those slots follow the buffers, so
+/// the table is padded first when the kernel takes fewer buffers than the launch provides.
+///
+/// Blocks requiring more than the pool's SIMD alignment are over-reserved and their bases
+/// rounded up.
+///
+/// The reservations are released right away: shared-memory launches never overlap — the stream
+/// drains before enqueuing one (see `CpuStream::enqueue_task`).
+fn reserve_shared_memories(
+    memory: &mut MemoryManagement<BytesStorage>,
+    failures: &mut ErrorGraph,
+    shared_memories: &SharedMemories,
+    table: &mut Vec<*mut std::ffi::c_void>,
+) {
+    let end = shared_memories.base + shared_memories.blocks.len();
+    if table.len() < end {
+        table.resize(end, core::ptr::null_mut());
+    }
+
+    // The handles are held until every block is reserved: releasing one right away would let
+    // the pool hand the same memory out to the next shared memory of the same launch.
+    let mut handles = Vec::with_capacity(shared_memories.blocks.len());
+
+    for (slot, block) in shared_memories.blocks.iter().enumerate() {
+        let padding = if block.align > BytesStorage::ALIGNMENT {
+            block.align - 1
+        } else {
+            0
+        };
+        let handle = memory
+            .reserve((block.size + padding) as u64, PageUpdate::Allow, failures)
+            .expect("Failed to reserve the shared memory of the launch");
+        let reserved = memory
+            .get_resource(handle.clone().binding(), None, None)
+            .expect("Failed to resolve the shared memory of the launch");
+        handles.push(handle);
+
+        let (ptr, _) = reserved.get_write_ptr_and_length();
+        let ptr = ptr.wrapping_add(ptr.align_offset(block.align));
+        table[shared_memories.base + slot] = ptr as *mut std::ffi::c_void;
     }
 }

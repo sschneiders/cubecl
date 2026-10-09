@@ -1,24 +1,27 @@
-use crate::{
-    compiler::{MlirCompiler, register_supported_types},
-    compute::server::CpuServer,
-    device::CpuDevice,
-};
+use crate::processor_times::ProcessorTimes;
+use crate::{compute::affinity, compute::server::CpuServer, device::CpuDevice};
 use cubecl_common::{device::DeviceService, profile::TimingMethod};
 use cubecl_core::{
-    MemoryConfiguration, Runtime,
-    client::ComputeClient,
+    MemoryConfiguration,
     device::{DeviceId, ServerUtilitiesHandle},
     ir::{
-        DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties,
-        TargetProperties, VectorSize, features::Features,
+        AddressType, DeviceIdentity, DeviceProperties, ElemType, FloatKind, HardwareProperties,
+        IntKind, MemoryDeviceProperties, TargetProperties, Type, UIntKind, VectorSize,
+        features::{AtomicUsage, Features, TypeUsage},
     },
     server::ServerUtilities,
     zspace::{Shape, Strides},
 };
-use cubecl_environment::sync::Arc;
-use cubecl_runtime::{allocator::ContiguousMemoryLayoutPolicy, logging::ServerLogger};
+use cubecl_llvm::PlironCompiler;
+use cubecl_server::{
+    allocator::ContiguousMemoryLayoutPolicy,
+    config::{CubeClRuntimeConfig, RuntimeConfig, compilation::F16Evaluation},
+    logging::ServerLogger,
+    runtime::{DeviceUtilization, Runtime, UtilizationUnavailable},
+};
 use cubecl_std::tensor::is_contiguous;
-use sysinfo::System;
+use std::sync::Arc;
+use sysinfo::{CpuRefreshKind, System};
 
 #[derive(Default)]
 pub struct RuntimeOptions {
@@ -29,18 +32,138 @@ pub struct RuntimeOptions {
 #[derive(Debug, Clone)]
 pub struct CpuRuntime;
 
-pub type CpuCompiler = MlirCompiler;
+pub type CpuCompiler = PlironCompiler;
+
+fn register_supported_types(props: &mut DeviceProperties) {
+    props.register_address_type(AddressType::U32);
+    props.register_address_type(AddressType::U64);
+
+    let supported_types = [
+        ElemType::Index,
+        ElemType::UInt(UIntKind::U8),
+        ElemType::UInt(UIntKind::U16),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Int(IntKind::I8),
+        ElemType::Int(IntKind::I16),
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::Float(FloatKind::F16),
+        ElemType::Float(FloatKind::BF16),
+        ElemType::Float(FloatKind::F32),
+        ElemType::Float(FloatKind::F64),
+        ElemType::Bool,
+    ];
+
+    let supported_atomic_types = [
+        ElemType::Int(IntKind::I8),
+        ElemType::Int(IntKind::I16),
+        ElemType::Int(IntKind::I32),
+        ElemType::Int(IntKind::I64),
+        ElemType::UInt(UIntKind::U8),
+        ElemType::UInt(UIntKind::U16),
+        ElemType::UInt(UIntKind::U32),
+        ElemType::UInt(UIntKind::U64),
+        ElemType::Float(FloatKind::F16),
+        ElemType::Float(FloatKind::F32),
+        ElemType::Float(FloatKind::F64),
+        ElemType::Bool,
+    ];
+
+    for ty in supported_types {
+        props.register_type_usage(ty, TypeUsage::all());
+    }
+
+    for ty in [FloatKind::E4M3, FloatKind::E5M2, FloatKind::UE8M0] {
+        props.register_type_usage(
+            ElemType::Float(ty),
+            TypeUsage::Conversion | TypeUsage::Buffer,
+        );
+    }
+
+    for ty in supported_atomic_types {
+        props.register_atomic_type_usage(Type::atomic(ty), AtomicUsage::all());
+    }
+}
+
+/// A feature bit promises the instructions, not their speed, and `compilation.f16_evaluation`
+/// overrides the mode chosen from it on a host where the two disagree.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn host_has_f16_arithmetic() -> bool {
+    std::arch::is_x86_feature_detected!("avx512fp16")
+}
+
+#[cfg(target_arch = "aarch64")]
+fn host_has_f16_arithmetic() -> bool {
+    std::arch::is_aarch64_feature_detected!("fp16")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+fn host_has_f16_arithmetic() -> bool {
+    false
+}
+
+fn host_cpu_name(system: &System) -> String {
+    system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().trim())
+        // sysinfo reports no brand on Windows for ARM.
+        .filter(|brand| !brand.is_empty())
+        .map_or_else(|| format!("CPU {}", std::env::consts::ARCH), String::from)
+}
+
+struct HostVectorRegisters {
+    width: u32,
+    count: Option<u32>,
+}
+
+/// Read at runtime, not from `cfg(target_feature)`: the JIT compiles for the CPU it runs on.
+#[cfg(target_arch = "x86_64")]
+fn host_vector_registers() -> HostVectorRegisters {
+    let (width, count) = if std::arch::is_x86_feature_detected!("avx512f") {
+        (512, 32)
+    } else if std::arch::is_x86_feature_detected!("avx") {
+        (256, 16)
+    } else {
+        (128, 16)
+    };
+    HostVectorRegisters {
+        width,
+        count: Some(count),
+    }
+}
+
+/// LLVM keeps a fixed-width vector on NEON even where SVE is present.
+#[cfg(target_arch = "aarch64")]
+fn host_vector_registers() -> HostVectorRegisters {
+    HostVectorRegisters {
+        width: 128,
+        count: Some(32),
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn host_vector_registers() -> HostVectorRegisters {
+    HostVectorRegisters {
+        width: 128,
+        count: None,
+    }
+}
 
 impl DeviceService for CpuServer {
-    fn init(_device_id: cubecl_common::device::DeviceId) -> Self {
+    fn init(device_id: cubecl_common::device::DeviceId) -> Self {
         let options = RuntimeOptions::default();
         let mut system = System::new();
         system.refresh_memory();
-        let max_shared_memory_size = system
+        system.refresh_cpu_list(CpuRefreshKind::nothing());
+        // The cgroup limit where one applies, else the host's RAM: the page size
+        // and the capacity both, and not a kernel's shared memory.
+        let total_memory = system
             .cgroup_limits()
             .map(|g| g.total_memory)
             .unwrap_or(system.total_memory()) as usize;
-        let logger = Arc::new(ServerLogger::default());
+        let logger = cubecl_environment::sync::Arc::new(ServerLogger::default());
 
         let available_parallelism = std::thread::available_parallelism()
             .expect("Can't get available parallelism on this platform")
@@ -52,14 +175,29 @@ impl DeviceService for CpuServer {
             available_parallelism,
         );
         let max_cube_count = (u32::MAX, u32::MAX, u32::MAX);
+        // Kernels size their stages against shared memory ("as big as shared
+        // memory allows"), so reporting whole RAM lets one matmul launch
+        // reserve tens of GB and abort. GPU shared memory is carved from L1,
+        // so the L1d size is its honest CPU analogue — reporting the L2
+        // measured ~2.5x worse on decode gemv, stages outgrowing what stays
+        // resident. GPU-like floor when the topology cannot be read.
+        let max_shared_memory_size = affinity::l1d_cache_size().unwrap_or(64 * 1024);
+        let f16_evaluation = CubeClRuntimeConfig::get()
+            .compilation
+            .f16_evaluation
+            .unwrap_or_else(|| F16Evaluation::for_native_f16(host_has_f16_arithmetic()));
+        let vector_registers = host_vector_registers();
+        let load_width = vector_registers.width;
         let topology = HardwareProperties {
-            load_width: 512,
+            load_width,
+            vector_register_count: vector_registers.count,
             plane_size_min: 1,
             plane_size_max: 1,
             max_bindings: u32::MAX,
             max_shared_memory_size,
             max_cube_count,
             num_cpu_cores: Some(available_parallelism as u32),
+            last_level_cache_size: affinity::llc_cache_size(),
             max_units_per_cube: available_parallelism,
             max_cube_dim,
             num_streaming_multiprocessors: None,
@@ -69,12 +207,10 @@ impl DeviceService for CpuServer {
             cube_mma_reserved_shared_memory: 0,
         };
 
-        const ALIGNMENT: u64 = 8;
+        const ALIGNMENT: u64 = cubecl_server::storage::BytesStorage::ALIGNMENT as u64;
 
-        let mem_properties = MemoryDeviceProperties {
-            max_page_size: max_shared_memory_size as u64,
-            alignment: ALIGNMENT,
-        };
+        let mem_properties = MemoryDeviceProperties::new(total_memory as u64, ALIGNMENT)
+            .with_max_memory(total_memory as u64);
 
         let mut device_props = DeviceProperties::new(
             Features {
@@ -84,27 +220,36 @@ impl DeviceService for CpuServer {
             mem_properties.clone(),
             topology.clone(),
             TimingMethod::Device,
-            // The CPU backend JITs through MLIR for whatever host it runs on
+            // The CPU backend JITs through LLVM for whatever host it runs on
             // and persists no compiled code, so there is no per-machine
-            // namespace to match against. The architecture is the honest
-            // fingerprint: it is what the generated code is valid for.
+            // namespace to match against. The architecture and its load width
+            // are the honest fingerprint: they are what the generated code is valid for.
             DeviceIdentity {
-                name: "CPU".to_string(),
-                fingerprint: format!("cpu_{}", std::env::consts::ARCH),
+                name: host_cpu_name(&system),
+                fingerprint: format!(
+                    "cpu_{}_load-{load_width}_f16-{f16_evaluation}",
+                    std::env::consts::ARCH
+                ),
+                physical: None,
             },
         );
+        // Past one register, a wider vector still amortizes each IO iteration's index math.
+        device_props.io_width_override = Some(512);
         register_supported_types(&mut device_props);
 
-        let utilities = ServerUtilities::new(
+        // No graph capture on this backend: nothing updates the captures.
+        let (utilities, _captures) = ServerUtilities::init(
+            cubecl_common::device::ServiceId::of::<Self>(device_id),
+            "cpu",
             device_props,
+            CpuRuntime::target_properties(),
             logger,
-            (),
             ContiguousMemoryLayoutPolicy::new(ALIGNMENT as usize),
         );
         CpuServer::new(
-            available_parallelism,
             mem_properties,
             options.memory_config,
+            f16_evaluation,
             Arc::new(utilities),
         )
     }
@@ -115,21 +260,8 @@ impl DeviceService for CpuServer {
 }
 
 impl Runtime for CpuRuntime {
-    type Compiler = CpuCompiler;
     type Server = CpuServer;
     type Device = CpuDevice;
-
-    fn client(device: &Self::Device) -> ComputeClient<Self> {
-        ComputeClient::load(device)
-    }
-
-    fn name(_client: &ComputeClient<Self>) -> &'static str {
-        "cpu"
-    }
-
-    fn max_cube_count() -> (u32, u32, u32) {
-        (u32::MAX, u32::MAX, u32::MAX)
-    }
 
     fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
         is_contiguous(shape, strides)
@@ -142,13 +274,14 @@ impl Runtime for CpuRuntime {
         }
     }
 
-    fn enumerate_devices(
-        _: u16,
-        _: &<Self::Server as cubecl_core::server::ComputeServer>::Info,
-    ) -> Vec<DeviceId> {
+    fn enumerate_devices(_: u16) -> Vec<DeviceId> {
         vec![DeviceId {
             type_id: 0,
             index_id: 0,
         }]
+    }
+
+    fn utilization(_device: &Self::Device) -> Result<DeviceUtilization, UtilizationUnavailable> {
+        ProcessorTimes::read_machine_wide()
     }
 }

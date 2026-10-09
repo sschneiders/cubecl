@@ -1,0 +1,141 @@
+use crate::prelude::*;
+use cubecl_core::ir::dialect::atomic::*;
+
+/// The scope every atomic synchronizes at: all units of the device, like CUDA's `atomicAdd`
+/// and HIP's agent-scoped atomics. The system scope would also order against the host and
+/// peer devices, which kernel buffers are never shared with while a kernel runs, and on the
+/// GPU targets it can select slower, system-coherent instructions.
+fn device_scope(ctx: &Context) -> SyncScopeAttr {
+    match ctx.target() {
+        #[cfg(feature = "amdgpu")]
+        LlvmTarget::AmdGpu => SyncScopeAttr::NamedScope("agent".into()),
+        #[cfg(feature = "nvptx")]
+        LlvmTarget::Nvptx => SyncScopeAttr::NamedScope("device".into()),
+        LlvmTarget::Cpu => SyncScopeAttr::System,
+    }
+}
+
+macro_rules! lower_atomic_rmw {
+    ($cube_op:ty => $pred:expr) => {
+        #[op_interface_impl]
+        impl ToLLVMDialect for $cube_op {
+            fn rewrite(
+                &self,
+                ctx: &mut Context,
+                rewriter: &mut DialectConversionRewriter,
+                _operands_info: &OperandsInfo,
+            ) -> Result<()> {
+                let ptr = self.ptr(ctx);
+                let val = self.value(ctx);
+                let kind = $pred;
+                let ordering = AtomicOrderingAttr::Monotonic;
+                let sync_scope = device_scope(ctx);
+
+                let op = llvm::AtomicRmwOp::new(ctx, ptr, val, kind, ordering, sync_scope);
+                rewriter.insert_op(ctx, &op);
+                rewriter.replace_operation_with_values(
+                    ctx,
+                    self.get_operation(),
+                    vec![op.get_result(ctx)],
+                );
+                Ok(())
+            }
+        }
+    };
+}
+
+lower_atomic_rmw!(AtomicExchangeOp => AtomicRmwKindAttr::Xchg);
+lower_atomic_rmw!(AtomicIAddOp => AtomicRmwKindAttr::Add);
+lower_atomic_rmw!(AtomicFAddOp => AtomicRmwKindAttr::FAdd);
+lower_atomic_rmw!(AtomicISubOp => AtomicRmwKindAttr::Sub);
+lower_atomic_rmw!(AtomicFSubOp => AtomicRmwKindAttr::FSub);
+lower_atomic_rmw!(AtomicSMinOp => AtomicRmwKindAttr::Min);
+lower_atomic_rmw!(AtomicUMinOp => AtomicRmwKindAttr::UMin);
+lower_atomic_rmw!(AtomicFMinOp => AtomicRmwKindAttr::FMin);
+lower_atomic_rmw!(AtomicSMaxOp => AtomicRmwKindAttr::Max);
+lower_atomic_rmw!(AtomicUMaxOp => AtomicRmwKindAttr::UMax);
+lower_atomic_rmw!(AtomicFMaxOp => AtomicRmwKindAttr::FMax);
+lower_atomic_rmw!(AtomicAndOp => AtomicRmwKindAttr::And);
+lower_atomic_rmw!(AtomicOrOp => AtomicRmwKindAttr::Or);
+lower_atomic_rmw!(AtomicXorOp => AtomicRmwKindAttr::Xor);
+
+#[op_interface_impl]
+impl ToLLVMDialect for AtomicLoadOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let ptr = self.ptr(ctx);
+        let ordering = AtomicOrderingAttr::Monotonic;
+        let result = self.get_result(ctx);
+        let res_cube_ty = operands_info
+            .lookup_most_recent_type(result)
+            .unwrap_or_else(|| result.get_type(ctx));
+        let align = scalar_alignment(ctx, res_cube_ty);
+        let res_ty = cube_type_to_llvm(ctx, res_cube_ty);
+
+        let sync_scope = device_scope(ctx);
+        let op = llvm::AtomicLoadOp::new(ctx, ptr, res_ty, ordering, sync_scope);
+        op.set_alignment(ctx, align);
+        rewriter.insert_op(ctx, &op);
+        rewriter.replace_operation_with_values(ctx, self.get_operation(), vec![op.get_result(ctx)]);
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMDialect for AtomicStoreOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let value = self.value(ctx);
+        let ptr = self.ptr(ctx);
+        let value_cube_ty = operands_info
+            .lookup_most_recent_type(value)
+            .unwrap_or_else(|| value.get_type(ctx));
+        let align = scalar_alignment(ctx, value_cube_ty);
+        let ordering = AtomicOrderingAttr::Monotonic;
+        let sync_scope = device_scope(ctx);
+
+        let store = llvm::AtomicStoreOp::new(ctx, value, ptr, ordering, sync_scope);
+        store.set_alignment(ctx, align);
+        rewriter.insert_op(ctx, &store);
+        rewriter.replace_operation(ctx, self.get_operation(), store.get_operation());
+        Ok(())
+    }
+}
+
+#[op_interface_impl]
+impl ToLLVMDialect for AtomicCompareExchangeWeakOp {
+    fn rewrite(
+        &self,
+        ctx: &mut Context,
+        rewriter: &mut DialectConversionRewriter,
+        _operands_info: &OperandsInfo,
+    ) -> Result<()> {
+        let ptr = self.ptr(ctx);
+        let cmp = self.cmp(ctx);
+        let new_val = self.value(ctx);
+        let before = AtomicOrderingAttr::Monotonic;
+        let after = AtomicOrderingAttr::Monotonic;
+
+        let sync_scope = device_scope(ctx);
+        let op = llvm::AtomicCmpxchgOp::new(ctx, ptr, cmp, new_val, before, after, sync_scope);
+        rewriter.insert_op(ctx, &op);
+        // `cmpxchg` yields the value it read beside whether it swapped; the cube op is the value.
+        let previous = llvm::ExtractValueOp::new(ctx, op.get_result(ctx), vec![0])
+            .expect("a cmpxchg result holds the value it read first");
+        rewriter.insert_op(ctx, &previous);
+        rewriter.replace_operation_with_values(
+            ctx,
+            self.get_operation(),
+            vec![previous.get_result(ctx)],
+        );
+        Ok(())
+    }
+}

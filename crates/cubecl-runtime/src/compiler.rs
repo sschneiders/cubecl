@@ -1,196 +1,12 @@
-use crate::{
-    id::KernelId,
-    kernel::{CompiledKernel, KernelDefinition, KernelMetadata},
-    server::ExecutionMode,
-};
-use alloc::string::String;
-use core::hash::Hash;
-use cubecl_common::hash::StableHash;
+use crate::kernel::KernelDefinition;
+use crate::poison::DevicePoison;
+use alloc::string::{String, ToString};
 use cubecl_environment::backtrace::BackTrace;
-use cubecl_environment::collections::HashMap;
-use cubecl_environment::persistence::{
-    CacheOption, Namespace, Store, StoreKey, StoreOptions, StoreValue,
-};
-use cubecl_ir::{ElemType, StorageType};
 use thiserror::Error;
-
-/// A store for `backend`'s compiled artifacts, or `None` when compilation
-/// caching is disabled or the target has nowhere durable to put them.
-///
-/// `fingerprint` names what the artifacts were built for — an architecture, a
-/// device — and becomes part of the namespace. Compiled code is not portable
-/// across those, so this is what keeps a bundle shipped between machines from
-/// serving the wrong binary. It needs no sanitizing: a namespace is a database
-/// column, never a path.
-pub fn compilation_store<K: StoreKey, V: StoreValue>(
-    backend: &'static str,
-    fingerprint: impl AsRef<str>,
-) -> Option<Store<K, V>> {
-    #[cfg(std_io)]
-    {
-        use crate::config::RuntimeConfig;
-
-        if !crate::config::CubeClRuntimeConfig::get().compilation.cache {
-            return None;
-        }
-
-        Some(Store::new(
-            StoreOptions::new()
-                .storage(Namespace::scoped(backend, fingerprint))
-                .cache(CacheOption::Lazy),
-        ))
-    }
-
-    // No file system to persist to; the caller keeps its in-memory map.
-    #[cfg(not(std_io))]
-    {
-        let _ = (backend, fingerprint);
-        None
-    }
-}
-
-/// Records a freshly compiled artifact, logging rather than failing.
-///
-/// A refused write is routine, not exceptional: another process sharing the
-/// environment may have written the key first, or the backing store may have
-/// declined it. The artifact was just compiled either way, so the whole cost
-/// is compiling it again next run.
-pub fn store_compiled<K: StoreKey, V: StoreValue>(store: &mut Store<K, V>, key: K, value: V) {
-    if let Err(err) = store.insert(key, value) {
-        log::warn!("Unable to cache the compiled kernel: {}", err.reason());
-    }
-}
-
-/// Kernel trait with the `ComputeShader` that will be compiled and cached based on the
-/// provided id.
-pub trait CubeTask<C: Compiler>: KernelMetadata + Send + Sync {
-    /// Expand the kernel into its [definition](KernelDefinition).
-    ///
-    /// Kept separate from [`CubeTask::compile`] so a server can hash the definition to key the
-    /// compilation cache, then hand the same definition back on a miss instead of expanding twice.
-    fn define(&self) -> KernelDefinition;
-
-    /// Compile a kernel definition and return the compiled form with an optional non-text
-    /// representation.
-    fn compile(
-        &self,
-        definition: KernelDefinition,
-        compiler: &mut C,
-        compilation_options: &C::CompilationOptions,
-        mode: ExecutionMode,
-        address_type: StorageType,
-    ) -> Result<CompiledKernel<C>, CompilationError>;
-}
-
-/// Key for an entry in the persistent compilation cache.
-///
-/// The [id](KernelId) alone doesn't describe what a kernel does: it covers the kernel type, its
-/// comptime arguments and its launch settings, but nothing of the body. Pairing it with a hash of
-/// the expanded IR is what lets a cached artifact be invalidated when the code behind it changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct KernelCacheKey {
-    /// Hash of the [kernel id](KernelId).
-    pub id: StableHash,
-    /// Hash of the [kernel definition](KernelDefinition).
-    pub ir: StableHash,
-}
-
-impl KernelCacheKey {
-    /// Create a key from a kernel id and its expanded definition.
-    pub fn new(id: &KernelId, definition: &KernelDefinition) -> Self {
-        Self {
-            id: id.stable_hash(),
-            ir: definition.stable_hash(),
-        }
-    }
-}
-
-/// A server's in-memory compilation cache: the compiled artifacts it memoizes
-/// — pipelines, loaded modules — in front of a persistent [`compilation_store`].
-///
-/// Entries are dropped when the environment switches, because the map is bound
-/// to an environment exactly as the store it mirrors is. One served after a
-/// switch would describe the environment that is gone, and, worse, would never
-/// be written to the new environment's store, so a bundle exported from that
-/// environment would silently be missing that kernel. This is the same contract
-/// [`Store`] applies to itself, for the state a store cannot see — see
-/// [`cubecl_environment::environment::generation`].
-///
-/// Every accessor resets before it answers, so a backend has nothing to
-/// remember beyond using this in place of a plain map.
-#[derive(Debug)]
-pub struct CompilationCache<K, V> {
-    entries: HashMap<K, V>,
-    /// The generation the entries were built under, or `None` when the cache
-    /// mirrors no store and so is unbound.
-    generation: Option<u32>,
-}
-
-impl<K: Eq + Hash, V> CompilationCache<K, V> {
-    /// An empty cache in front of `store`, bound to the active environment
-    /// exactly when that store exists.
-    ///
-    /// Unbound otherwise: with nothing persisted, a switch changes nothing
-    /// about what the cache holds, so resetting it would only buy a redundant
-    /// compilation — the same reason the autotune cache survives a switch when
-    /// its persistent cache is off.
-    pub fn mirroring<SK: StoreKey, SV: StoreValue>(store: &Option<Store<SK, SV>>) -> Self {
-        Self {
-            entries: HashMap::new(),
-            generation: store
-                .is_some()
-                .then(cubecl_environment::environment::generation),
-        }
-    }
-
-    /// An empty cache that no environment switch ever resets, for a backend
-    /// with no persistent store to mirror.
-    pub fn unbound() -> Self {
-        Self {
-            entries: HashMap::new(),
-            generation: None,
-        }
-    }
-
-    /// The artifact compiled for `key`, if it is still valid.
-    pub fn get(&mut self, key: &K) -> Option<&V> {
-        self.reset_if_switched();
-        self.entries.get(key)
-    }
-
-    /// Whether an artifact for `key` is cached and still valid.
-    pub fn contains(&mut self, key: &K) -> bool {
-        self.reset_if_switched();
-        self.entries.contains_key(key)
-    }
-
-    /// Records a freshly compiled artifact.
-    pub fn insert(&mut self, key: K, value: V) {
-        self.reset_if_switched();
-        self.entries.insert(key, value);
-    }
-
-    /// Drops every entry when the environment switched since the last access,
-    /// adopting the new generation so one switch costs one reset.
-    fn reset_if_switched(&mut self) {
-        let Some(generation) = self.generation else {
-            return;
-        };
-
-        let current = cubecl_environment::environment::generation();
-        if current == generation {
-            return;
-        }
-
-        log::debug!("Environment switched, dropping the in-memory compilation cache");
-        self.generation = Some(current);
-        self.entries.clear();
-    }
-}
 
 /// JIT compilation error.
 #[derive(Error, Clone)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub enum CompilationError {
     /// An instruction isn't supported.
     #[error(
@@ -200,7 +16,7 @@ pub enum CompilationError {
         /// The caused of the error.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
 
@@ -212,9 +28,14 @@ pub enum CompilationError {
         /// The error context.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+    /// The device was poisoned before the compiled kernel could be loaded onto
+    /// it. See [`ServerError::DevicePoisoned`](crate::server::ServerError::DevicePoisoned).
+    #[error("The device is poisoned, the kernel could not be loaded\nCaused by:\n  {0}")]
+    DevicePoisoned(#[from] DevicePoison),
+
     /// A generic compilation error.
     #[error(
         "A validation error caused the compilation to fail\nCaused by:\n  {reason}\nBacktrace:\n{backtrace}"
@@ -223,14 +44,55 @@ pub enum CompilationError {
         /// The error context.
         reason: String,
         /// The backtrace for this error.
-        #[cfg_attr(std_io, serde(skip))]
+        #[cfg_attr(serializable, serde(skip))]
         backtrace: BackTrace,
     },
+    /// The kernel's own code panicked while it expanded, an assertion in it included: a defect
+    /// in the kernel, where every other variant is a compiler turning it down.
+    #[error(
+        "Expanding the kernel `{kernel}` panicked\nCaused by:\n  {message}\nBacktrace:\n{backtrace}"
+    )]
+    ExpansionPanicked {
+        /// The kernel that panicked.
+        kernel: String,
+        /// The panic's message.
+        message: String,
+        /// The backtrace for this error.
+        #[cfg_attr(serializable, serde(skip))]
+        backtrace: BackTrace,
+    },
+}
+
+impl CompilationError {
+    /// Whether the device that emitted the error is poisoned.
+    pub fn is_device_poisoned(&self) -> bool {
+        matches!(self, Self::DevicePoisoned(_))
+    }
+
+    /// Whether this is the kernel being turned down, a candidate to drop or a case to skip,
+    /// rather than a defect in it to report or something going wrong while building it.
+    ///
+    /// Every variant is, except two:
+    /// - a kernel that panicked while it expanded: a kernel declines a configuration by
+    ///   returning an error, so a panic is a bug that skipping would hide;
+    /// - a device that died before the module could load.
+    pub fn is_refusal(&self) -> bool {
+        !matches!(self, Self::ExpansionPanicked { .. }) && !self.is_device_poisoned()
+    }
 }
 
 impl core::fmt::Debug for CompilationError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{self}")
+    }
+}
+
+impl From<pliron::result::Error> for CompilationError {
+    fn from(value: pliron::result::Error) -> Self {
+        CompilationError::Validation {
+            reason: value.to_string(),
+            backtrace: BackTrace::capture(),
+        }
     }
 }
 
@@ -246,14 +108,31 @@ pub trait Compiler: Sync + Send + 'static + Clone + core::fmt::Debug {
         &mut self,
         kernel: KernelDefinition,
         compilation_options: &Self::CompilationOptions,
-        mode: ExecutionMode,
-        addr_type: StorageType,
     ) -> Result<Self::Representation, CompilationError>;
 
-    /// The size of the given element in bytes.
-    fn elem_size(&self, elem: ElemType) -> usize;
+    /// What the compiled kernel does with each buffer binding, by buffer
+    /// position — the visibility analysis's answer, when the representation
+    /// kept it (see [`BufferIOAttr`](crate::kernel::BufferIOAttr)).
+    ///
+    /// `None` reads as every buffer both read and written, the conservative
+    /// direction. A compiler overriding this must answer from the IR
+    /// attributes the annotate pass stamped, never from what its shader
+    /// language kept — wgpu's shader visibility, for one, is deliberately
+    /// forced wider than the kernel's own behavior.
+    fn buffer_io(
+        _repr: &Self::Representation,
+    ) -> Option<alloc::vec::Vec<crate::kernel::BufferIOAttr>> {
+        None
+    }
 
     /// The default extension for the runtime's kernel/shader code.
     /// Might change based on which compiler is used.
     fn extension(&self) -> &'static str;
+
+    /// Short identifier of the language this compiler produces, such as
+    /// `"wgsl"` or `"cuda"`.
+    ///
+    /// What a [`PrecompiledSource`](crate::kernel::PrecompiledSource) has to
+    /// name to be accepted by this compiler.
+    fn lang_tag(&self) -> &'static str;
 }

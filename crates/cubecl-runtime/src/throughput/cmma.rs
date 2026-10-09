@@ -1,9 +1,9 @@
-use crate::{client::ComputeClient, runtime::Runtime};
-use cubecl_ir::{ElemType, StorageType};
+use crate::client::Client;
+use cubecl_ir::ElemType;
 
 /// Configuration for a matrix multiplication (CMMA) operation.
 #[derive(Eq, PartialEq, Clone, Hash, Debug, Copy)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub struct ComputeCmmaConfig {
     /// The data type used to store the running sum.
     pub accumulator_type: AccumulatorType,
@@ -16,7 +16,7 @@ pub type AccumulatorType = ElemType;
 
 /// The M, N, and K dimensions of a matrix multiplication.
 #[derive(Eq, PartialEq, Clone, Hash, Debug, Copy)]
-#[cfg_attr(std_io, derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(serializable, derive(serde::Serialize, serde::Deserialize))]
 pub struct CmmaDims {
     /// Rows in the output matrix.
     pub m: usize,
@@ -34,11 +34,11 @@ impl CmmaDims {
 }
 
 /// Resolves the largest supported CMMA or MMA tile size `(m, n, k)`.
-pub fn select_cmma_tile<R: Runtime>(
-    client: &ComputeClient<R>,
-    lhs: StorageType,
-    rhs: StorageType,
-    acc: StorageType,
+pub fn select_cmma_tile(
+    client: &Client,
+    lhs: ElemType,
+    rhs: ElemType,
+    acc: ElemType,
     (m, n, k): (usize, usize, usize),
 ) -> Option<(u32, u32, u32)> {
     let props = client.properties();

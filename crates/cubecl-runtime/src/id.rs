@@ -10,10 +10,11 @@ use cubecl_common::{
     format::{DebugRaw, format_str},
     hash::{StableHash, StableHasher},
 };
-use cubecl_ir::AddressType;
+use cubecl_ir::{
+    AddressType,
+    settings::{Dim3, ExecutionMode},
+};
 use derive_more::{Eq, PartialEq};
-
-use crate::server::{CubeDim, ExecutionMode};
 
 #[macro_export(local_inner_macros)]
 /// Create a new storage ID type.
@@ -50,10 +51,10 @@ macro_rules! storage_id_type {
 
 /// Identifies a backend-owned captured graph.
 ///
-/// [`end_capture`](crate::server::ComputeServer::end_capture) records a graph,
+/// [`end_capture`](crate::server::Server::end_capture) records a graph,
 /// stores it in the backend's own registry, and returns this lightweight id;
-/// [`replay`](crate::server::ComputeServer::replay) and
-/// [`graph_destroy`](crate::server::ComputeServer::graph_destroy) take the id
+/// [`replay`](crate::server::Server::replay) and
+/// [`graph_destroy`](crate::server::Server::graph_destroy) take the id
 /// back to look the graph up. Referencing the graph by id keeps the raw
 /// executable inside the server — it never crosses the actor boundary in a box —
 /// exactly as memory is referenced by [`Handle`](crate::server::Handle) rather
@@ -90,10 +91,12 @@ pub struct KernelId {
     #[eq(skip)]
     type_name: &'static str,
     pub(crate) type_id: core::any::TypeId,
-    pub(crate) address_type: AddressType,
     /// The [`CubeDim`] for this kernel
-    pub cube_dim: CubeDim,
-    pub(crate) mode: ExecutionMode,
+    pub cube_dim: Dim3,
+    /// The address type for this kernel
+    pub address_type: AddressType,
+    /// The execution mode for this kernel
+    pub mode: ExecutionMode,
     pub(crate) info: Option<Info>,
 }
 
@@ -140,13 +143,26 @@ impl Display for KernelId {
 }
 
 impl KernelId {
+    /// The kernel's type name, trimmed to its last path segment — the short
+    /// name a report can print without drowning the reader in type paths.
+    pub fn short_name(&self) -> &'static str {
+        let name = self.type_name.split('<').next().unwrap_or(self.type_name);
+        name.rsplit("::").next().unwrap_or(name)
+    }
+
+    /// The kernel's type, in full: what names it before its comptime
+    /// arguments tell instances apart.
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
     /// Create a new [kernel id](KernelId) for a type.
     pub fn new<T: 'static>() -> Self {
         Self {
             type_id: core::any::TypeId::of::<T>(),
             type_name: core::any::type_name::<T>(),
             info: None,
-            cube_dim: CubeDim::new_single(),
+            cube_dim: Dim3::new_single(),
             mode: ExecutionMode::Checked,
             address_type: Default::default(),
         }
@@ -176,6 +192,11 @@ impl KernelId {
         hasher.finalize()
     }
 
+    /// Return the entrypoint name disambiguated with a stable hash discriminator.
+    pub fn entrypoint_name(&self, base: &str) -> String {
+        format!("{base}_{:08x}", self.stable_hash() as u32)
+    }
+
     /// Add information to the [kernel id](KernelId).
     ///
     /// The information is used to differentiate kernels of the same kind but with different
@@ -189,12 +210,13 @@ impl KernelId {
     }
 
     /// Set the [execution mode](ExecutionMode).
-    pub fn mode(&mut self, mode: ExecutionMode) {
+    pub fn mode(mut self, mode: ExecutionMode) -> Self {
         self.mode = mode;
+        self
     }
 
     /// Set the [cube dim](CubeDim).
-    pub fn cube_dim(mut self, cube_dim: CubeDim) -> Self {
+    pub fn cube_dim(mut self, cube_dim: Dim3) -> Self {
         self.cube_dim = cube_dim;
         self
     }

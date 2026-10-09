@@ -1,99 +1,43 @@
-use alloc::{collections::VecDeque, vec::Vec};
-use core::ops::Deref;
+use pliron::{
+    graph::{
+        ControlFlowGraph,
+        dominance::{DomFrontierMap, DomTree},
+    },
+    utils::table::ISet,
+};
+use smallvec::SmallVec;
 
-use crate::{Function, GlobalState, NodeIndex};
-use cubecl_environment::collections::{HashMap, HashSet};
-use petgraph::algo::dominators;
-
-use super::Analysis;
-
-/// Dominator tree for the program graph
-pub struct Dominators(dominators::Dominators<NodeIndex>);
-/// Post dominator tree for the program graph
-pub struct PostDominators(dominators::Dominators<NodeIndex>);
-
-impl Deref for Dominators {
-    type Target = dominators::Dominators<NodeIndex>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+pub struct DomFrontierCalculator<G: ControlFlowGraph<GraphContext>, GraphContext> {
+    frontiers: DomFrontierMap<G, GraphContext>,
+    defining_blocks: SmallVec<[G::Node; 16]>,
 }
 
-impl Deref for PostDominators {
-    type Target = dominators::Dominators<NodeIndex>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Analysis for Dominators {
-    fn init(func: &mut crate::Function, _: &GlobalState) -> Self {
-        Dominators(dominators::simple_fast(&func.graph, func.root))
-    }
-}
-
-impl Analysis for PostDominators {
-    fn init(func: &mut crate::Function, _: &GlobalState) -> Self {
-        let mut reversed = func.graph.clone();
-        reversed.reverse();
-        PostDominators(dominators::simple_fast(&reversed, func.ret))
-    }
-}
-
-impl Dominators {
-    pub fn breadth_first_nodes(&self) -> Vec<NodeIndex> {
-        let mut out = Vec::new();
-        let mut worklist = VecDeque::new();
-        worklist.push_back(self.root());
-        while let Some(node) = worklist.pop_front() {
-            out.push(node);
-            worklist.extend(self.immediately_dominated_by(node));
+impl<G: ControlFlowGraph<GraphContext>, GraphContext> DomFrontierCalculator<G, GraphContext> {
+    pub fn new(
+        ctx: &GraphContext,
+        graph: &G,
+        tree: &DomTree<G, GraphContext>,
+        defining_blocks: impl IntoIterator<Item = G::Node>,
+    ) -> Self {
+        let frontiers = DomFrontierMap::new(ctx, graph, tree);
+        Self {
+            frontiers,
+            defining_blocks: defining_blocks.into_iter().collect(),
         }
-        out
     }
-}
 
-/// Dominance frontiers for each block
-pub struct DomFrontiers {
-    /// The dominance frontiers of each block (where phi nodes must be inserted).
-    dom_frontiers: HashMap<NodeIndex, HashSet<NodeIndex>>,
-}
+    pub fn compute(&self) -> ISet<G::Node> {
+        let mut worklist = self.defining_blocks.clone();
+        let mut merge_points = ISet::default();
 
-impl Deref for DomFrontiers {
-    type Target = HashMap<NodeIndex, HashSet<NodeIndex>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.dom_frontiers
-    }
-}
-
-impl DomFrontiers {
-    /// Find dominance frontiers for each block
-    pub fn new(func: &mut Function, state: &GlobalState) -> Self {
-        let doms = func.analysis::<Dominators>(state);
-        let nodes = func.node_ids().into_iter().map(|it| (it, HashSet::new()));
-        let mut dom_frontiers: HashMap<NodeIndex, HashSet<NodeIndex>> = nodes.collect();
-
-        for node in func.node_ids() {
-            let predecessors = func.predecessors(node);
-            if predecessors.len() >= 2 {
-                for predecessor in predecessors {
-                    let mut runner = predecessor;
-                    while runner != doms.immediate_dominator(node).unwrap() {
-                        dom_frontiers.get_mut(&runner).unwrap().insert(node);
-                        runner = doms.immediate_dominator(runner).unwrap();
-                    }
+        while let Some(block) = worklist.pop() {
+            for frontier_block in self.frontiers.frontier(&block) {
+                if merge_points.insert(frontier_block.clone()) {
+                    worklist.push(frontier_block.clone());
                 }
             }
         }
-        Self { dom_frontiers }
-    }
-}
 
-impl Analysis for DomFrontiers {
-    fn init(func: &mut Function, state: &GlobalState) -> Self {
-        DomFrontiers::new(func, state)
+        merge_points
     }
 }

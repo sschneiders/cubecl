@@ -1,22 +1,22 @@
-use crate::{MetalCompiler, MetalDevice, compute::MetalServer};
+use crate::{MetalDevice, compute::MetalServer};
 use cubecl_common::device::{Device, DeviceService};
 use cubecl_core::{
-    Runtime,
     device::{DeviceId, ServerUtilitiesHandle},
     ir::{
         AddressType, DeviceIdentity, DeviceProperties, ElemType, FloatKind, HardwareProperties,
-        IntKind, MemoryDeviceProperties, TargetProperties, Type, UIntKind,
+        IntKind, MemoryDeviceProperties, PhysicalDevice, RegistryEntryId, TargetProperties, Type,
+        UIntKind,
         features::{AtomicUsage, Plane, TypeUsage},
     },
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
 use cubecl_cpp::{
-    DialectWmmaCompiler,
-    metal::{MslDialect, arch::MetalArchitecture},
+    metal::{arch::MetalArchitecture, supported_cmma_combinations_metal},
     shared::register_wmma_features,
 };
-use cubecl_runtime::allocator::ContiguousMemoryLayoutPolicy;
-use cubecl_runtime::client::ComputeClient;
+use cubecl_monitoring::{DeviceUtilization, UtilizationUnavailable, gpu_utilization::CardCounters};
+use cubecl_server::allocator::ContiguousMemoryLayoutPolicy;
+use cubecl_server::runtime::Runtime;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLDevice, MTLGPUFamily};
 
@@ -63,13 +63,15 @@ impl DeviceService for MetalServer {
 
         use cubecl_common::profile::TimingMethod;
 
-        let mem_props = MemoryDeviceProperties {
-            max_page_size: (*metal_device).maxBufferLength() as u64,
-            alignment: 256,
-        };
+        // Metal states no total, only the working set it recommends a device
+        // stay under before it starts paging, around two thirds of unified
+        // memory on Apple silicon. That is the budget `max_memory` asks for.
+        let mem_props = MemoryDeviceProperties::new((*metal_device).maxBufferLength() as u64, 256)
+            .with_max_memory((*metal_device).recommendedMaxWorkingSetSize());
 
         let hardware_props = HardwareProperties {
             load_width: 128,
+            vector_register_count: None,
             plane_size_min: 32,
             plane_size_max: 32,
             // Metal allows 31 buffer bindings; one is reserved for the per-kernel info buffer.
@@ -85,6 +87,7 @@ impl DeviceService for MetalServer {
             num_tensor_cores: None,
             min_tensor_cores_dim: None,
             num_cpu_cores: None,
+            last_level_cache_size: None,
             max_vector_size: 4,
             cube_mma_reserved_shared_memory: 0,
         };
@@ -92,9 +95,12 @@ impl DeviceService for MetalServer {
         // Metal is the one backend where the display name *is* the fingerprint:
         // the MSL is emitted from device-derived compilation options, so the
         // device's own name is what keeps sources built for another GPU out.
-        // `MetalContext` builds the same `msl_{name}` namespace from the same
+        // `MetalPipelines` builds the same `msl_{name}` namespace from the same
         // string.
         let device_name = metal_device.name().to_string();
+
+        let mut physical = PhysicalDevice::default();
+        physical.registry_entry_id = Some(RegistryEntryId::new(metal_device.registryID()));
 
         let mut device_props = DeviceProperties::new(
             Default::default(),
@@ -104,19 +110,24 @@ impl DeviceService for MetalServer {
             DeviceIdentity {
                 fingerprint: format!("msl_{device_name}"),
                 name: device_name,
+                physical: Some(physical),
             },
         );
 
         register_metal_features(&mut device_props);
 
-        let logger = std::sync::Arc::new(cubecl_runtime::logging::ServerLogger::default());
+        let logger = std::sync::Arc::new(cubecl_server::logging::ServerLogger::default());
         let allocator = ContiguousMemoryLayoutPolicy::new(mem_props.alignment as usize);
-        let utilities = std::sync::Arc::new(cubecl_core::server::ServerUtilities::new(
+        // No graph capture on this backend: nothing updates the captures.
+        let (utilities, _captures) = cubecl_core::server::ServerUtilities::init(
+            cubecl_common::device::ServiceId::of::<Self>(device_id),
+            "metal",
             device_props.clone(),
+            MetalRuntime::target_properties(),
             logger,
-            (),
             allocator,
-        ));
+        );
+        let utilities = std::sync::Arc::new(utilities);
 
         let mem_config = cubecl_core::MemoryConfiguration::default();
 
@@ -129,21 +140,8 @@ impl DeviceService for MetalServer {
 }
 
 impl Runtime for MetalRuntime {
-    type Compiler = MetalCompiler;
     type Server = MetalServer;
     type Device = MetalDevice;
-
-    fn client(device: &Self::Device) -> ComputeClient<Self> {
-        ComputeClient::load(device)
-    }
-
-    fn name(_client: &ComputeClient<Self>) -> &'static str {
-        "metal"
-    }
-
-    fn max_cube_count() -> (u32, u32, u32) {
-        (u32::MAX, u32::MAX, u32::MAX)
-    }
 
     fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
         has_pitched_row_major_strides(shape, strides)
@@ -155,10 +153,7 @@ impl Runtime for MetalRuntime {
         }
     }
 
-    fn enumerate_devices(
-        type_id: u16,
-        _info: &<Self::Server as cubecl_core::server::ComputeServer>::Info,
-    ) -> Vec<DeviceId> {
+    fn enumerate_devices(type_id: u16) -> Vec<DeviceId> {
         // type_id matches `device.rs`: 0=Default, 1=Discrete, 2=Integrated, where
         // integrated == `hasUnifiedMemory()`. index_id is the nth device of that class,
         // as resolved by `DeviceService::init`.
@@ -188,6 +183,10 @@ impl Runtime for MetalRuntime {
             _ => Vec::new(),
         }
     }
+
+    fn utilization(device: &Self::Device) -> Result<DeviceUtilization, UtilizationUnavailable> {
+        CardCounters::read(Self::client(device).properties().identity.physical.as_ref())
+    }
 }
 
 /// Register Metal-specific features including types, WMMA, and plane operations
@@ -196,6 +195,8 @@ fn register_metal_features(props: &mut DeviceProperties) {
     register_wmma(props);
 
     props.features.alignment = true;
+    // MSL's `threadgroup_barrier(mem_flags::mem_device)` orders device memory at device scope.
+    props.features.device_memory_scope = true;
     props.features.plane.insert(Plane::Ops);
     props.features.plane.insert(Plane::Sync);
     props.features.plane.insert(Plane::NonUniformControlFlow);
@@ -224,6 +225,12 @@ fn register_types(props: &mut DeviceProperties) {
     for ty in types {
         props.register_type_usage(ty, TypeUsage::all());
     }
+    for ty in [FloatKind::E4M3, FloatKind::E5M2] {
+        props.register_type_usage(
+            ElemType::Float(ty),
+            TypeUsage::Conversion | TypeUsage::Buffer,
+        );
+    }
 
     // Metal natively supports the full integer atomic set; float atomics are
     // limited to add + load/store (no native float min/max).
@@ -238,7 +245,7 @@ fn register_types(props: &mut DeviceProperties) {
 
 /// Register WMMA (`simdgroup_matrix`) features for Metal.
 fn register_wmma(props: &mut DeviceProperties) {
-    let combinations = MslDialect::supported_wmma_combinations(&MetalArchitecture::Metal3);
+    let combinations = supported_cmma_combinations_metal(&MetalArchitecture::Metal3);
     register_wmma_features(combinations, props);
 }
 

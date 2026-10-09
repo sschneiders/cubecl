@@ -1,28 +1,27 @@
+use crate::{
+    frontend::container::{buffer_len::expand_buffer_length_native, slice},
+    prelude::*,
+};
 use alloc::boxed::Box;
-use core::marker::PhantomData;
-
-use crate::{frontend::container::slice, prelude::*};
-use cubecl_ir::Id;
-use cubecl_runtime::runtime::Runtime;
+use cubecl_zspace::Tiling;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub struct BufferCompilationArg {
-    pub inplace: Option<Id>,
+    pub inplace: Option<usize>,
 }
 
 /// Buffer representation with a reference to the [server handle](cubecl_runtime::server::Handle).
-pub struct BufferBinding<R: Runtime> {
-    pub handle: cubecl_runtime::server::Binding,
+pub struct BufferBinding {
+    pub handle: cubecl_runtime::server::BufferBinding,
     pub(crate) length: [usize; 1],
-    runtime: PhantomData<R>,
 }
 
-pub enum BufferArg<R: Runtime> {
+pub enum BufferArg {
     /// The buffer is passed with a buffer handle.
     Handle {
         /// The buffer handle.
-        handle: BufferBinding<R>,
+        handle: BufferBinding,
     },
     /// The buffer is aliasing another input buffer.
     Alias {
@@ -33,7 +32,7 @@ pub enum BufferArg<R: Runtime> {
     },
 }
 
-impl<R: Runtime> BufferArg<R> {
+impl BufferArg {
     /// Create a new buffer argument.
     ///
     /// # Safety
@@ -52,7 +51,7 @@ impl<R: Runtime> BufferArg<R> {
     ///
     /// Specifying the wrong length may lead to out-of-bounds reads and writes.
     pub unsafe fn from_raw_parts_binding(
-        binding: cubecl_runtime::server::Binding,
+        binding: cubecl_runtime::server::BufferBinding,
         length: usize,
     ) -> Self {
         unsafe {
@@ -60,6 +59,19 @@ impl<R: Runtime> BufferArg<R> {
                 handle: BufferBinding::from_raw_parts_binding(binding, length),
             }
         }
+    }
+
+    /// The buffer's length in elements, as it was declared.
+    pub fn len(&self) -> usize {
+        match self {
+            BufferArg::Handle { handle } => handle.length[0],
+            BufferArg::Alias { length, .. } => length[0],
+        }
+    }
+
+    /// Whether the buffer was declared empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn alias(input_pos: usize, length: usize) -> Self {
@@ -84,7 +96,7 @@ impl<R: Runtime> BufferArg<R> {
     }
 }
 
-impl<R: Runtime> BufferBinding<R> {
+impl BufferBinding {
     /// Create a new buffer handle reference.
     ///
     /// # Safety
@@ -100,37 +112,33 @@ impl<R: Runtime> BufferBinding<R> {
     ///
     /// Specifying the wrong length or size, may lead to out-of-bounds reads and writes.
     pub unsafe fn from_raw_parts_binding(
-        handle: cubecl_runtime::server::Binding,
+        handle: cubecl_runtime::server::BufferBinding,
         length: usize,
     ) -> Self {
         Self {
             handle,
             length: [length],
-            runtime: PhantomData,
         }
     }
 
     /// Return the handle as a tensor instead of a buffer.
-    pub fn into_tensor(self) -> TensorBinding<R> {
+    pub fn into_tensor(self) -> TensorBinding {
         let shape = self.length.into();
 
         TensorBinding {
             handle: self.handle,
             strides: [1].into(),
             shape,
-            runtime: PhantomData,
+            tiling: Tiling::UNTILED,
         }
     }
 }
 
 impl<C: CubePrimitive> LaunchArg for Box<[C]> {
-    type RuntimeArg<R: Runtime> = BufferArg<R>;
+    type RuntimeArg = BufferArg;
     type CompilationArg = BufferCompilationArg;
 
-    fn register<R: Runtime>(
-        arg: Self::RuntimeArg<R>,
-        launcher: &mut KernelLauncher<R>,
-    ) -> Self::CompilationArg {
+    fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
         <[C]>::register(arg, launcher)
     }
 
@@ -140,19 +148,16 @@ impl<C: CubePrimitive> LaunchArg for Box<[C]> {
 }
 
 impl<C: CubePrimitive> LaunchArg for [C] {
-    type RuntimeArg<R: Runtime> = BufferArg<R>;
+    type RuntimeArg = BufferArg;
     type CompilationArg = BufferCompilationArg;
 
-    fn register<R: Runtime>(
-        arg: Self::RuntimeArg<R>,
-        launcher: &mut KernelLauncher<R>,
-    ) -> Self::CompilationArg {
-        let ty = launcher.with_scope(|scope| C::__expand_as_type(scope));
+    fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
+        let elem_size = launcher.with_scope(|scope| C::__expand_size(scope));
         let inplace = match &arg {
             BufferArg::Handle { .. } => None,
-            BufferArg::Alias { input_pos, .. } => Some(*input_pos as Id),
+            BufferArg::Alias { input_pos, .. } => Some(*input_pos),
         };
-        launcher.register_buffer(arg, ty);
+        launcher.register_buffer(arg, elem_size);
 
         BufferCompilationArg { inplace }
     }

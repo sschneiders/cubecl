@@ -1,7 +1,9 @@
 /// Re-export for testgen macros.
 pub use test_log;
 
+pub mod erased;
 pub mod event;
+pub mod fp4;
 pub mod reinterpret_slice;
 pub mod round;
 pub mod tensor;
@@ -19,6 +21,8 @@ macro_rules! testgen {
             cubecl_std::testgen_trigonometry!();
             cubecl_std::testgen_event!();
             cubecl_std::testgen_round!();
+            cubecl_std::testgen_fp4!();
+            cubecl_std::testgen_erased!();
         }
     };
 }

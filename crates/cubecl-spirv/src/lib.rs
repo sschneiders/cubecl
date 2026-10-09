@@ -1,33 +1,20 @@
 #![allow(unknown_lints, unnecessary_transmutes)]
 
+use cubecl_runtime::kernel::BufferIOAttr;
 use std::{
     fmt::{Debug, Display},
     sync::Arc,
 };
 
 use cubecl_core::prelude::Visibility;
-use cubecl_opt::Optimizer;
 use rspirv::{binary::Disassemble, dr::Module};
 
-mod arithmetic;
-mod atomic;
-mod bitwise;
-mod branch;
-mod cmma;
-mod compiler;
-mod debug;
-mod extensions;
-mod globals;
-mod instruction;
-mod item;
-mod lookups;
-mod metadata;
-mod subgroup;
-mod sync;
-mod target;
-mod tensor_indexing;
-mod transformers;
-mod value;
+pub mod attributes;
+pub mod compiler;
+pub mod lower;
+pub mod ops;
+pub mod target;
+pub mod types;
 
 pub use compiler::*;
 use serde::{Deserialize, Serialize};
@@ -37,11 +24,16 @@ pub use target::*;
 pub struct SpirvKernel {
     #[serde(skip)]
     pub module: Option<Arc<Module>>,
-    #[serde(skip)]
-    pub optimizer: Option<Arc<Optimizer>>,
 
     pub assembled_module: Vec<u32>,
     pub bindings: Vec<Visibility>,
+    /// What the kernel does with each buffer binding, by buffer position --
+    /// the four-state answer the launch path's taint bookkeeping consumes,
+    /// never collapsed the way [`bindings`](Self::bindings) is. Defaulted for
+    /// entries persisted before the field existed, which reads as no answer:
+    /// every buffer both read and written.
+    #[serde(default)]
+    pub io: Option<Vec<BufferIOAttr>>,
     pub shared_size: usize,
     pub immediate_size: Option<usize>,
     pub info_visibility: Visibility,

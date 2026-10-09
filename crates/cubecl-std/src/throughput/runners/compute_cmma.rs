@@ -4,8 +4,8 @@ use cubecl_runtime::throughput::{CmmaDims, ComputeCmmaConfig, KernelConfig, Thro
 
 use crate::throughput::LaunchConfig;
 
-pub fn build_kernel<R: Runtime>(
-    client: &ComputeClient<R>,
+pub fn build_kernel(
+    client: &Client,
     key: ThroughputKey,
     cmma_config: ComputeCmmaConfig,
     config: LaunchConfig,
@@ -25,23 +25,27 @@ pub fn build_kernel<R: Runtime>(
             compute_cmma_throughput::launch_unchecked(
                 &client,
                 CubeCount::Static(config.cube_count as u32, 1, 1),
-                CubeDim::new(&client, config.cube_dim),
+                config.cube_dim,
                 config.vector_size,
                 BufferArg::from_raw_parts(out, 1),
                 iterations,
                 cmma_config.cmma_dims,
-                dtype.into(),
-                cmma_config.accumulator_type.into(),
+                dtype,
+                cmma_config.accumulator_type,
             )
         };
         let _ = cubecl_core::future::block_on(client.sync());
         start.elapsed()
     });
 
-    let planes_per_cube = config.cube_dim / config.plane_size;
+    let planes_per_cube = config.cube_dim.num_elems() as usize / config.plane_size;
     let ops_count = config.cube_count * planes_per_cube * ops_per_cmma;
 
-    KernelConfig { sample, ops_count }
+    KernelConfig {
+        sample,
+        ops_count,
+        min_iterations: 1,
+    }
 }
 
 #[cube(launch_unchecked)]
@@ -49,8 +53,8 @@ pub fn compute_cmma_throughput<I: Numeric, ACC: Numeric, N: Size>(
     output: &mut [Vector<ACC, N>],
     n_iter: usize,
     #[comptime] cmm_dims: CmmaDims,
-    #[define(I)] _dtype: StorageType,
-    #[define(ACC)] _acc: StorageType,
+    #[define(I)] _dtype: ElemType,
+    #[define(ACC)] _acc: ElemType,
 ) {
     let CmmaDims { m, n, k } = cmm_dims;
 

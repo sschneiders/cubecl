@@ -4,10 +4,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt::{Debug, Display};
 use core::hash::Hash;
+use cubecl_common::hash::StableHasher;
 
 use alloc::format;
 
-use crate::tune::{Bounds, BoundsGenerator};
+use crate::tune::{Bounds, BoundsGenerator, Eviction, Evictor};
 
 use super::{
     AutotuneError, input_generator::InputGenerator, key_generator::KeyGenerator,
@@ -39,15 +40,37 @@ impl<I: TuneInputs, Out: 'static> TuneFn<I, Out> {
 
 /// A set of candidate tunable functions for autotune, sharing a key generator and an
 /// input generator. See [`TuneInputs`] for the `F` parameter.
-pub struct TunableSet<K: AutotuneKey, F: TuneInputs, Output: 'static> {
-    tunables: Vec<Tunable<K, F, Output>>,
+///
+/// `Id` is what its tunables are [identified](Tunable::identified) by, inferred from the
+/// tunables it is given: `()` for tunables built by [`Tunable::new`], named and nothing more.
+pub struct TunableSet<K: AutotuneKey, F: TuneInputs, Output: 'static, Id = ()> {
+    tunables: Vec<Tunable<K, F, Output, Id>>,
     key_gen: Arc<dyn KeyGenerator<K, F> + Send + Sync>,
     input_gen: Arc<dyn InputGenerator<K, F> + Send + Sync>,
     bounds_gen: Option<Arc<dyn BoundsGenerator<K, F> + Send + Sync>>,
+    eviction: Option<Arc<dyn Eviction<K, F> + Send + Sync>>,
     short_circuit: bool,
 }
 
-impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
+impl<K: AutotuneKey, F: TuneInputs, Output: 'static, Id> TunableSet<K, F, Output, Id> {
+    /// Create a tunable set from a key generator and an input generator.
+    pub fn new(key_gen: impl KeyGenerator<K, F>, input_gen: impl InputGenerator<K, F>) -> Self {
+        Self {
+            tunables: Default::default(),
+            input_gen: Arc::new(input_gen),
+            key_gen: Arc::new(key_gen),
+            bounds_gen: None,
+            eviction: None,
+            short_circuit: true,
+        }
+    }
+
+    /// Shorthand for [`new`](Self::new) with a [`CloneInputGenerator`](super::CloneInputGenerator): benchmarks run
+    /// on clones of the real call inputs.
+    pub fn new_cloning_inputs(key_gen: impl KeyGenerator<K, F>) -> Self {
+        Self::new(key_gen, super::CloneInputGenerator)
+    }
+
     /// The number of tunables in the set.
     pub fn len(&self) -> usize {
         self.tunables.len()
@@ -58,25 +81,8 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         self.tunables.is_empty()
     }
 
-    /// Create a tunable set from a key generator and an input generator.
-    pub fn new(key_gen: impl KeyGenerator<K, F>, input_gen: impl InputGenerator<K, F>) -> Self {
-        Self {
-            tunables: Default::default(),
-            input_gen: Arc::new(input_gen),
-            key_gen: Arc::new(key_gen),
-            bounds_gen: None,
-            short_circuit: true,
-        }
-    }
-
-    /// Shorthand for [`new`](Self::new) with a [`CloneInputGenerator`]: benchmarks run
-    /// on clones of the real call inputs.
-    pub fn new_cloning_inputs(key_gen: impl KeyGenerator<K, F>) -> Self {
-        Self::new(key_gen, super::CloneInputGenerator)
-    }
-
     /// Register a tunable with this tunable set.
-    pub fn with(mut self, tunable: Tunable<K, F, Output>) -> Self {
+    pub fn with(mut self, tunable: Tunable<K, F, Output, Id>) -> Self {
         self.tunables.push(tunable);
         self
     }
@@ -84,6 +90,13 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
     /// Sets the autotune bounds for this set.
     pub fn with_bounds(mut self, bounds: Arc<dyn BoundsGenerator<K, F> + Send + Sync>) -> Self {
         self.bounds_gen = Some(bounds);
+        self
+    }
+
+    /// Sets what runs before every measured sample, so the candidates are timed reading
+    /// memory rather than the cache the previous sample left warm. See [`Eviction`].
+    pub fn with_eviction(mut self, eviction: Arc<dyn Eviction<K, F> + Send + Sync>) -> Self {
+        self.eviction = Some(eviction);
         self
     }
 
@@ -114,6 +127,13 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         &self.tunables[fastest_index].function
     }
 
+    /// What the tunable at `index` is [identified](Tunable::identified) by. The index is one
+    /// the tuner stored for this set, so it panics out of range as [`fastest`](Self::fastest)
+    /// does.
+    pub(crate) fn identity(&self, index: usize) -> &Id {
+        self.tunables[index].identity()
+    }
+
     /// Compute a checksum that invalidates outdated cached auto-tune results when the
     /// set of tunable names changes.
     pub fn compute_checksum(&self) -> String {
@@ -121,7 +141,7 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         for tune in &self.tunables {
             checksum += &tune.function.name;
         }
-        format!("{:x}", md5::compute(checksum))
+        format!("{:x}", StableHasher::hash_one(&checksum))
     }
 
     /// Generate a key from a set of inputs
@@ -134,14 +154,23 @@ impl<K: AutotuneKey, F: TuneInputs, Output: 'static> TunableSet<K, F, Output> {
         self.input_gen.generate(key, inputs)
     }
 
+    /// The eviction registered on this set, bound to `key` and the reference `inputs`, if
+    /// any: what a benchmark loop runs before each of its samples.
+    pub(crate) fn evictor<'i>(&self, key: &K, inputs: &F::At<'i>) -> Option<Box<Evictor<'i>>> {
+        let eviction = self.eviction.clone()?;
+        let key = key.clone();
+        let inputs = inputs.clone();
+        Some(Box::new(move || eviction.evict(&key, &inputs)))
+    }
+
     /// The throughput bounds registered on this set, if any.
     pub fn bounds(&self, key: &K, inputs: &F::At<'_>) -> Option<Bounds> {
         self.bounds_gen.as_ref().map(|f| f.generate(key, inputs))
     }
 }
 
-#[cfg(autotune_persistence)]
-/// Trait alias with support for persistent caching
+#[cfg(serializable)]
+/// Trait alias, serializable for the persistent cache and the autotune log
 pub trait AutotuneKey:
     Clone
     + Debug
@@ -156,7 +185,7 @@ pub trait AutotuneKey:
     + 'static
 {
 }
-#[cfg(not(autotune_persistence))]
+#[cfg(not(serializable))]
 /// Trait alias
 pub trait AutotuneKey:
     Clone + Debug + PartialEq + Eq + Hash + Display + Send + Sync + 'static

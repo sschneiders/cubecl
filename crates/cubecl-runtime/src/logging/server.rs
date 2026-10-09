@@ -161,6 +161,18 @@ impl ServerLogger {
         }
     }
 
+    /// Log a failure at the moment it happens — the backstop of the lazy
+    /// model, for the failure nobody ever observes through a side effect.
+    ///
+    /// Always on, unlike the opt-in channels above: a kernel that will not
+    /// compile is a programming error, and a line at the failure site beats a
+    /// `Result` handed over some arbitrary distance later. Reads, syncs and
+    /// profiles still fail loudly on the buffers a failure claimed; this line
+    /// is for the launch whose output nobody ever asks about.
+    pub fn log_failure(&self, error: &impl Display) {
+        log::warn!("{error}");
+    }
+
     /// Register a profiled task without timing.
     pub fn register_execution(&self, name: impl Display) {
         if let Some(channel) = &self.log_channel
@@ -211,12 +223,20 @@ impl AsyncLogger {
                 LogMessage::Memory(msg) => {
                     self.logger.log_memory(&msg);
                 }
-                LogMessage::Profile(name, profile) => {
-                    let duration = profile.resolve().await.duration();
-                    self.profiled.update(&name, duration);
-                    self.logger
-                        .log_profiling(&format!("| {duration:<10?} | {name}"));
-                }
+                LogMessage::Profile(name, profile) => match profile.resolve().await {
+                    Some(ticks) => {
+                        let duration = ticks.duration();
+                        self.profiled.update(&name, duration);
+                        self.logger
+                            .log_profiling(&format!("| {duration:<10?} | {name}"));
+                    }
+                    // Named but not counted. Folding an absence into the
+                    // summary as a zero would drag every average it joins down
+                    // towards a speed nothing achieved.
+                    None => self
+                        .logger
+                        .log_profiling(&format!("| {:<10} | {name}", "not measured")),
+                },
                 LogMessage::Execution(name) => {
                     self.logger.log_profiling(&format!("Executing {name}"));
                 }

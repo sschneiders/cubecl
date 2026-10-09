@@ -1,6 +1,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use alloc::{vec, vec::Vec};
+use cubecl_runtime::runtime::Runtime;
 
 use crate::{self as cubecl, as_bytes};
 use cubecl::prelude::*;
@@ -9,6 +10,7 @@ use cubecl::prelude::*;
 pub fn kernel_vector_index<F: Float, N: Size>(output: &mut [F]) {
     if UNIT_POS == 0 {
         let vector = Vector::<F, N>::new(F::new(5f32));
+        #[unroll]
         for i in 0..4 {
             output[i] = vector.extract(i);
         }
@@ -16,14 +18,14 @@ pub fn kernel_vector_index<F: Float, N: Size>(output: &mut [F]) {
 }
 
 #[allow(clippy::needless_range_loop)]
-pub fn test_vector_index<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_vector_index<R: Runtime, F: Float + CubeElement>(client: Client) {
     for vector_size in client.io_optimized_vector_sizes(size_of::<F>()) {
         if vector_size < 4 {
             continue;
         }
         let handle = client.create_from_slice(F::as_bytes(&vec![F::new(0.0); vector_size]));
         unsafe {
-            kernel_vector_index::launch_unchecked::<F, R>(
+            kernel_vector_index::launch_unchecked::<F>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -47,16 +49,16 @@ pub fn test_vector_index<R: Runtime, F: Float + CubeElement>(client: ComputeClie
 pub fn kernel_vector_index_assign<F: Float, N: Size>(output: &mut [Vector<F, N>]) {
     if UNIT_POS == 0 {
         let mut vector = RuntimeCell::<Vector<F, N>>::new(output[0]);
-        vector.insert(0, F::new(5f32));
+        vector.insert(0usize, F::new(5f32));
         output[0] = vector.consume();
     }
 }
 
-pub fn test_vector_index_assign<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_vector_index_assign<R: Runtime, F: Float + CubeElement>(client: Client) {
     for vector_size in client.io_optimized_vector_sizes(size_of::<F>()) {
         let handle = client.create_from_slice(F::as_bytes(&vec![F::new(0.0); vector_size]));
         unsafe {
-            kernel_vector_index_assign::launch_unchecked::<F, R>(
+            kernel_vector_index_assign::launch_unchecked::<F>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -87,11 +89,11 @@ pub fn kernel_vector_loop_unroll<F: Float, N: Size>(output: &mut [Vector<F, N>])
     }
 }
 
-pub fn test_vector_loop_unroll<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_vector_loop_unroll<R: Runtime, F: Float + CubeElement>(client: Client) {
     for vector_size in client.io_optimized_vector_sizes(size_of::<F>()) {
         let handle = client.create_from_slice(F::as_bytes(&vec![F::new(0.0); vector_size]));
         unsafe {
-            kernel_vector_loop_unroll::launch_unchecked::<F, R>(
+            kernel_vector_loop_unroll::launch_unchecked::<F>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -111,6 +113,39 @@ pub fn test_vector_loop_unroll<R: Runtime, F: Float + CubeElement>(client: Compu
     }
 }
 
+/// `x - x` and `x ^ x` fold to a constant the optimizer has to build for the operation's own
+/// type, which is a vector here. The buffer starts non-zero because a fold that cannot build one
+/// leaves the kernel uncompiled and the output untouched, which reads as the zeros expected here.
+#[allow(clippy::eq_op, reason = "the equal operands are what the folds key on")]
+#[cube(launch_unchecked)]
+pub fn kernel_vector_self_operand_folds<F: Float, N: Size>(output: &mut [Vector<F, N>]) {
+    if UNIT_POS == 0 {
+        let float = output[0];
+        let int = Vector::<u32, N>::cast_from(float);
+        output[0] = (float - float) + Vector::<F, N>::cast_from((int - int) ^ (int ^ int));
+    }
+}
+
+pub fn test_vector_self_operand_folds<R: Runtime, F: Float + CubeElement>(client: Client) {
+    for vector_size in client.io_optimized_vector_sizes(size_of::<F>()) {
+        let handle = client.create_from_slice(F::as_bytes(&vec![F::new(9.0); vector_size]));
+        unsafe {
+            kernel_vector_self_operand_folds::launch_unchecked::<F>(
+                &client,
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                vector_size,
+                BufferArg::from_raw_parts(handle.clone(), 1),
+            )
+        }
+
+        let actual = client.read_one_unchecked(handle);
+        let actual = F::from_bytes(&actual);
+
+        assert_eq!(&actual[..vector_size], vec![F::new(0.0); vector_size]);
+    }
+}
+
 #[cube(launch_unchecked)]
 pub fn kernel_vector_conditional<F: Float, N: Size>(
     input: &[Vector<F, N>],
@@ -122,7 +157,7 @@ pub fn kernel_vector_conditional<F: Float, N: Size>(
     output[0] = vector;
 }
 
-pub fn test_vector_conditional<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_vector_conditional<R: Runtime, F: Float + CubeElement>(client: Client) {
     let vector_size = 8usize;
     let mut input_data = vec![F::new(1.0); vector_size];
     input_data.extend(vec![F::new(2.0); vector_size]);
@@ -131,7 +166,7 @@ pub fn test_vector_conditional<R: Runtime, F: Float + CubeElement>(client: Compu
 
     let flag = client.create_from_slice(u32::as_bytes(&[0u32]));
     unsafe {
-        kernel_vector_conditional::launch_unchecked::<F, R>(
+        kernel_vector_conditional::launch_unchecked::<F>(
             &client,
             CubeCount::new_single(),
             CubeDim::new_1d(1),
@@ -147,7 +182,7 @@ pub fn test_vector_conditional<R: Runtime, F: Float + CubeElement>(client: Compu
 
     let flag = client.create_from_slice(u32::as_bytes(&[1u32]));
     unsafe {
-        kernel_vector_conditional::launch_unchecked::<F, R>(
+        kernel_vector_conditional::launch_unchecked::<F>(
             &client,
             CubeCount::new_single(),
             CubeDim::new_1d(1),
@@ -162,6 +197,85 @@ pub fn test_vector_conditional<R: Runtime, F: Float + CubeElement>(client: Compu
     assert_eq!(actual, vec![F::new(2.0); vector_size]);
 }
 
+/// A dynamic lane index on a vector wider than the target's vectors: the
+/// unroll pass has to search the parts it split the vector into, so every lane
+/// is asked for in turn.
+#[cube(launch_unchecked)]
+pub fn kernel_vector_extract_dynamic<F: Float, N: Size>(
+    input: &[Vector<F, N>],
+    index: &[u32],
+    output: &mut [F],
+) {
+    if UNIT_POS == 0 {
+        output[0] = input[0].extract_dynamic(usize::cast_from(index[0]));
+    }
+}
+
+pub fn test_vector_extract_dynamic<R: Runtime, F: Float + CubeElement>(client: Client) {
+    let vector_size = 8usize;
+    let data = (0..vector_size as i64)
+        .map(|x| F::from_int(x + 1))
+        .collect::<Vec<_>>();
+    let input = client.create_from_slice(F::as_bytes(&data));
+
+    for lane in 0..vector_size {
+        let index = client.create_from_slice(u32::as_bytes(&[lane as u32]));
+        let output = client.create_from_slice(F::as_bytes(&[F::new(0.0)]));
+        unsafe {
+            kernel_vector_extract_dynamic::launch_unchecked::<F>(
+                &client,
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                vector_size,
+                BufferArg::from_raw_parts(input.clone(), 1),
+                BufferArg::from_raw_parts(index, 1),
+                BufferArg::from_raw_parts(output.clone(), 1),
+            )
+        }
+
+        let actual = client.read_one_unchecked(output);
+        let actual = F::from_bytes(&actual);
+
+        assert_eq!(actual[0], data[lane], "lane {lane}");
+    }
+}
+
+#[cube(launch_unchecked)]
+pub fn kernel_vector_insert_dynamic<F: Float, N: Size>(index: &[u32], output: &mut [Vector<F, N>]) {
+    if UNIT_POS == 0 {
+        let mut vector = output[0];
+        vector.insert_dynamic(usize::cast_from(index[0]), F::new(5f32));
+        output[0] = vector;
+    }
+}
+
+pub fn test_vector_insert_dynamic<R: Runtime, F: Float + CubeElement>(client: Client) {
+    let vector_size = 8usize;
+
+    for lane in 0..vector_size {
+        let index = client.create_from_slice(u32::as_bytes(&[lane as u32]));
+        let output = client.create_from_slice(F::as_bytes(&vec![F::new(0.0); vector_size]));
+        unsafe {
+            kernel_vector_insert_dynamic::launch_unchecked::<F>(
+                &client,
+                CubeCount::new_single(),
+                CubeDim::new_single(),
+                vector_size,
+                BufferArg::from_raw_parts(index, 1),
+                BufferArg::from_raw_parts(output.clone(), 1),
+            )
+        }
+
+        let actual = client.read_one_unchecked(output);
+        let actual = F::from_bytes(&actual);
+
+        let mut expected = vec![F::new(0.0); vector_size];
+        expected[lane] = F::new(5.0);
+
+        assert_eq!(&actual[..vector_size], expected, "lane {lane}");
+    }
+}
+
 #[cube(launch_unchecked)]
 pub fn kernel_shared_memory<F: Float, N: Size>(output: &mut [Vector<F, N>]) {
     let mut smem1 = Shared::new_slice(8usize);
@@ -169,11 +283,11 @@ pub fn kernel_shared_memory<F: Float, N: Size>(output: &mut [Vector<F, N>]) {
     output[0] = smem1[0];
 }
 
-pub fn test_shared_memory<R: Runtime, F: Float + CubeElement>(client: ComputeClient<R>) {
+pub fn test_shared_memory<R: Runtime, F: Float + CubeElement>(client: Client) {
     for vector_size in client.io_optimized_vector_sizes(size_of::<F>()) {
         let output = client.create_from_slice(F::as_bytes(&vec![F::new(0.0); vector_size]));
         unsafe {
-            kernel_shared_memory::launch_unchecked::<F, R>(
+            kernel_shared_memory::launch_unchecked::<F>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_single(),
@@ -204,14 +318,14 @@ macro_rules! impl_vector_comparison {
             }
 
             pub fn [< test_vector_ $cmp >] <R: Runtime, F: Float + CubeElement>(
-                client: ComputeClient<R>,
+                client: Client,
             ) {
                 let lhs = client.create_from_slice(as_bytes![F: 0.0, 1.0, 2.0, 3.0]);
                 let rhs = client.create_from_slice(as_bytes![F: 0.0, 2.0, 1.0, 3.0]);
                 let output = client.empty(16);
 
                 unsafe {
-                    [< kernel_vector_ $cmp >]::launch::<F, R>(
+                    [< kernel_vector_ $cmp >]::launch::<F>(
                         &client,
                         CubeCount::Static(1, 1, 1),
                         CubeDim::new_1d(1),
@@ -259,6 +373,15 @@ macro_rules! testgen_vector {
         }
 
         #[$crate::runtime_tests::test_log::test]
+        fn test_vector_self_operand_folds() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::vector::test_vector_self_operand_folds::<
+                TestRuntime,
+                FloatType,
+            >(client);
+        }
+
+        #[$crate::runtime_tests::test_log::test]
         fn test_vector_loop_unroll() {
             let client = TestRuntime::client(&Default::default());
             cubecl_core::runtime_tests::vector::test_vector_loop_unroll::<TestRuntime, FloatType>(
@@ -270,6 +393,23 @@ macro_rules! testgen_vector {
         fn test_vector_conditional() {
             let client = TestRuntime::client(&Default::default());
             cubecl_core::runtime_tests::vector::test_vector_conditional::<TestRuntime, FloatType>(
+                client,
+            );
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_vector_extract_dynamic() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::vector::test_vector_extract_dynamic::<
+                TestRuntime,
+                FloatType,
+            >(client);
+        }
+
+        #[$crate::runtime_tests::test_log::test]
+        fn test_vector_insert_dynamic() {
+            let client = TestRuntime::client(&Default::default());
+            cubecl_core::runtime_tests::vector::test_vector_insert_dynamic::<TestRuntime, FloatType>(
                 client,
             );
         }

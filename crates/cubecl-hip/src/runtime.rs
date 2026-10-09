@@ -1,37 +1,56 @@
 use crate::{
-    HipWmmaCompiler,
+    compiler::{HipBackend, HipCompilationOptions},
     compute::{HipServer, context::HipContext},
     device::AmdDevice,
 };
 use core::ffi::c_int;
+
 use cubecl_common::{
     device::{Device, DeviceService},
     profile::TimingMethod,
 };
+#[cfg(windows)]
+use cubecl_core::ir::AdapterLuid;
 use cubecl_core::{
-    MemoryConfiguration, Runtime,
+    MemoryConfiguration,
+    cmma::MatrixLayout,
     device::{DeviceId, ServerUtilitiesHandle},
     ir::{
-        ContiguousElements, DeviceIdentity, DeviceProperties, HardwareProperties, MatrixLayout,
-        MemoryDeviceProperties, MmaProperties, TargetProperties, VectorSize, features::Plane,
+        ContiguousElements, DeviceIdentity, DeviceProperties, HardwareProperties,
+        MemoryDeviceProperties, MmaProperties, PciVendor, PhysicalDevice, TargetProperties,
+        VectorSize, amd::GfxArch, features::Plane,
     },
     server::ServerUtilities,
     zspace::{Shape, Strides, striding::has_pitched_row_major_strides},
 };
 use cubecl_cpp::{
-    ComputeKernel,
-    hip::{HipDialect, arch::AMDArchitecture, mma::contiguous_elements_rdna3},
+    hip::{
+        self,
+        arch::AmdWmma,
+        mma::{
+            HipCmmaCompiler,
+            manual::{contiguous_elements_rdna3, contiguous_elements_rdna4},
+        },
+    },
     register_supported_types,
     shared::{
-        Architecture, CompilationOptions, CppCompiler, CppSupportedFeatures, DialectWmmaCompiler,
-        register_mma_features, register_scaled_mma_features, register_wmma_features,
+        Architecture, CompilationOptions, CppSupportedFeatures, register_mma_features,
+        register_scaled_mma_features, register_wmma_features,
     },
 };
-use cubecl_hip_sys::{HIP_SUCCESS, hipDeviceScheduleSpin, hipGetDeviceCount, hipSetDeviceFlags};
-use cubecl_runtime::{
-    allocator::PitchedMemoryLayoutPolicy, client::ComputeClient, logging::ServerLogger,
+use cubecl_hip_sys::{hipDeviceScheduleSpin, hipGetDeviceCount, hipSetDeviceFlags};
+use cubecl_llvm::shared::lowered_features::{GpuTarget, restrict_features};
+use cubecl_monitoring::{DeviceUtilization, UtilizationUnavailable, gpu_utilization::CardCounters};
+use cubecl_server::{
+    allocator::PitchedMemoryLayoutPolicy, driver::checked, logging::ServerLogger, runtime::Runtime,
 };
-use std::{ffi::CStr, mem::MaybeUninit, sync::Arc};
+use std::{
+    ffi::CStr,
+    mem::MaybeUninit,
+    sync::{Arc, OnceLock},
+};
+
+static AMD_WMMA: OnceLock<Option<AmdWmma>> = OnceLock::new();
 
 /// The values that control how a HIP Runtime will perform its calculations.
 #[derive(Default)]
@@ -43,69 +62,37 @@ pub struct RuntimeOptions {
 #[derive(Debug, Clone)]
 pub struct HipRuntime;
 
-pub type HipCompiler = CppCompiler<HipDialect<HipWmmaCompiler>>;
-pub type HipComputeKernel = ComputeKernel<HipDialect<HipWmmaCompiler>>;
-
 impl DeviceService for HipServer {
     fn init(device_id: cubecl_common::device::DeviceId) -> Self {
+        assert!(
+            cubecl_hip_sys::is_available(),
+            "HIP runtime is unavailable; install ROCm or set ROCM_PATH/HIP_PATH"
+        );
+
         let device = AmdDevice::from_id(device_id);
+        let probe = DeviceProbe::of(device.index as i32);
 
-        #[allow(unused_assignments)]
-        let mut prop_warp_size = 0;
-        #[allow(unused_assignments)]
-        let mut prop_arch_name = "";
-        // Owned, unlike `prop_arch_name`: the marketing name is only ever
-        // copied out, so there is no reason to keep a borrow of the property
-        // struct alive for it. Left uninitialized rather than given a dummy —
-        // the block below is straight-line code that always assigns it, and a
-        // placeholder would only be something to forget to replace.
-        let prop_name;
-        #[allow(unused_assignments)]
-        let mut prop_max_shared_memory_size = 0;
-        #[allow(unused_assignments)]
-        let mut max_cube_count = (1, 1, 1);
-        #[allow(unused_assignments)]
-        let mut prop_max_threads = 0;
-        let mut max_cube_dim = (1, 1, 1);
-        let mut mem_alignment = 32;
-        // SAFETY: Calling HIP FFI to query device properties. The `MaybeUninit` is
-        // initialized by `hipGetDevicePropertiesR0600` on success (asserted below), so
-        // `assume_init()` is valid. The device index is validated by the `AmdDevice` constructor.
-        unsafe {
-            let mut ll_device_props = MaybeUninit::uninit();
-            let status = cubecl_hip_sys::hipGetDevicePropertiesR0600(
-                ll_device_props.as_mut_ptr(),
-                device.index as cubecl_hip_sys::hipDevice_t,
-            );
-            assert_eq!(status, HIP_SUCCESS, "Should get device properties");
-            let ll_device_props = ll_device_props.assume_init();
-            prop_warp_size = ll_device_props.warpSize;
-            prop_arch_name = CStr::from_ptr(ll_device_props.gcnArchName.as_ptr())
-                .to_str()
-                .unwrap();
-            // Lossy: a device name is for display, and a driver returning
-            // something not valid UTF-8 must not take the runtime down with it.
-            prop_name = CStr::from_ptr(ll_device_props.name.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-            prop_max_shared_memory_size = ll_device_props.sharedMemPerBlock;
-            max_cube_count = (
-                ll_device_props.maxGridSize[0] as u32,
-                ll_device_props.maxGridSize[1] as u32,
-                ll_device_props.maxGridSize[2] as u32,
-            );
-            prop_max_threads = ll_device_props.maxThreadsPerBlock as u32;
-            max_cube_dim.0 = ll_device_props.maxThreadsDim[0] as u32;
-            max_cube_dim.1 = ll_device_props.maxThreadsDim[1] as u32;
-            max_cube_dim.2 = ll_device_props.maxThreadsDim[2] as u32;
-
-            // Just to be sure we check both.
-            mem_alignment = usize::max(mem_alignment, ll_device_props.textureAlignment);
-            mem_alignment = usize::max(mem_alignment, ll_device_props.surfaceAlignment);
-        };
-        let normalized_arch_name = prop_arch_name.split(':').next().unwrap_or(prop_arch_name);
-        let arch = AMDArchitecture::parse(normalized_arch_name).unwrap();
-        assert_eq!(prop_warp_size as u32, arch.warp_size());
+        // Parsed once, here, and handed to whichever backend compiles: the target feature
+        // suffix (`xnack`, `sramecc`) is not part of the name the tables are keyed by.
+        let gfx = GfxArch::parse(&probe.arch_name);
+        let arch = gfx.family();
+        // `Runtime::target_properties` is static, so stash what it needs from the device we're
+        // initializing. A process mixing RDNA3 and RDNA4 GPUs would see whichever came up first,
+        // which is a limitation the static signature can't express anyway.
+        let _ = AMD_WMMA.set(gfx.wmma());
+        // The architecture table decides the plane size the compiler emits for, so a driver
+        // reporting a different one, or a name the table has never seen, would mean every
+        // kernel is generated for the wrong wavefront width.
+        assert_eq!(
+            Some(probe.warp_size),
+            gfx.plane_dim(),
+            "the driver reports a wavefront of {} for {:?} (reported as {:?}), but the \
+             architecture table generates code for {:?}",
+            probe.warp_size,
+            gfx.name(),
+            probe.arch_name,
+            gfx.plane_dim(),
+        );
 
         // SAFETY: Calling HIP FFI to set the active device and configure spin-wait scheduling
         // for the current thread. The device index has been validated above by a successful
@@ -113,49 +100,44 @@ impl DeviceService for HipServer {
         unsafe {
             let status = cubecl_hip_sys::hipSetDevice(device.index as cubecl_hip_sys::hipDevice_t);
             hipSetDeviceFlags(hipDeviceScheduleSpin);
-
-            assert_eq!(
-                status, HIP_SUCCESS,
-                "Should set the default device for the current thread"
-            );
+            checked("hipSetDevice", status)
+                .expect("the current thread needs its device set before anything is issued");
         }
 
-        // SAFETY: Calling HIP FFI to query device memory info. The pointers to `free` and
-        // `total` are valid stack variables cast to mutable pointers; HIP writes the values
-        // through them on success (asserted below).
+        // SAFETY: Calling HIP FFI to query device memory info. `free` and `total` are valid
+        // stack variables borrowed mutably; HIP writes the values through them on success
+        // (asserted below).
         let max_memory = unsafe {
-            let free: usize = 0;
-            let total: usize = 0;
-            let status = cubecl_hip_sys::hipMemGetInfo(
-                &free as *const _ as *mut usize,
-                &total as *const _ as *mut usize,
-            );
-            assert_eq!(
-                status, HIP_SUCCESS,
-                "Should get the available memory of the device"
-            );
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let status = cubecl_hip_sys::hipMemGetInfo(&mut free, &mut total);
+            checked("hipMemGetInfo", status)
+                .expect("the memory pools are sized against the device's capacity");
             total
         };
-        let mem_properties = MemoryDeviceProperties {
-            max_page_size: max_memory as u64 / 4,
-            alignment: mem_alignment as u64,
-        };
+        let mem_properties =
+            MemoryDeviceProperties::new(max_memory as u64 / 4, probe.alignment as u64)
+                .with_max_memory(max_memory as u64);
 
-        let supported_wmma_combinations = HipWmmaCompiler::supported_wmma_combinations(&arch);
-        let supported_mma_combinations = HipWmmaCompiler::supported_mma_combinations(&arch);
-        let supported_scaled_mma_combinations =
-            HipWmmaCompiler::supported_scaled_mma_combinations(&arch);
+        let supported_wmma_combinations =
+            HipCmmaCompiler::RocWmma.supported_cmma_combinations(&arch);
+        let supported_mma_combinations = hip::supported_mma_combinations(&arch);
+        let supported_scaled_mma_combinations = hip::supported_scaled_mma_combinations(&arch);
 
         let topology = HardwareProperties {
             load_width: 128,
-            plane_size_min: prop_warp_size as u32,
-            plane_size_max: prop_warp_size as u32,
+            vector_register_count: None,
+            plane_size_min: probe.warp_size,
+            plane_size_max: probe.warp_size,
             max_bindings: crate::device::AMD_MAX_BINDINGS,
-            max_shared_memory_size: prop_max_shared_memory_size,
-            max_cube_count,
-            max_units_per_cube: prop_max_threads,
-            max_cube_dim,
-            num_streaming_multiprocessors: None,
+            max_shared_memory_size: probe.max_shared_memory,
+            max_cube_count: probe.max_cube_count,
+            max_units_per_cube: probe.max_units_per_cube,
+            max_cube_dim: probe.max_cube_dim,
+            // Consumers that size a grid against the machine need this: without
+            // it cubek's matmul selectors fall back to `CubeCountStrategy::FromProblem`
+            // and the cube count bears no relation to the device it runs on.
+            num_streaming_multiprocessors: probe.num_sms,
             num_tensor_cores: None,
             min_tensor_cores_dim: if supported_wmma_combinations.is_empty() {
                 None
@@ -163,26 +145,28 @@ impl DeviceService for HipServer {
                 Some(16)
             },
             num_cpu_cores: None,
+            last_level_cache_size: None,
             max_vector_size: VectorSize::MAX,
             cube_mma_reserved_shared_memory: 0,
         };
 
-        // The full `gcnArchName`, target-feature suffix included: HIP RTC gets
-        // no `--offload-arch`, so the code object it emits carries this exact
-        // string and a loader rejects it on a device that differs by so much as
-        // `xnack`. Built once here and handed to both the identity and the
-        // compilation cache, so the two can never disagree about what a kernel
-        // was built for.
-        let fingerprint = format!("hip-kernel_{prop_arch_name}");
+        // The full `gcnArchName`, target-feature suffix included: HIP RTC
+        // compiles for it as its `--offload-arch`, so the code object it emits
+        // carries this exact string and a loader rejects it on a device that
+        // differs by so much as `xnack`. Built once here and handed to both the
+        // identity and the compilation cache, so the two can never disagree
+        // about what a kernel was built for.
+        let fingerprint = format!("hip-kernel_{}", probe.arch_name);
 
         let mut device_props = DeviceProperties::new(
             Default::default(),
             mem_properties.clone(),
             topology,
-            TimingMethod::System,
+            TimingMethod::Device,
             DeviceIdentity {
-                name: prop_name,
+                name: probe.name.clone(),
                 fingerprint: fingerprint.clone(),
+                physical: Some(probe.physical.clone()),
             },
         );
         register_supported_types(&mut device_props);
@@ -193,6 +177,8 @@ impl DeviceService for HipServer {
 
         device_props.features.memory_reinterpret = true;
         device_props.features.alignment = true;
+        // `__threadfence` carries a block's writes to device scope.
+        device_props.features.device_memory_scope = true;
         device_props.features.plane.insert(Plane::Ops);
         device_props
             .features
@@ -203,57 +189,58 @@ impl DeviceService for HipServer {
         register_mma_features(supported_mma_combinations, &mut device_props);
         register_scaled_mma_features(supported_scaled_mma_combinations, &mut device_props);
 
-        let comp_opts = CompilationOptions {
-            warp_size: arch.warp_size(),
-            supports_features: CppSupportedFeatures {
-                fast_math: true,
-                ..Default::default()
+        // Which backend compiles here decides what may be advertised: a feature the selected
+        // one cannot honour is a kernel that fails to compile rather than a slower one.
+        let backend = HipBackend::default();
+        if backend == HipBackend::Llvm {
+            let wmma = gfx.wmma();
+            restrict_features(&mut device_props, GpuTarget::AmdGpu { wmma });
+        }
+
+        let comp_opts = HipCompilationOptions {
+            cpp: CompilationOptions {
+                warp_size: arch.warp_size() as usize,
+                supports_features: CppSupportedFeatures {
+                    fast_math: true,
+                    ..Default::default()
+                },
+                amd_wmma: gfx.wmma(),
             },
+            arch: Some(gfx),
+            target: probe.arch_name.clone(),
         };
-        let hip_ctx = HipContext::new(comp_opts, device_props.clone(), fingerprint);
+        let hip_ctx = HipContext::new(comp_opts, device_props.clone(), fingerprint, backend);
         let logger = Arc::new(ServerLogger::default());
         let policy = PitchedMemoryLayoutPolicy::new(device_props.memory.alignment as usize);
-        let utilities = ServerUtilities::new(device_props, logger, (), policy);
+        let (utilities, captures) = ServerUtilities::init(
+            cubecl_common::device::ServiceId::of::<Self>(device_id),
+            "hip",
+            device_props,
+            HipRuntime::target_properties(),
+            logger,
+            policy,
+        );
         let options = RuntimeOptions::default();
-
-        // SAFETY: `is_integrated_gpu` calls HIP FFI functions with a valid device index.
-        let is_integrated = unsafe { is_integrated_gpu(device_id.index_id as i32) };
 
         HipServer::new(
             hip_ctx,
             mem_properties,
             options.memory_config,
-            mem_alignment,
-            is_integrated,
+            probe.alignment,
+            probe.integrated,
             utilities,
+            captures,
         )
     }
 
     fn utilities(&self) -> ServerUtilitiesHandle {
-        self.utilities() as ServerUtilitiesHandle
+        cubecl_core::server::Server::utilities(self) as ServerUtilitiesHandle
     }
 }
 
 impl Runtime for HipRuntime {
-    type Compiler = HipCompiler;
     type Server = HipServer;
     type Device = AmdDevice;
-
-    fn client(device: &Self::Device) -> ComputeClient<Self> {
-        ComputeClient::load(device)
-    }
-
-    fn name(_client: &ComputeClient<Self>) -> &'static str {
-        "hip"
-    }
-
-    fn require_array_lengths() -> bool {
-        true
-    }
-
-    fn max_cube_count() -> (u32, u32, u32) {
-        (i32::MAX as u32, u16::MAX as u32, u16::MAX as u32)
-    }
 
     fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
         if shape.is_empty() {
@@ -263,6 +250,10 @@ impl Runtime for HipRuntime {
     }
 
     fn target_properties() -> TargetProperties {
+        // RDNA3 hands every lane the whole `k` range, duplicated across lanes 0-15 / 16-31. RDNA4
+        // splits `k` between the two halves instead, so there's no duplication to account for.
+        let rdna4 = AMD_WMMA.get().copied().flatten() == Some(AmdWmma::Rdna4);
+        let duplication_ab = if rdna4 { 1 } else { 2 };
         TargetProperties {
             mma: MmaProperties {
                 register_size_bits: 32,
@@ -270,19 +261,24 @@ impl Runtime for HipRuntime {
                 register_layout_a: MatrixLayout::RowMajor,
                 register_layout_b: MatrixLayout::ColMajor,
                 register_layout_acc: MatrixLayout::ColMajor,
-                register_duplication_a: 2,
-                register_duplication_b: 2,
+                register_duplication_a: duplication_ab,
+                register_duplication_b: duplication_ab,
                 register_duplication_acc: 1,
-                contiguous_elements: ContiguousElements::new(contiguous_elements_rdna3),
+                contiguous_elements: ContiguousElements::new(if rdna4 {
+                    contiguous_elements_rdna4
+                } else {
+                    contiguous_elements_rdna3
+                }),
             },
         }
     }
 
-    fn enumerate_devices(
-        _: u16,
-        _: &<Self::Server as cubecl_core::server::ComputeServer>::Info,
-    ) -> Vec<cubecl_core::device::DeviceId> {
+    fn enumerate_devices(_: u16) -> Vec<cubecl_core::device::DeviceId> {
         fn device_count() -> usize {
+            if !cubecl_hip_sys::is_available() {
+                return 0;
+            }
+
             let mut device_count: c_int = 0;
             let result;
             // SAFETY: Calling HIP FFI to get the number of available devices.
@@ -290,30 +286,139 @@ impl Runtime for HipRuntime {
             unsafe {
                 result = hipGetDeviceCount(&mut device_count);
             }
-            if result == HIP_SUCCESS {
-                device_count.try_into().unwrap_or(0)
-            } else {
-                0
+            // No devices rather than an error: a machine with no HIP runtime
+            // installed is answering the question, not failing at it.
+            match checked("hipGetDeviceCount", result) {
+                Ok(()) => device_count.try_into().unwrap_or(0),
+                Err(_) => 0,
             }
         }
         (0..device_count())
             .map(|i| DeviceId::new(0, i as u16))
             .collect()
     }
+
+    fn utilization(device: &Self::Device) -> Result<DeviceUtilization, UtilizationUnavailable> {
+        CardCounters::read(Self::client(device).properties().identity.physical.as_ref())
+    }
 }
 
-/// Checks whether the GPU with the given device ID is an integrated (APU) device.
+/// What the driver says about one AMD device.
 ///
-/// # Safety
-///
-/// Calls HIP FFI functions. The caller must ensure `device_id` is a valid HIP device index.
-unsafe fn is_integrated_gpu(device_id: i32) -> bool {
-    // SAFETY: `hipDeviceProp_tR0600` is a plain-old-data struct; zeroing it is valid.
-    let mut props = unsafe { std::mem::zeroed::<cubecl_hip_sys::hipDeviceProp_tR0600>() };
-    // SAFETY: `props` is a valid mutable reference and `device_id` is assumed valid by the caller.
-    let status = unsafe { cubecl_hip_sys::hipGetDevicePropertiesR0600(&mut props, device_id) };
-    if status != HIP_SUCCESS {
-        return false; // assume discrete if we can't tell
+/// Every field is copied out of the property struct rather than borrowed from
+/// it. That struct is a 1.6 KB C type built for the length of one query, and a
+/// `&str` into its `gcnArchName` array would outlive it by the whole of
+/// `init` — [`CStr::from_ptr`] hands out whatever lifetime is asked of it, so
+/// nothing would say so.
+struct DeviceProbe {
+    /// The full `gcnArchName`, target-feature suffix included. HIP RTC compiles
+    /// for it as its `--offload-arch`, so the code object it emits carries this
+    /// exact string and a loader rejects it on a device that differs by so much
+    /// as `xnack`.
+    arch_name: String,
+    /// The marketing name, lossily decoded: a driver returning something that
+    /// is not UTF-8 must not take the runtime down over a display string.
+    name: String,
+    /// The wavefront width, which the architecture table has to agree with.
+    warp_size: u32,
+    /// What the driver counts as a multiprocessor. On RDNA that is the work
+    /// group processor rather than the compute unit -- gfx1151 reports 20 for
+    /// its 40 CUs -- which is the right figure either way, since the WGP is
+    /// what a cube is scheduled onto. `None` when the driver reports zero,
+    /// which is a driver that does not know rather than a device with none.
+    num_sms: Option<u32>,
+    max_shared_memory: usize,
+    max_cube_count: (u32, u32, u32),
+    max_units_per_cube: u32,
+    max_cube_dim: (u32, u32, u32),
+    /// The strictest alignment the device asks for, never below 32.
+    alignment: usize,
+    /// An APU, sharing its memory and IOMMU with the host. The drop queue
+    /// flushes more often on one, to keep the GPU off a 0-to-100% transition.
+    integrated: bool,
+    physical: PhysicalDevice,
+}
+
+impl DeviceProbe {
+    /// Ask the driver to describe the device at `index`.
+    ///
+    /// # Panics
+    ///
+    /// If the driver cannot describe its own device. [`DeviceService::init`]
+    /// returns `Self`, so there is nowhere to report this to and nothing that
+    /// follows would be meaningful.
+    fn of(index: i32) -> Self {
+        // SAFETY: `hipGetDevicePropertiesR0600` initializes the struct on
+        // success, which is asserted before anything reads it, and `index` was
+        // validated by the `AmdDevice` constructor.
+        let props = unsafe {
+            let mut props = MaybeUninit::uninit();
+            let status = cubecl_hip_sys::hipGetDevicePropertiesR0600(
+                props.as_mut_ptr(),
+                index as cubecl_hip_sys::hipDevice_t,
+            );
+            checked("hipGetDevicePropertiesR0600", status).unwrap_or_else(|err| {
+                panic!("the driver could not describe device {index}: {err}")
+            });
+            props.assume_init()
+        };
+
+        // SAFETY: both arrays are null-terminated C strings written by the
+        // driver, and both are copied out before `props` goes out of scope.
+        let (arch_name, name) = unsafe {
+            (
+                CStr::from_ptr(props.gcnArchName.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+                CStr::from_ptr(props.name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+
+        let mut bus_id = [0u8; 32];
+        // SAFETY: the buffer outlives the call and its length travels with it.
+        let status = unsafe {
+            cubecl_hip_sys::hipDeviceGetPCIBusId(
+                bus_id.as_mut_ptr().cast(),
+                bus_id.len() as c_int,
+                index,
+            )
+        };
+        let mut physical = PhysicalDevice::default();
+        physical.pci_address = checked("hipDeviceGetPCIBusId", status)
+            .ok()
+            .and_then(|()| CStr::from_bytes_until_nul(&bus_id).ok())
+            .and_then(|id| id.to_str().ok()?.parse().ok());
+        physical.vendor = Some(PciVendor::Amd);
+        #[cfg(windows)]
+        {
+            let luid = props.luid.map(|byte| byte as u8);
+            // A zeroed LUID names no adapter.
+            physical.luid = (luid != [0; 8]).then(|| AdapterLuid::new(luid));
+        }
+
+        Self {
+            arch_name,
+            name,
+            warp_size: props.warpSize as u32,
+            num_sms: (props.multiProcessorCount > 0).then_some(props.multiProcessorCount as u32),
+            max_shared_memory: props.sharedMemPerBlock,
+            max_cube_count: (
+                props.maxGridSize[0] as u32,
+                props.maxGridSize[1] as u32,
+                props.maxGridSize[2] as u32,
+            ),
+            max_units_per_cube: props.maxThreadsPerBlock as u32,
+            max_cube_dim: (
+                props.maxThreadsDim[0] as u32,
+                props.maxThreadsDim[1] as u32,
+                props.maxThreadsDim[2] as u32,
+            ),
+            // Both are checked: 32 is the floor either way.
+            alignment: 32.max(props.textureAlignment).max(props.surfaceAlignment),
+            integrated: props.integrated != 0,
+            physical,
+        }
     }
-    props.integrated != 0
 }

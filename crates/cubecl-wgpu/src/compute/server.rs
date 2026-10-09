@@ -1,7 +1,13 @@
+use cubecl_core::server::{DeviceCaptures, ServerStorage};
+use cubecl_server::kernel::BufferIOAttr;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 
+use super::graph::WgpuGraph;
 use super::storage::{WgpuResource, WgpuStorage};
 use crate::WgpuCompiler;
+use crate::compute::artifact::WgpuArtifactCompiler;
+use crate::compute::pipelines::{MetadataLayout, WgpuPipelines};
 use crate::schedule::{BindingsResource, ScheduleTask, ScheduledWgpuBackend};
 use alloc::sync::Arc;
 use cubecl_common::pool::LeasePool;
@@ -9,40 +15,39 @@ use cubecl_common::{
     bytes::Bytes,
     profile::{ProfileDuration, TimingMethod},
 };
-use cubecl_core::server::{Binding, StreamErrorMode};
+use cubecl_core::server::{BufferBinding, KernelResource};
 use cubecl_core::zspace::{Shape, SmallVec};
 use cubecl_core::{
     MemoryConfiguration, WgpuCompilationOptions,
     prelude::*,
     server::{
-        CopyDescriptor, IoError, KernelArguments, LaunchError, ProfileError, ProfilingToken,
+        CopyDescriptor, IoError, KernelArguments, ProfileError, ProfilingToken,
         ServerCommunication, ServerError, ServerUtilities,
     },
     zspace::{Strides, strides},
 };
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::DynFut;
-#[cfg(feature = "spirv")]
-use cubecl_environment::persistence::Store;
 use cubecl_environment::stream::StreamId;
 use cubecl_ir::MemoryDeviceProperties;
-use cubecl_runtime::allocator::ContiguousMemoryLayoutPolicy;
 #[cfg(feature = "spirv")]
-use cubecl_runtime::compiler::{KernelCacheKey, compilation_store, store_compiled};
-use cubecl_runtime::memory_management::{ManagedMemoryHandle, MemoryUsage, SharedMemoryBindings};
-use cubecl_runtime::{
-    compiler::{CompilationCache, CubeTask},
+use cubecl_server::compiler::compilation_store;
+use cubecl_server::compiler::{ArtifactId, KernelLoader};
+use cubecl_server::memory_management::{
+    ManagedMemoryHandle, SharedMemoryBindings, StreamMemoryReport,
+    relocation::{RelocatingStreams, RelocationReason},
+};
+use cubecl_server::{
     config::{CubeClRuntimeConfig, RuntimeConfig},
-    dry_run::LaunchMode,
+    execution::LaunchMode,
+    id::GraphId,
+    kernel::CubeKernel,
     logging::ServerLogger,
     memory_management::MemoryAllocationMode,
-    server::ComputeServer,
+    server::Server,
     storage::ManagedResource,
-    stream::scheduler::{
-        SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy,
-        SchedulerStreamBackend,
-    },
-    validation::{validate_cube_dim, validate_units},
+    stream::scheduler::{SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy},
+    stream::{ExecuteScope, FailureStore, StreamCapture, WriteScoped, failed_writing},
 };
 use wgpu::ComputePipeline;
 
@@ -50,6 +55,19 @@ use wgpu::ComputePipeline;
 pub enum ParamsTransfer {
     Immediate,
     Uniform,
+}
+
+/// What a launch needs from a compiled kernel, loaded on the device.
+#[derive(Debug, Clone)]
+pub struct WgpuCompiledKernel {
+    /// The pipeline the launch dispatches.
+    pub pipeline: Arc<ComputePipeline>,
+    /// How the launch passes the kernel's parameters.
+    pub compiler_info: CompilerInfo,
+    /// What the kernel does with each buffer binding, which the taint
+    /// bookkeeping stages from. It rides here because on a cache hit nothing
+    /// else of the compilation survives.
+    pub io: Option<Arc<[BufferIOAttr]>>,
 }
 
 /// Compiler kind and info used when compiling a specific kernel. Used to determine parameter passing strategies.
@@ -64,25 +82,39 @@ pub enum CompilerInfo {
 /// Wgpu compute server.
 #[derive(Debug)]
 pub struct WgpuServer<C: WgpuCompiler> {
-    pub(crate) device: wgpu::Device,
     // A buffer that can be used to store stream id without extra allocations.
     streams_pool: Vec<StreamId>,
-    /// The pipelines built so far, in front of the SPIR-V store when there is
-    /// one.
-    pipelines: CompilationCache<KernelId, (Arc<ComputePipeline>, CompilerInfo)>,
+    /// The pipelines built so far, and how to build another.
+    pipelines: KernelLoader<WgpuPipelines<C>>,
     scheduler: SchedulerMultiStream<ScheduledWgpuBackend>,
-    #[cfg(feature = "spirv")]
-    pub(crate) spirv_cache: Option<Store<(u64, KernelCacheKey), cubecl_spirv::SpirvCacheEntry>>,
-    pub compilation_options: WgpuCompilationOptions,
-    pub(crate) backend: wgpu::Backend,
-    pub(crate) utilities: Arc<ServerUtilities<Self>>,
+    pub(crate) utilities: Arc<ServerUtilities>,
     /// Reusable buffers for the cross-stream input bindings of each launch.
     shared_bindings_pool: LeasePool<SharedMemoryBindings>,
+    /// Captured graphs owned by this server, keyed by the [`GraphId`] handed to
+    /// the client. `end_capture` inserts, `replay` looks up, `graph_destroy`
+    /// removes (dropping the [`WgpuGraph`] unpins the buffers it retained).
+    graphs: HashMap<GraphId, WgpuGraph>,
     _compiler: PhantomData<C>,
 }
 
-impl<C: WgpuCompiler> ServerCommunication for WgpuServer<C> {
-    const SERVER_COMM_ENABLED: bool = false;
+impl<C: WgpuCompiler> ServerCommunication for WgpuServer<C> {}
+
+impl<C: WgpuCompiler> WriteScoped for WgpuServer<C> {
+    type Streams = SchedulerMultiStream<ScheduledWgpuBackend>;
+
+    fn write_streams(&mut self) -> &mut Self::Streams {
+        &mut self.scheduler
+    }
+
+    fn on_failure(&mut self, stream: StreamId, error: &ServerError) {
+        // Measured per stream on this backend, so the scope's stream is the
+        // one whose measurement a failure invalidates.
+        self.scheduler.stream(&stream).profile_failure(error);
+    }
+
+    fn capturing(&mut self, stream: StreamId) -> Option<&mut StreamCapture> {
+        Some(&mut self.scheduler.stream(&stream).capturing)
+    }
 }
 
 impl<C: WgpuCompiler> WgpuServer<C> {
@@ -97,7 +129,8 @@ impl<C: WgpuCompiler> WgpuServer<C> {
         tasks_max: usize,
         backend: wgpu::Backend,
         timing_method: TimingMethod,
-        utilities: ServerUtilities<Self>,
+        utilities: ServerUtilities,
+        captures: DeviceCaptures,
     ) -> Self {
         #[cfg(feature = "spirv")]
         let adapter_info = device.adapter_info();
@@ -111,29 +144,32 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             tasks_max,
             utilities.logger.clone(),
             compilation_options.supports_vulkan_compiler,
+            captures,
         );
 
         let config = CubeClRuntimeConfig::get();
         let max_streams = config.streaming.max_streams;
 
-        #[cfg(feature = "spirv")]
-        let spirv_cache = compilation_store(
-            "vulkan",
-            format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
+        let compiler = WgpuArtifactCompiler::new(
+            device,
+            (*utilities.properties).clone(),
+            compilation_options,
+            backend,
+        );
+        let pipelines = WgpuPipelines::new(
+            compiler,
+            #[cfg(feature = "spirv")]
+            compilation_store(
+                "vulkan",
+                format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
+            ),
+            #[cfg(feature = "spirv")]
+            utilities.properties_hash,
         );
 
-        // WGSL is compiled by the driver on every run, so without the SPIR-V
-        // store there is nothing persisted for a switch to invalidate.
-        #[cfg(feature = "spirv")]
-        let pipelines = CompilationCache::mirroring(&spirv_cache);
-        #[cfg(not(feature = "spirv"))]
-        let pipelines = CompilationCache::unbound();
-
         Self {
-            compilation_options,
             streams_pool: Vec::new(),
-            device,
-            pipelines,
+            pipelines: KernelLoader::new(pipelines),
             scheduler: SchedulerMultiStream::new(
                 utilities.logger.clone(),
                 backend_scheduler,
@@ -143,29 +179,38 @@ impl<C: WgpuCompiler> WgpuServer<C> {
                     strategy: SchedulerStrategy::Interleave,
                 },
             ),
-            #[cfg(feature = "spirv")]
-            spirv_cache,
-            backend,
             utilities: Arc::new(utilities),
             shared_bindings_pool: LeasePool::with_capacity(tasks_max * max_streams as usize),
+            graphs: HashMap::new(),
             _compiler: PhantomData,
         }
     }
 
     fn prepare_bindings(
         &mut self,
+        stream_id: StreamId,
         bindings: KernelArguments,
         compiler_info: CompilerInfo,
     ) -> Result<BindingsResource, IoError> {
         // Store all the resources we'll be using. This could be eliminated if
         // there was a way to tie the lifetime of the resource to the memory handle.
         // Inlined up to four bindings, so the common launch allocates nothing here.
-        let mut resources = SmallVec::with_capacity(bindings.buffers.len());
+        let mut resources = SmallVec::with_capacity(bindings.resources.len());
 
-        for b in bindings.buffers.into_iter() {
-            let stream = self.scheduler.stream(&b.stream);
-            let resource = stream.mem_manage.get_resource(b)?;
-            resources.push(resource);
+        for resource in bindings.resources.into_iter() {
+            match resource {
+                KernelResource::Buffer(b) => {
+                    // A recording guards the pages it was given once it seals.
+                    self.scheduler
+                        .stream(&stream_id)
+                        .capturing
+                        .touch(b.stream, b.memory.descriptor().location());
+                    let stream = self.scheduler.stream(&b.stream);
+                    let resource = stream.resource(b)?;
+                    resources.push(resource);
+                }
+                KernelResource::TensorMap(_) => panic!("Tensor map not supported in wgpu"),
+            }
         }
 
         Ok(BindingsResource {
@@ -174,110 +219,14 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             compiler_info,
         })
     }
-
-    fn pipeline(
-        &mut self,
-        kernel: <Self as ComputeServer>::Kernel,
-        bindings: &KernelArguments,
-        mode: ExecutionMode,
-    ) -> Result<(Arc<ComputePipeline>, CompilerInfo), LaunchError> {
-        let mut kernel_id = kernel.id();
-        kernel_id.mode(mode);
-
-        if let Some(pipeline) = self.pipelines.get(&kernel_id) {
-            return Ok(pipeline.clone());
-        }
-
-        let definition = kernel.define();
-        let cached = self.load_cached_pipeline(&kernel_id, &definition, bindings, mode)?;
-
-        if let Some(Ok(pipeline)) = cached {
-            self.pipelines.insert(kernel_id, pipeline.clone());
-            return Ok(pipeline);
-        }
-
-        validate_cube_dim(&self.utilities.properties, &kernel_id)?;
-        validate_units(&self.utilities.properties, &kernel_id)?;
-
-        let mut compiler = C::init(self.backend, &self.compilation_options);
-        let mut compiled = compiler.compile_kernel(self, kernel, definition, mode)?;
-
-        if self.scheduler.logger.compilation_source_activated() {
-            compiled.debug_info = Some(DebugInformation::new(
-                compiler.lang_tag(),
-                kernel_id.clone(),
-            ));
-        }
-        self.scheduler.logger.log_compilation(&compiled);
-
-        compiler.validate_ir(&compiled.repr, &self.utilities.properties)?;
-        let (compiler_info, auto_repr) = compiler.normalize_repr(compiled.repr);
-        let repr = auto_repr.as_ref().map(|r| r.as_ref());
-
-        // /!\ Do not delete the following commented code.
-        // This is useful while working on the metal compiler.
-        // Also the errors are printed nicely which is not the case when this is the runtime
-        // that does it.
-        // {
-        //     // Write shader in metal file then compile it for error
-        //     std::fs::write("shader.metal", &compiled.source).expect("should write to file");
-        //     let status = std::process::Command::new("xcrun")
-        //         .args(vec![
-        //             "-sdk",
-        //             "macosx",
-        //             "metal",
-        //             "-o",
-        //             "shader.ir",
-        //             "-c",
-        //             "shader.metal",
-        //             "-w",
-        //         ])
-        //         .status()
-        //         .expect("should launch the command");
-        //     if !status.success() {
-        //         println!("SOURCE:\n{}", compiled.source);
-        //         std::process::exit(status.code().unwrap());
-        //     }
-        // }
-
-        let module = self.create_module(
-            &compiled.entrypoint_name,
-            kernel_id.cube_dim,
-            repr,
-            &compiled.source,
-            mode,
-        )?;
-        let pipeline = self.create_pipeline(&compiled.entrypoint_name, repr, module, bindings);
-        self.pipelines
-            .insert(kernel_id.clone(), (pipeline.clone(), compiler_info));
-
-        #[cfg(feature = "spirv")]
-        if let Some(Err(key)) = cached
-            && let Some(crate::AutoRepresentation::SpirV(kernel)) = auto_repr
-        {
-            let cache = self.spirv_cache.as_mut().unwrap();
-            store_compiled(
-                cache,
-                key,
-                cubecl_spirv::SpirvCacheEntry::new(compiled.entrypoint_name, kernel),
-            );
-        }
-
-        Ok((pipeline, compiler_info))
-    }
 }
 
-impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
-    type Kernel = Box<dyn CubeTask<C>>;
-    type Storage = WgpuStorage;
-    type MemoryLayoutPolicy = ContiguousMemoryLayoutPolicy;
-    type Info = wgpu::Backend;
-
+impl<C: WgpuCompiler> Server for WgpuServer<C> {
     fn logger(&self) -> Arc<ServerLogger> {
         self.scheduler.logger.clone()
     }
 
-    fn utilities(&self) -> Arc<ServerUtilities<Self>> {
+    fn utilities(&self) -> Arc<ServerUtilities> {
         self.utilities.clone()
     }
 
@@ -293,12 +242,38 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
         .into())
     }
 
-    fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId) {
-        let stream = self.scheduler.stream(&stream_id);
-        let reserved = stream
-            .empty(size)
-            .unwrap_or_else(|err| panic!("failed to reserve {size} bytes of device memory: {err}"));
-        stream.mem_manage.bind(reserved, memory);
+    fn initialize_memory(
+        &mut self,
+        memory: ManagedMemoryHandle,
+        size: u64,
+        stream_id: StreamId,
+    ) -> Result<(), ServerError> {
+        let mut relocating = self.scheduler.relocating(stream_id);
+        relocating.relocate_when_wanted();
+        let (stream, failures) = self.scheduler.stream_and_failures(&stream_id);
+        let update = stream.capturing.page_update();
+        let reserved = match stream.memory.reserve(size, update, failures) {
+            Ok(reserved) => reserved,
+            // The recording now misses whatever this memory was for, and
+            // `end_capture` reports that: the handle stays unbound, and
+            // whatever uses it belongs to a recording that will not seal.
+            Err(err @ IoError::PageUpdateForbidden { .. }) => {
+                stream.capturing.fail(err.into());
+                return Ok(());
+            }
+            Err(err) => {
+                // Nothing to allocate: the buffer carries the error instead.
+                let err = ServerError::from(err);
+                failures.fail_unallocated(&memory, err.clone());
+                return Err(err);
+            }
+        };
+        if let Err(err) = stream.memory.bind(reserved, memory.clone(), 0, failures) {
+            let err = ServerError::from(err);
+            failures.fail_unallocated(&memory, err.clone());
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn read(
@@ -306,6 +281,26 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
         descriptors: Vec<CopyDescriptor>,
         stream_id: StreamId,
     ) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+        // A read is a host sync: it cannot be recorded, and the recorded work
+        // has not executed, so there is nothing meaningful to read anyway.
+        if let Err(err) = self
+            .scheduler
+            .stream(&stream_id)
+            .reject_while_recording("read")
+        {
+            return Box::pin(async move { Err(err) });
+        }
+
+        // Buffers another stream wrote are only as good as the work that wrote
+        // them; see `StreamPool::ensure_written`. The reader's own errors are
+        // surfaced by `read_resources`' flush further down.
+        if let Err(err) = self
+            .scheduler
+            .ensure_written(descriptors.iter().map(|d| &d.handle))
+        {
+            return Box::pin(async move { Err(err) });
+        }
+
         let mut streams = vec![stream_id];
         let mut resources = Vec::with_capacity(descriptors.len());
         for desc in descriptors {
@@ -321,7 +316,7 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
                 streams.push(desc.handle.stream);
             }
             let stream = self.scheduler.stream(&desc.handle.stream);
-            let resource = match stream.mem_manage.get_resource(desc.handle) {
+            let resource = match stream.resource(desc.handle) {
                 Ok(val) => val,
                 Err(err) => return Box::pin(async move { Err(err.into()) }),
             };
@@ -331,105 +326,214 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
         self.scheduler.execute_streams(streams);
 
         let stream = self.scheduler.stream(&stream_id);
-        stream.read_resources(resources)
+        stream.read_resources(resources, stream_id)
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
-        for (desc, data) in descriptors {
-            let stream = self.scheduler.stream(&desc.handle.stream);
-
-            if contiguous_strides(&desc.shape) != desc.strides {
-                stream.error(ServerError::Io(IoError::UnsupportedStrides {
-                    backtrace: BackTrace::capture(),
-                }));
+        // Writes go on the queue, not the encoder — they cannot be recorded
+        // into a software graph (v1; CUDA records them as memcpy nodes).
+        //
+        // Rejected lazily. When the caller is the stream recording the
+        // capture, the refusal dooms its `end_capture` rather than handing
+        // back a graph missing an operation. When it is a neighbour sharing
+        // the pooled stream, the write was never going into anyone's graph and
+        // the taint on its own destinations is the whole report — dooming a
+        // capture on it would charge one stream's window to another.
+        {
+            let recording = self
+                .scheduler
+                .stream(&stream_id)
+                .reject_while_recording("write");
+            if let Err(err) = recording {
+                // Nothing is copied, so every destination this call was given is
+                // left as it was — taint them, or a read of one on another
+                // logical stream finds no failure to fail on and copies stale
+                // bytes.
+                self.scheduler.taint(
+                    err.clone(),
+                    descriptors.iter().map(|(desc, _)| &desc.handle),
+                );
+                // The owner's own write dooms its capture: the recording is
+                // missing that operation and must not seal. A neighbour's
+                // refusal is not the capture's failure — the taint on its
+                // destinations is the whole report.
+                let stream = self.scheduler.stream(&stream_id);
+                if stream.capturing.owner() == Some(stream_id) {
+                    stream.capturing.fail(err);
+                }
                 return;
             }
-
-            let resource = match stream.mem_manage.get_resource(desc.handle) {
-                Ok(r) => r,
-                Err(err) => {
-                    stream.error(ServerError::Io(err));
-                    return;
+        }
+        for (desc, data) in descriptors {
+            // Each copy runs in its own scope over its destination: the write
+            // that lands fills it, which is what releases an earlier
+            // failure's hold on it — a caller recovers by writing from the
+            // host as much as by relaunching — and a failure leaves it as it
+            // was, which is what a later read of it has to fail on. The scope
+            // queues failures on the caller's stream, the one that flushes
+            // them, even though the resource is resolved on the stream that
+            // owns the handle.
+            let mut written = self.write_set();
+            written.push(desc.handle.clone());
+            ExecuteScope::over(self, stream_id, written).execute(|server| {
+                if contiguous_strides(&desc.shape) != desc.strides {
+                    return Err(ServerError::Io(IoError::UnsupportedStrides {
+                        backtrace: BackTrace::capture(),
+                    }));
                 }
-            };
-            let task = ScheduleTask::Write {
-                data,
-                buffer: resource,
-            };
 
-            self.scheduler.register(stream_id, task, &[]);
+                // The write is registered on the caller, so name the
+                // stream that owns the handle as an argument: its queued
+                // work has to land before this write overwrites the same
+                // memory.
+                let owner = desc.handle.stream;
+                let handle = desc.handle.clone();
+                let stream = server.scheduler.stream(&owner);
+                let resource = stream.resource(desc.handle).map_err(ServerError::Io)?;
+                let task = ScheduleTask::Write {
+                    data,
+                    buffer: resource,
+                    handle,
+                };
+
+                server.scheduler.register(stream_id, task, &[owner]);
+                Ok(())
+            });
         }
     }
 
-    fn get_resource(
+    fn check(
         &mut self,
-        binding: Binding,
-        stream_id: StreamId,
-    ) -> Result<ManagedResource<WgpuResource>, ServerError> {
-        let mut streams = vec![stream_id];
-        if binding.stream != stream_id {
-            streams.push(binding.stream);
-        }
-        self.scheduler.execute_streams(streams);
-        let stream = self.scheduler.stream(&binding.stream);
-        let memory = binding.memory.clone();
-        let resource = stream.mem_manage.get_resource(binding)?;
-
-        Ok(ManagedResource::new(memory, resource))
+        handles: Vec<BufferBinding>,
+        _stream_id: StreamId,
+    ) -> Result<(), ServerError> {
+        self.scheduler.ensure_written(handles.iter())
     }
 
     unsafe fn launch(
         &mut self,
-        kernel: Self::Kernel,
+        kernel: Box<dyn CubeKernel>,
         count: CubeCount,
         args: KernelArguments,
-        mode: ExecutionMode,
         stream_id: StreamId,
         launch_mode: LaunchMode,
     ) {
-        let (pipeline, compiler_info) = match self.pipeline(kernel, &args, mode) {
-            Ok(val) => val,
-            Err(err) => {
-                // We make the stream that would execute the kernel in error.
-                let stream = self.scheduler.stream(&stream_id);
-                stream.errors.push(ServerError::Launch(err));
-                return;
-            }
-        };
-
-        if launch_mode.is_skipped() {
+        // Compilation comes first — memoized, so a launch after the first
+        // pays a map lookup — because the write scope stages what the
+        // compiled kernel says it writes. A kernel that fails to compile has
+        // no IR and no compiled answer, so the caller's declared IO decides:
+        // only the declared outputs are left carrying the failure, never the
+        // buffers the kernel was only going to read — tainting those would
+        // refuse every later launch that shares them, an autotune sweep
+        // above all.
+        //
+        // A discarded launch stages none either way. It was never going to write, so a
+        // failure in it leaves nothing stale, and tainting its buffers would
+        // fail unrelated reads of memory the run deliberately left alone.
+        let layout = MetadataLayout::from(&args.info);
+        if launch_mode == LaunchMode::Queue {
+            self.pipelines.enqueue(kernel, layout);
             return;
         }
-
-        self.streams_pool.clear();
-        // Reuse a pooled buffer to avoid allocating on every launch; it returns to the pool
-        // automatically when the guard drops.
-        let mut shared_inputs = self.shared_bindings_pool.acquire();
-        // Pin the memory of every input that lives on another stream (released in `WgpuStream::flush`).
-        args.buffers.iter().for_each(|b| {
-            self.streams_pool.push(b.stream);
-            if b.stream != stream_id {
-                shared_inputs.push(b.memory.clone());
-            }
-        });
-
-        let resources = match self.prepare_bindings(args, compiler_info) {
-            Ok(val) => val,
+        let id = ArtifactId {
+            kernel: kernel.id(),
+            variant: layout,
+        };
+        let loaded = self.pipelines.load(&*kernel, &id, &self.scheduler.logger);
+        let WgpuCompiledKernel {
+            pipeline,
+            compiler_info,
+            io,
+        } = match loaded {
+            Ok(entry) => entry,
             Err(err) => {
-                // We make the stream that would execute the kernel in error.
-                let stream = self.scheduler.stream(&stream_id);
-                stream.errors.push(ServerError::Io(err));
+                let error = ServerError::Launch(err);
+                self.scheduler.stream(&stream_id).profile_failure(&error);
+                if !launch_mode.discards_launch() {
+                    let mut written = self.write_set();
+                    written.extend(args.buffers_written(None).cloned());
+                    failed_writing(self, stream_id, written, error);
+                }
                 return;
             }
         };
-        let task = ScheduleTask::Execute {
-            pipeline,
-            count,
-            resources,
-            shared_inputs,
-        };
+        if launch_mode.discards_launch() {
+            return;
+        }
+        let kernel_id = id.kernel;
 
-        self.scheduler.register(stream_id, task, &self.streams_pool);
+        // Skip, do not taint: a launch whose input cannot be trusted does not
+        // run. Running it is not merely wasted device time — a buffer holding
+        // garbage can be read as a dynamic cube count or as gather indices,
+        // scattering into memory that carried no failure at all. The outputs
+        // take the failure that stopped the launch, exactly as a failed
+        // launch's would, so a read downstream fails on the root cause.
+        //
+        // Except while this stream records a graph: skipping would seal a
+        // recording missing an operation, and the replay contract has the
+        // caller write fresh inputs before each replay — clearing the very
+        // claim that would explain the hole. A doomed capture is refused at
+        // `end_capture` instead.
+        //
+        // The scope claims what the launch writes until the body proves the
+        // work enqueued, so a failure — or a panic — anywhere in it leaves a
+        // read of those buffers failing on the error rather than copying
+        // bytes nothing wrote.
+        let mut written = self.write_set();
+        written.extend(args.buffers_written(io.as_deref()).cloned());
+        // A dynamic count travels outside `resources`, so `buffers_read`
+        // never names it — yet the indirect dispatch reads it as its grid
+        // dimensions, which is exactly the garbage-as-cube-count read the
+        // skip exists to prevent.
+        let count_read = match &count {
+            CubeCount::Dynamic(binding) => Some(binding),
+            CubeCount::Static(..) => None,
+        };
+        ExecuteScope::launching(
+            self,
+            kernel_id,
+            stream_id,
+            args.buffers_read(io.as_deref()).chain(count_read),
+            written,
+        )
+        .execute(|server| {
+            server.streams_pool.clear();
+            // Reuse a pooled buffer to avoid allocating on every launch; it returns to the pool
+            // automatically when the guard drops.
+            let mut shared_inputs = server.shared_bindings_pool.acquire();
+            // Pin the memory of every input that lives on another stream (released in `WgpuStream::flush`).
+            args.resources.iter().for_each(|resource| match resource {
+                KernelResource::Buffer(b) => {
+                    server.streams_pool.push(b.stream);
+                    if b.stream != stream_id {
+                        shared_inputs.push(b.memory.clone());
+                    }
+                }
+                KernelResource::TensorMap(_) => {
+                    panic!("Tensor maps not supported in WGPU")
+                }
+            });
+
+            let resources = server
+                .prepare_bindings(stream_id, args, compiler_info)
+                .map_err(ServerError::Io)?;
+
+            let task = ScheduleTask::Execute {
+                pipeline,
+                count,
+                resources,
+                shared_inputs,
+            };
+
+            server
+                .scheduler
+                .register(stream_id, task, &server.streams_pool);
+            Ok(())
+        });
+    }
+
+    fn compile_queued(&mut self) {
+        self.pipelines.compile_queued(&self.scheduler.logger);
     }
 
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
@@ -437,24 +541,42 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
 
         let stream = self.scheduler.stream(&stream_id);
 
-        stream.flush(StreamErrorMode {
-            ignore: false,
-            flush: true,
-        })
+        stream.flush(stream_id)
     }
 
     /// Returns the total time of GPU work this sync completes.
-    fn sync(&mut self, stream_id: StreamId) -> DynFut<Result<(), ServerError>> {
+    fn sync(
+        &mut self,
+        handles: Vec<BufferBinding>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<(), ServerError>> {
+        if let Err(err) = self
+            .scheduler
+            .stream(&stream_id)
+            .reject_while_recording("sync")
+        {
+            return Box::pin(async move { Err(err) });
+        }
+        // The claim check a read would have made, without the read; claims
+        // are set at enqueue time, so they are already in place.
+        if let Err(err) = self.scheduler.ensure_written(handles.iter()) {
+            return Box::pin(async move { Err(err) });
+        }
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
 
-        stream.sync()
+        stream.sync(stream_id)
     }
 
     fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError> {
+        // Recorded launches do not execute, so a profile of the window would
+        // measure nothing.
+        self.scheduler
+            .stream(&stream_id)
+            .reject_while_recording("start_profile")?;
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.start_profile()
+        stream.start_profile(stream_id)
     }
 
     fn end_profile(
@@ -465,48 +587,243 @@ impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
 
-        stream.end_profile(token)
+        stream.end_profile(token, stream_id)
     }
 
-    fn memory_usage(&mut self, stream_id: StreamId) -> Result<MemoryUsage, ServerError> {
+    fn abandon_profile(&mut self, stream_id: StreamId, token: ProfilingToken) {
+        // No `execute_streams`: the default reaches this through `end_profile`,
+        // which has to flush what it is about to measure. An abandon measures
+        // nothing, so it leaves the stream's queued work where it found it.
+        self.scheduler.stream(&stream_id).abandon_profile(token);
+    }
+
+    fn memory_report(&mut self, stream_id: StreamId) -> Option<StreamMemoryReport> {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        Ok(stream.mem_manage.memory_usage())
+        Some(StreamMemoryReport {
+            stream: stream_id,
+            pools: stream.memory.memory_report(),
+            auxiliary: stream.auxiliary.report(),
+        })
     }
 
     fn stream_ids(&self) -> Vec<StreamId> {
         self.scheduler.stream_ids().collect()
     }
 
-    fn memory_cleanup(&mut self, stream_id: StreamId) {
+    fn memory_cleanup(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         self.scheduler.execute_streams(vec![stream_id]);
+        self.scheduler
+            .relocating(stream_id)
+            .refuse_while_recording()?;
         let stream = self.scheduler.stream(&stream_id);
-        stream.mem_manage.memory_cleanup(true);
+        // The info cache's buffers are live slices in the uniforms pool; an
+        // explicit cleanup exists to leave the pools empty, so every entry not
+        // pinned by a live graph goes too (entries are recreated on their next
+        // miss).
+        stream.info_cache.clear_unpinned();
         // Cached bind groups retain the buffers they bind; an explicit
         // cleanup should give that memory back.
         stream.clear_cached_bind_groups();
+        self.scheduler.relocating(stream_id).reclaim()
     }
 
     fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId) {
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.mem_manage.mode(mode);
+        stream.memory.mode(mode);
     }
 
-    fn configure_memory_pools(&mut self, config: MemoryConfiguration, stream_id: StreamId) -> bool {
-        // Streams created from now on build their main pool with the new
-        // layout; memory is per stream, so already-created streams keep theirs.
-        self.scheduler
-            .backend_mut()
-            .factory()
-            .set_gpu_pools(config.clone());
-        let (_, props) = self.scheduler.backend_mut().factory().gpu_pools();
-
-        // The calling stream's pools are rebuilt in place (kept, with a log,
-        // when something is still live in them).
+    fn graph_prepare(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        // Drain queued tasks first so pre-capture work is not attributed to
+        // the capture window.
         self.scheduler.execute_streams(vec![stream_id]);
         let stream = self.scheduler.stream(&stream_id);
-        stream.mem_manage.configure_memory_pools(config, &props)
+
+        // The non-`NoCapture` state isolates this stream in the scheduler
+        // (see `requires_isolation`) until the capture ends.
+        stream.capturing.prepare(stream_id)?;
+
+        // The pages the recording touches are guarded for the graph's life,
+        // and a guarded page is never relocated: empty every stream's outdated
+        // pools now, since the recording may touch memory any stream owns.
+        self.scheduler
+            .relocating(stream_id)
+            .relocate_device(RelocationReason::Capture);
+        Ok(())
+    }
+
+    fn begin_capture(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        // Materialize the warmup work queued in the scheduler before the
+        // recording window opens.
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+
+        stream.capturing.begin()?;
+
+        // Submit the warmup work and surface its failure now, so a warmup
+        // failure is reported here — where the diagnostic points at the cause
+        // — instead of dooming `end_capture` later.
+        let stream = self.scheduler.stream(&stream_id);
+        if let Err(err) = stream.flush(stream_id) {
+            // The capture never opened: return to `NoCapture`, so a failed
+            // `start_capture` leaves the stream fully usable and
+            // re-capturable.
+            stream.info_cache.capture_discard();
+            stream.capturing.abort();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn end_capture(&mut self, stream_id: StreamId) -> Result<GraphId, ServerError> {
+        // Materialize the recorded launches still queued in the scheduler.
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+
+        // The capture is over even on the failure path below, so an error here
+        // doesn't leave the stream stuck in capture/persistent state — and it
+        // is over for a caller that does not own the window too, since that is
+        // a window nobody is coming back to close. Only its owner gets a graph
+        // out of it, and the errors raised inside belong to that owner rather
+        // than to whoever happens to be flushing.
+        let outcome = match stream.capturing.end(stream_id) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                // A capture prepared but never opened still holds the stream,
+                // and a `graph_prepare` retry is refused while it does.
+                // Closing is the only call the caller has left — a warmup that
+                // failed never reaches `start_capture` — so a close from
+                // `Prepare` unwinds it, as `begin_capture` does when the
+                // warmup flush fails, instead of leaving it held forever.
+                if stream.capturing.is_active() {
+                    stream.info_cache.capture_discard();
+                    stream.capturing.abort();
+                }
+                return Err(err);
+            }
+        };
+        let recording = stream.take_recording();
+        // The memory the recorded launches write. A graph that seals answers
+        // for it on a failed replay; one that does not is answered for here,
+        // since those launches never ran and now never will.
+        let written = stream.capturing.take_recorded();
+        let touched = stream.capturing.take_touched();
+
+        // A failure raised during the window — a rejected write, a failed or
+        // skipped launch — means the recording is missing an operation:
+        // reject the capture rather than hand back a graph that silently
+        // skips work. The window is doomed from the moment one lands, so what
+        // is read here arose inside it and nowhere else.
+        let doomed = stream.capturing.take_failure().map(|reason| {
+            ServerError::graph_state(format!(
+                "an operation inside the capture window failed, so the recording is missing \
+                 an operation and cannot seal: {reason}"
+            ))
+        });
+        let discarded = match outcome.is_abandoned() {
+            true => Some(outcome.abandoned_error(stream_id, doomed)),
+            false => doomed,
+        };
+        if let Some(err) = discarded {
+            stream.info_cache.capture_discard();
+            // The recording is thrown away, so the launches in it never run:
+            // every buffer they were given is left as it was. The caller gets
+            // the error below; the taint is what makes a read of one of those
+            // buffers fail on some other stream, which heard nothing.
+            self.scheduler.taint(err.clone(), written.iter());
+            return Err(err);
+        }
+
+        let id = GraphId::new();
+        // Seal the info-cache entries this capture pinned under the graph's
+        // id, so `graph_destroy` can release them later.
+        stream.info_cache.capture_commit(id);
+        // Guard every page the recording touched, on whichever stream owns
+        // it, so nothing on them moves or is reused for the graph's lifetime.
+        let guards = touched
+            .iter()
+            .filter_map(|page| {
+                self.scheduler
+                    .stream(&page.stream)
+                    .memory
+                    .guard(page.location)
+            })
+            .collect();
+        self.graphs.insert(
+            id,
+            WgpuGraph {
+                tasks: recording.tasks,
+                _guards: guards,
+                _uniforms: recording.uniform_pins,
+                _shared: recording.shared,
+                written,
+            },
+        );
+        Ok(id)
+    }
+
+    fn replay(&mut self, graph: GraphId, stream_id: StreamId) -> Result<(), ServerError> {
+        // Order the replay after previously queued work on this stream.
+        self.scheduler.execute_streams(vec![stream_id]);
+
+        // A use-after-free in the caller's own code, with the caller standing
+        // right there, so it is returned. Nothing to taint either — the
+        // graph is gone, and with it the record of which buffers its launches
+        // would have written.
+        let Some(wgpu_graph) = self.graphs.get(&graph) else {
+            return Err(ServerError::graph_state(
+                "replay was given an unknown or already-destroyed graph",
+            ));
+        };
+
+        // A replay writes the buffers its recorded launches were given, so it
+        // takes the same scope over that write set and settles it: a failed
+        // enqueue leaves them carrying the failure, and the next replay that
+        // lands releases the claim. Without the settle one transient failure
+        // would leave the graph's buffers unreadable forever — the graph
+        // retains their handles, so none of the shedding paths can ever fire
+        // for them, and the graph itself is the only thing that writes them.
+        let recorded = wgpu_graph.written.clone();
+        let mut written = self.write_set();
+        written.extend(recorded);
+        ExecuteScope::over(self, stream_id, written)
+            .execute(|server| {
+                server
+                    .scheduler
+                    .stream(&stream_id)
+                    .reject_while_recording("replay")?;
+                let wgpu_graph = server
+                    .graphs
+                    .get(&graph)
+                    .expect("checked above; nothing in the scope removes graphs");
+                let stream = server.scheduler.stream(&stream_id);
+                stream.replay_graph(wgpu_graph);
+                Ok(())
+            })
+            .into_result()
+    }
+
+    fn graph_destroy(&mut self, graph: GraphId, stream_id: StreamId) {
+        // No-op for an unknown id (e.g. a double release). The graph is held
+        // until the end of this function, so its pins outlive the flush below.
+        let Some(wgpu_graph) = self.graphs.remove(&graph) else {
+            return;
+        };
+        let stream = self.scheduler.stream(&stream_id);
+        // Submit any replay still sitting in the encoder before the pins drop:
+        // a `queue.write_buffer` onto a reclaimed slice runs at the *next*
+        // submit, ahead of everything already in the encoder, so it would reach
+        // the GPU before the still-unsubmitted replay that reads it. The `Write`
+        // path flushes on its own account, so this covers the writes that do
+        // not — the uniform uploads in `create_uniform`/`info_uniform`. Once the
+        // replay is submitted, queue ordering makes releasing the slices safe
+        // with no host sync, unlike CUDA.
+        stream.submit();
+        // Release the info-cache entries this graph pinned; entries no other
+        // live graph still pins are dropped, freeing their buffers.
+        stream.info_cache.graph_release(graph);
+        drop(wgpu_graph);
     }
 }
 
@@ -517,4 +834,30 @@ pub(crate) fn contiguous_strides(shape: &Shape) -> Strides {
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     strides
+}
+
+impl<C: WgpuCompiler> ServerStorage for WgpuServer<C> {
+    type Storage = WgpuStorage;
+
+    fn get_resource(
+        &mut self,
+        binding: BufferBinding,
+        stream_id: StreamId,
+    ) -> Result<ManagedResource<WgpuResource>, ServerError> {
+        // The same claim check a read makes: a buffer a failed launch never
+        // filled reports the failure rather than handing back a pointer to
+        // whatever was there before.
+        self.scheduler.ensure_written([&binding].into_iter())?;
+        let mut streams = vec![stream_id];
+        if binding.stream != stream_id {
+            streams.push(binding.stream);
+        }
+        self.scheduler.execute_streams(streams);
+        let stream = self.scheduler.stream(&binding.stream);
+        Ok(stream.memory.managed_resource(
+            binding.memory,
+            binding.offset_start,
+            binding.offset_end,
+        )?)
+    }
 }

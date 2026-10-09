@@ -14,7 +14,6 @@ mod layout {
         self as cubecl,
         format::DebugRaw,
         hash::{StableHash, StableHasher},
-        prelude::*,
         zspace::{Shape, Strides, metadata::Metadata},
     };
 
@@ -29,7 +28,7 @@ mod layout {
         fn strides(&self) -> &[usize];
     }
 
-    impl<R: Runtime> MemoryArg for TensorArg<R> {
+    impl MemoryArg for TensorArg {
         fn len(&self) -> usize {
             self.size()
         }
@@ -42,7 +41,7 @@ mod layout {
             self.strides()
         }
     }
-    impl<R: Runtime> MemoryArg for BufferArg<R> {
+    impl MemoryArg for BufferArg {
         fn len(&self) -> usize {
             self.size()
         }
@@ -55,7 +54,7 @@ mod layout {
             &[1]
         }
     }
-    impl<R: Runtime, K: TensorMapKind> MemoryArg for TensorMapArg<R, K> {
+    impl<K: TensorMapKind> MemoryArg for TensorMapArg<K> {
         fn len(&self) -> usize {
             self.tensor.size()
         }
@@ -88,15 +87,15 @@ mod layout {
     /// this trait.
     pub trait ViewLayoutLaunchArg: CubeType + Send + Sync + 'static {
         /// The runtime argument for the kernel.
-        type RuntimeArg<R: Runtime>: Send + Sync;
+        type RuntimeArg: Send + Sync;
         /// Compilation argument.
         type CompilationArg: CompilationArg;
 
-        fn register<R: Runtime, B: MemoryArg>(
-            arg: Self::RuntimeArg<R>,
+        fn register<B: MemoryArg>(
+            arg: Self::RuntimeArg,
             buffer: &B,
             ty: Type,
-            launcher: &mut KernelLauncher<R>,
+            launcher: &mut KernelLauncher,
         ) -> Self::CompilationArg;
 
         /// Register an input variable during compilation that fill the [`KernelBuilder`].
@@ -117,14 +116,14 @@ mod layout {
     }
 
     impl<T: LaunchArg + Send + Sync> ViewLayoutLaunchArg for T {
-        type RuntimeArg<R: Runtime> = <T as LaunchArg>::RuntimeArg<R>;
+        type RuntimeArg = <T as LaunchArg>::RuntimeArg;
         type CompilationArg = <T as LaunchArg>::CompilationArg;
 
-        fn register<R: Runtime, B: MemoryArg>(
-            arg: Self::RuntimeArg<R>,
+        fn register<B: MemoryArg>(
+            arg: Self::RuntimeArg,
             _buffer: &B,
             _ty: Type,
-            launcher: &mut KernelLauncher<R>,
+            launcher: &mut KernelLauncher,
         ) -> Self::CompilationArg {
             <T as LaunchArg>::register(arg, launcher)
         }
@@ -138,24 +137,22 @@ mod layout {
         }
     }
 
-    pub struct VirtualViewLayoutLaunch<C: Coordinates, S: Coordinates, B: MemoryArg, R: Runtime> {
-        _ty: core::marker::PhantomData<R>,
+    pub struct VirtualViewLayoutLaunch<C: Coordinates, S: Coordinates, B: MemoryArg> {
         #[allow(clippy::type_complexity)]
         register: Box<
-            dyn FnOnce(&B, Type, &mut KernelLauncher<R>) -> VirtualViewLayoutCompilationArg<C, S>
+            dyn FnOnce(&B, Type, &mut KernelLauncher) -> VirtualViewLayoutCompilationArg<C, S>
                 + Send
                 + Sync,
         >,
     }
 
-    impl<C: Coordinates, S: Coordinates, B: MemoryArg, R: Runtime> VirtualViewLayoutLaunch<C, S, B, R> {
+    impl<C: Coordinates, S: Coordinates, B: MemoryArg> VirtualViewLayoutLaunch<C, S, B> {
         pub fn new<L: Layout<Coordinates = C, SourceCoordinates = S> + ViewLayoutLaunchArg>(
-            layout: L::RuntimeArg<R>,
+            layout: L::RuntimeArg,
         ) -> Self {
             Self {
-                _ty: PhantomData,
                 register: Box::new(move |buffer, ty, launcher| {
-                    let comp_arg = L::register::<R, B>(layout, buffer, ty, launcher);
+                    let comp_arg = L::register::<B>(layout, buffer, ty, launcher);
                     let comp_arg_2 = comp_arg.clone();
                     let expand = Rc::new(RefCell::new(
                         move |ty: Type, builder: &mut KernelBuilder, is_out: bool| {
@@ -175,7 +172,7 @@ mod layout {
             self,
             buffer: &B,
             ty: Type,
-            launcher: &mut KernelLauncher<R>,
+            launcher: &mut KernelLauncher,
         ) -> VirtualViewLayoutCompilationArg<C, S> {
             (self.register)(buffer, ty, launcher)
         }
@@ -290,23 +287,22 @@ mod layout {
         }
     }
 
-    pub struct ConcreteLayoutLaunch<L: Layout + ViewLayoutLaunchArg, R: Runtime> {
+    pub struct ConcreteLayoutLaunch<L: Layout + ViewLayoutLaunchArg> {
         meta: Metadata,
         ty: Type,
-        value: L::RuntimeArg<R>,
+        value: L::RuntimeArg,
     }
 
-    impl<L: Layout + ViewLayoutLaunchArg, R: Runtime> ConcreteLayoutLaunch<L, R> {
-        pub fn new(meta: Metadata, ty: Type, value: L::RuntimeArg<R>) -> Self {
+    impl<L: Layout + ViewLayoutLaunchArg> ConcreteLayoutLaunch<L> {
+        pub fn new(meta: Metadata, ty: Type, value: L::RuntimeArg) -> Self {
             Self { meta, ty, value }
         }
 
-        pub fn from_handle(handle: &TensorBinding<R>, ty: Type, value: L::RuntimeArg<R>) -> Self {
+        pub fn from_handle(handle: &TensorBinding, ty: Type, value: L::RuntimeArg) -> Self {
             Self {
-                meta: Metadata {
-                    shape: handle.shape.clone(),
-                    strides: handle.strides.clone(),
-                },
+                meta: Metadata::new(handle.shape.clone(), handle.strides.clone())
+                    .with_tiling(handle.tiling)
+                    .expect("a binding's tiling describes its own rank"),
                 ty,
                 value,
             }
@@ -316,10 +312,10 @@ mod layout {
             shape: Shape,
             strides: Strides,
             ty: Type,
-            value: L::RuntimeArg<R>,
+            value: L::RuntimeArg,
         ) -> Self {
             Self {
-                meta: Metadata { shape, strides },
+                meta: Metadata::new(shape, strides),
                 ty,
                 value,
             }
@@ -364,13 +360,10 @@ mod layout {
     }
 
     impl<L: Layout + ViewLayoutLaunchArg> LaunchArg for ConcreteLayout<L> {
-        type RuntimeArg<R: Runtime> = ConcreteLayoutLaunch<L, R>;
+        type RuntimeArg = ConcreteLayoutLaunch<L>;
         type CompilationArg = ConcreteLayoutCompilationArg<L>;
 
-        fn register<R: Runtime>(
-            arg: Self::RuntimeArg<R>,
-            launcher: &mut KernelLauncher<R>,
-        ) -> Self::CompilationArg {
+        fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
             ConcreteLayoutCompilationArg {
                 value: L::register(arg.value, &arg.meta, arg.ty, launcher),
                 ty: arg.ty,
@@ -408,36 +401,130 @@ mod dynamic {
     use super::*;
 
     #[allow(clippy::type_complexity)]
-    pub enum ViewArg<C: Coordinates, R: Runtime> {
-        Array(
-            BufferArg<R>,
-            VirtualViewLayoutLaunch<C, Coords1d, BufferArg<R>, R>,
-        ),
-        Tensor(
-            TensorArg<R>,
-            VirtualViewLayoutLaunch<C, Coords1d, TensorArg<R>, R>,
-        ),
+    pub enum ViewArg<C: Coordinates> {
+        Array(BufferArg, VirtualViewLayoutLaunch<C, Coords1d, BufferArg>),
+        Tensor(TensorArg, VirtualViewLayoutLaunch<C, Coords1d, TensorArg>),
         TensorMapTiled(
-            TensorMapArg<R, Tiled>,
-            VirtualViewLayoutLaunch<C, Sequence<i32>, TensorMapArg<R, Tiled>, R>,
+            TensorMapArg<Tiled>,
+            VirtualViewLayoutLaunch<C, Sequence<i32>, TensorMapArg<Tiled>>,
         ),
         TensorMapIm2col(
-            TensorMapArg<R, Im2col>,
-            VirtualViewLayoutLaunch<C, (Sequence<i32>, Sequence<i32>), TensorMapArg<R, Im2col>, R>,
+            TensorMapArg<Im2col>,
+            VirtualViewLayoutLaunch<C, (Sequence<i32>, Sequence<i32>), TensorMapArg<Im2col>>,
         ),
         Quantized {
-            values: Box<ViewArg<C, R>>,
-            scales: Box<ViewArg<C, R>>,
+            values: Box<ViewArg<C>>,
+            scales: ScaleBindings<C>,
             scheme: QuantScheme,
         },
     }
 
-    impl<C: Coordinates, R: Runtime> ViewArg<C, R> {
+    /// The scale bindings of a quantized view, one per scheme level.
+    ///
+    /// Only the block scales are addressed per position, so they bind as a view; the per-tensor
+    /// scale of a two-level scheme covers the whole tensor and binds as a buffer holding its one
+    /// scale in the first element, read once per kernel as f32.
+    pub struct ScaleBindings<C: Coordinates> {
+        pub(crate) inner: Box<ViewArg<C>>,
+        pub(crate) global_scale: Option<BufferArg>,
+        /// A lookup scheme's `2^bits`-entry table, present exactly under
+        /// [`QuantMode::Lookup`](cubecl_common::quant::scheme::QuantMode). Not a scale level —
+        /// [`len`](Self::len) never counts it — but it rides here because it is the same kind of
+        /// thing: a side binding the dequantizing read folds in.
+        pub(crate) table: Option<BufferArg>,
+    }
+
+    impl<C: Coordinates> ScaleBindings<C> {
+        /// The binding of a one-level scheme's scales.
+        pub fn one(scales: ViewArg<C>) -> Self {
+            Self {
+                inner: Box::new(scales),
+                global_scale: None,
+                table: None,
+            }
+        }
+
+        /// The bindings of a two-level scheme: the block scales and the per-tensor scale they are
+        /// normalized against.
+        pub fn two(scales: ViewArg<C>, global_scale: BufferArg) -> Self {
+            Self {
+                inner: Box::new(scales),
+                global_scale: Some(global_scale),
+                table: None,
+            }
+        }
+
+        /// The bindings of a one-level lookup scheme
+        /// ([`QuantMode::Lookup`](cubecl_common::quant::scheme::QuantMode)): the scales and the
+        /// table each stored field indexes, so a read reconstructs `table[field] * scale`.
+        ///
+        /// `table` must hold `2^bits` f32 entries — registration checks its length against the
+        /// scheme, and the unpack's mask bounds every index to that range.
+        pub fn lookup(scales: ViewArg<C>, table: BufferArg) -> Self {
+            Self {
+                inner: Box::new(scales),
+                global_scale: None,
+                table: Some(table),
+            }
+        }
+
+        /// The number of bound scale levels, matched against the scheme's at construction: the
+        /// inner binding plus the global scale when bound. The lookup table is not a level and is
+        /// never counted; its presence is checked against the scheme's mode instead
+        /// ([`quant::check_table_bindings`]).
+        #[allow(clippy::len_without_is_empty, reason = "never empty by construction")]
+        pub fn len(&self) -> usize {
+            1 + self.global_scale.iter().count()
+        }
+    }
+
+    /// [`ScaleBindings`] between registration and expansion.
+    #[derive(Clone)]
+    pub struct ScaleBindingsCompilationArg<C: Coordinates> {
+        pub(crate) inner: Box<ViewCompilationArg<C>>,
+        pub(crate) global_scale: Option<BufferCompilationArg>,
+        pub(crate) table: Option<BufferCompilationArg>,
+    }
+
+    impl<C: Coordinates> ScaleBindingsCompilationArg<C> {
+        /// See [`ScaleBindings::len`].
+        #[allow(clippy::len_without_is_empty, reason = "never empty by construction")]
+        pub fn len(&self) -> usize {
+            1 + self.global_scale.iter().count()
+        }
+    }
+
+    impl<C: Coordinates> Eq for ScaleBindingsCompilationArg<C> {}
+    impl<C: Coordinates> PartialEq for ScaleBindingsCompilationArg<C> {
+        fn eq(&self, other: &Self) -> bool {
+            self.inner == other.inner
+                && self.global_scale == other.global_scale
+                && self.table == other.table
+        }
+    }
+    impl<C: Coordinates> core::hash::Hash for ScaleBindingsCompilationArg<C> {
+        fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+            self.inner.hash(state);
+            self.global_scale.hash(state);
+            self.table.hash(state);
+        }
+    }
+    impl<C: Coordinates> core::fmt::Debug for ScaleBindingsCompilationArg<C> {
+        fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+            f.debug_struct("ScaleBindings")
+                .field("inner", &self.inner)
+                .field("global_scale", &self.global_scale)
+                .field("table", &self.table)
+                .finish()
+        }
+    }
+
+    impl<C: Coordinates> ViewArg<C> {
         pub fn new_array<
             L: Layout<Coordinates = C, SourceCoordinates = Coords1d> + ViewLayoutLaunchArg,
         >(
-            buffer: BufferArg<R>,
-            layout: L::RuntimeArg<R>,
+            buffer: BufferArg,
+            layout: L::RuntimeArg,
         ) -> Self {
             let layout = VirtualViewLayoutLaunch::new::<L>(layout);
             ViewArg::Array(buffer, layout)
@@ -446,8 +533,8 @@ mod dynamic {
         pub fn new_tensor<
             L: Layout<Coordinates = C, SourceCoordinates = Coords1d> + ViewLayoutLaunchArg,
         >(
-            buffer: TensorArg<R>,
-            layout: L::RuntimeArg<R>,
+            buffer: TensorArg,
+            layout: L::RuntimeArg,
         ) -> Self {
             let layout = VirtualViewLayoutLaunch::new::<L>(layout);
             ViewArg::Tensor(buffer, layout)
@@ -456,9 +543,9 @@ mod dynamic {
         pub fn new_tensor_map_tiled<
             L: Layout<Coordinates = C, SourceCoordinates: IntoDyn> + ViewLayoutLaunchArg,
         >(
-            buffer: TensorMapArg<R, Tiled>,
-            layout: L::RuntimeArg<R>,
-        ) -> ViewArg<C, R> {
+            buffer: TensorMapArg<Tiled>,
+            layout: L::RuntimeArg,
+        ) -> ViewArg<C> {
             let layout = VirtualViewLayoutLaunch::new::<IntoDynLayout<L>>(layout);
             ViewArg::TensorMapTiled(buffer, layout)
         }
@@ -468,19 +555,26 @@ mod dynamic {
             P: IntoDyn,
             O: IntoDyn,
         >(
-            buffer: TensorMapArg<R, Im2col>,
-            layout: L::RuntimeArg<R>,
-        ) -> ViewArg<C, R> {
+            buffer: TensorMapArg<Im2col>,
+            layout: L::RuntimeArg,
+        ) -> ViewArg<C> {
             let layout = VirtualViewLayoutLaunch::new::<IntoDyn2Layout<L, P, O>>(layout);
             ViewArg::TensorMapIm2col(buffer, layout)
         }
 
-        /// Create a new view arg that dequantizes on read.
-        /// The scales layout should take values indices and map them to the corresponding scale.
-        pub fn new_quantized(values: Self, scales: Self, scheme: QuantScheme) -> Self {
+        /// Create a new view arg that dequantizes on read, against one scale binding per scheme
+        /// level. The inner scales layout should take values indices and map them to the
+        /// corresponding scale.
+        ///
+        /// Panics when the bindings and the scheme's levels disagree in count, since a missing
+        /// level would be dropped from the reconstruction, and for an global level this reader
+        /// cannot serve. See [`quant::check_scale_bindings`].
+        pub fn new_quantized(values: Self, scales: ScaleBindings<C>, scheme: QuantScheme) -> Self {
+            quant::check_scale_bindings(&scheme, scales.len());
+            quant::check_table_bindings(&scheme, scales.table.is_some());
             Self::Quantized {
                 values: Box::new(values),
-                scales: Box::new(scales),
+                scales,
                 scheme,
             }
         }
@@ -501,7 +595,7 @@ mod dynamic {
         },
         Quantized {
             values: Box<ViewCompilationArg<C>>,
-            scales: Box<ViewCompilationArg<C>>,
+            scales: ScaleBindingsCompilationArg<C>,
             scheme: QuantScheme,
         },
     }
@@ -607,14 +701,15 @@ mod dynamic {
     }
 
     impl<E: CubePrimitive, C: Coordinates + 'static> LaunchArg for View<'static, E, C> {
-        type RuntimeArg<R: Runtime> = ViewArg<C, R>;
+        type RuntimeArg = ViewArg<C>;
         type CompilationArg = ViewCompilationArg<C>;
 
-        fn register<R: Runtime>(
-            arg: Self::RuntimeArg<R>,
-            launcher: &mut KernelLauncher<R>,
-        ) -> Self::CompilationArg {
-            let ty = launcher.with_scope(|scope| E::__expand_as_type(scope));
+        fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
+            let ty = launcher.with_scope(|scope| {
+                let storage = E::Scalar::elem_type(scope);
+                let vector_size = E::__expand_vector_size(scope);
+                Type::new(storage).with_vector_size(vector_size)
+            });
             match arg {
                 ViewArg::Array(buffer, layout) => ViewCompilationArg::Array {
                     layout: layout.register(&buffer, ty, launcher),
@@ -639,7 +734,7 @@ mod dynamic {
                 } => {
                     let register = RegisterDynamic {
                         values: *values,
-                        scales: *scales,
+                        scales,
                         scheme,
                         launcher,
                         _ty: PhantomData::<E>,
@@ -652,7 +747,9 @@ mod dynamic {
             arg: &Self::CompilationArg,
             builder: &mut KernelBuilder,
         ) -> <Self as CubeType>::ExpandType {
-            let ty = E::__expand_as_type(&builder.scope);
+            let storage = E::Scalar::elem_type(builder);
+            let vector_size = E::__expand_vector_size(builder);
+            let ty = Type::new(storage).with_vector_size(vector_size);
             match arg {
                 ViewCompilationArg::Array { buffer, layout } => {
                     let layout = layout.expand(ty, builder);
@@ -691,13 +788,10 @@ mod dynamic {
     }
 
     impl<E: CubePrimitive, C: Coordinates + 'static> LaunchArg for ViewMut<'static, E, C> {
-        type RuntimeArg<R: Runtime> = ViewArg<C, R>;
+        type RuntimeArg = ViewArg<C>;
         type CompilationArg = ViewCompilationArg<C>;
 
-        fn register<R: Runtime>(
-            arg: Self::RuntimeArg<R>,
-            launcher: &mut KernelLauncher<R>,
-        ) -> Self::CompilationArg {
+        fn register(arg: Self::RuntimeArg, launcher: &mut KernelLauncher) -> Self::CompilationArg {
             <View<'static, E, C> as LaunchArg>::register(arg, launcher)
         }
 
@@ -705,7 +799,9 @@ mod dynamic {
             arg: &Self::CompilationArg,
             builder: &mut KernelBuilder,
         ) -> <Self as CubeType>::ExpandType {
-            let ty = E::__expand_as_type(&builder.scope);
+            let storage = E::Scalar::elem_type(builder);
+            let vector_size = E::__expand_vector_size(builder);
+            let ty = Type::new(storage).with_vector_size(vector_size);
             match arg {
                 ViewCompilationArg::Array { buffer, layout } => {
                     let layout = layout.expand(ty, builder);

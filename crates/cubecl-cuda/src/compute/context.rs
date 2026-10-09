@@ -1,99 +1,65 @@
-use cubecl_cpp::formatter::format_cpp;
-use cubecl_cpp::{cuda::arch::CudaArchitecture, shared::CompilationOptions};
+use crate::compiler::{CudaBackend, CudaCompilationOptions};
+use crate::compute::artifact::CudaArtifactCompiler;
+use crate::compute::events::{EventProfiler, driver_error, poisons_device};
+use crate::compute::modules::{CudaCompiledKernel, CudaModules};
+use crate::compute::stream::Stream;
+use cubecl_core::{ir::DeviceProperties, prelude::*};
+use cubecl_cpp::cuda::arch::CudaArchitecture;
 use cubecl_environment::backtrace::BackTrace;
-use cubecl_runtime::{
-    compiler::CompilationError,
-    validation::{validate_cube_dim, validate_units},
-};
-
-use super::storage::gpu::GpuResource;
-use crate::{CudaCompiler, compute::stream::Stream};
-use crate::{
-    CudaComputeKernel,
-    install::{cccl_include_path, include_path},
-};
-use cubecl_core::{
-    server::ResourceLimitError,
-    {ir::DeviceProperties, prelude::*},
-};
-use cubecl_environment::persistence::Store;
-use cubecl_runtime::timestamp_profiler::TimestampProfiler;
-use cubecl_runtime::{
-    compiler::{CubeTask, KernelCacheKey},
-    logging::ServerLogger,
-};
+use cubecl_server::compiler::{ArtifactId, KernelLoader};
+use cubecl_server::kernel::CubeKernel;
+use cubecl_server::logging::ServerLogger;
 use cudarc::driver::DriverError;
-use cudarc::driver::sys::CUfunc_st;
-use cudarc::driver::sys::{CUctx_st, CUfunction_attribute, CUtensorMap};
-use std::ffi::CString;
-use std::ffi::c_char;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::{ffi::CStr, os::raw::c_void};
-
-use cubecl_runtime::compiler::{CompilationCache, compilation_store, store_compiled};
+use cudarc::driver::sys::{CUctx_st, CUfunction_attribute, CUstream};
+use std::os::raw::c_void;
 
 #[derive(Debug)]
 pub(crate) struct CudaContext {
     pub context: *mut CUctx_st,
-    /// The modules loaded on the device, in front of [`Self::ptx_cache`].
-    ///
-    /// An environment switch drops these, and nothing unloads the modules they
-    /// name: see [`CudaContext::is_loaded`].
-    modules: CompilationCache<KernelId, CompiledKernel>,
-    ptx_cache: Option<Store<KernelCacheKey, PtxCacheEntry>>,
-    pub timestamps: TimestampProfiler,
-    pub arch: CudaArchitecture,
-    pub compilation_options: CompilationOptions,
-    pub properties: DeviceProperties,
-}
-
-#[derive(Debug)]
-pub struct CompiledKernel {
-    cube_dim: CubeDim,
-    shared_mem_bytes: usize,
-    func: *mut CUfunc_st,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq, Clone)]
-pub struct PtxCacheEntry {
-    entrypoint_name: String,
-    shared_mem_bytes: usize,
-    ptx: Vec<std::ffi::c_char>,
+    /// The stream collectives run on. Kept on the context so a relocation —
+    /// which reaches the context, not the server — can wait on it.
+    pub comm_stream: CUstream,
+    /// The modules loaded on the device, and how to load another.
+    kernels: KernelLoader<CudaModules>,
+    /// The options kernels are compiled with.
+    compilation_options: CudaCompilationOptions,
+    pub profiler: EventProfiler,
 }
 
 impl CudaContext {
+    /// `backend` is which one compiles here; see [`CudaModules::new`].
+    ///
+    /// An environment switch drops every loaded kernel, so the new
+    /// environment's PTX store is filled rather than bypassed. The modules
+    /// those kernels named stay resident: nothing calls `cuModuleUnload`, here
+    /// or anywhere else in this context, and unloading one a stream still has
+    /// queued work against would be unsound. A process that switches
+    /// environments a handful of times at startup pays a bounded price; one
+    /// that switches repeatedly grows its resident modules without bound — see
+    /// [`cubecl_environment::environment::activate`].
     pub fn new(
-        compilation_options: CompilationOptions,
+        compilation_options: CudaCompilationOptions,
         properties: DeviceProperties,
         context: *mut CUctx_st,
         arch: CudaArchitecture,
+        backend: CudaBackend,
+        comm_stream: CUstream,
     ) -> Self {
-        let ptx_cache = compilation_store("cuda", format!("ptx_sm{}", arch.version));
+        let compiler = CudaArtifactCompiler::new(properties, compilation_options.clone(), arch);
 
         Self {
             context,
-            modules: CompilationCache::mirroring(&ptx_cache),
-            ptx_cache,
-            arch,
-            timestamps: TimestampProfiler::default(),
+            comm_stream,
+            kernels: KernelLoader::new(CudaModules::new(compiler, backend)),
             compilation_options,
-            properties,
+            profiler: EventProfiler::default(),
         }
     }
 
-    /// Whether `kernel_id` is already loaded on the device.
-    ///
-    /// An environment switch drops the whole cache, so the new environment's
-    /// PTX store is filled rather than bypassed. The modules those entries
-    /// named stay resident: nothing calls `cuModuleUnload`, here or anywhere
-    /// else in this context, and unloading one a stream still has queued work
-    /// against would be unsound. A process that switches environments a handful
-    /// of times at startup pays a bounded price; one that switches repeatedly
-    /// grows its resident modules without bound — see
-    /// [`cubecl_environment::environment::activate`].
-    pub fn is_loaded(&mut self, kernel_id: &KernelId) -> bool {
-        self.modules.contains(kernel_id)
+    /// The options kernels are compiled with, which the launch path reads
+    /// to pass arguments the way the compiled code expects them.
+    pub fn compilation_options(&self) -> &CudaCompilationOptions {
+        &self.compilation_options
     }
 
     /// Switches the current CUDA context to this context.
@@ -103,196 +69,35 @@ impl CudaContext {
         unsafe { cudarc::driver::result::ctx::set_current(self.context) }
     }
 
-    pub fn compile_kernel(
+    /// Loads `kernel`, whose id is `id`, on the device, compiling it first
+    /// when no store holds it. A kernel already loaded costs a map lookup.
+    pub fn load_kernel(
         &mut self,
-        kernel_id: &KernelId,
-        kernel: Box<dyn CubeTask<CudaCompiler>>,
-        mode: ExecutionMode,
-        logger: Arc<ServerLogger>,
-    ) -> Result<(), LaunchError> {
-        let definition = kernel.define();
-
-        let key = if let Some(cache) = self.ptx_cache.as_mut() {
-            let key = KernelCacheKey::new(kernel_id, &definition);
-
-            if let Some(entry) = cache.remove(&key) {
-                log::trace!("Using PTX cache");
-
-                self.load_ptx(
-                    entry.ptx,
-                    kernel_id.clone(),
-                    entry.entrypoint_name,
-                    kernel_id.cube_dim,
-                    entry.shared_mem_bytes,
-                )?;
-                return Ok(());
-            }
-            Some(key)
-        } else {
-            None
-        };
-
-        log::trace!("Compiling kernel");
-
-        validate_cube_dim(&self.properties, kernel_id)?;
-        validate_units(&self.properties, kernel_id)?;
-
-        let mut kernel_compiled = kernel.compile(
-            definition,
-            &mut Default::default(),
-            &self.compilation_options,
-            mode,
-            kernel.address_type(),
-        )?;
-
-        self.validate_shared(&kernel_compiled.repr)?;
-
-        if logger.compilation_source_activated() {
-            kernel_compiled.debug_info = Some(DebugInformation::new("cpp", kernel_id.clone()));
-
-            if let Ok(formatted) = format_cpp(&kernel_compiled.source) {
-                kernel_compiled.source = formatted;
-            }
-        }
-
-        let cube_dim = kernel_compiled.cube_dim;
-        let arch = if self.arch.version >= 90 {
-            format!("--gpu-architecture=sm_{}a", self.arch)
-        } else {
-            format!("--gpu-architecture=sm_{}", self.arch)
-        };
-
-        let include_path = include_path();
-        let include_option = format!("--include-path={}", include_path.to_str().unwrap());
-        let cccl_include_path = cccl_include_path();
-        let cccl_include_option = format!("--include-path={}", cccl_include_path.to_str().unwrap());
-        let mut options = vec![arch.as_str(), include_option.as_str(), "-lineinfo"];
-        if cccl_include_path.exists() {
-            options.push(&cccl_include_option);
-        }
-
-        logger.log_compilation(&kernel_compiled);
-
-        // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
-        // The `CString` source is null-terminated and outlives the program. On compilation
-        // failure, the error log is retrieved and reported before returning.
-        let ptx = unsafe {
-            // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
-            // leave it `None` for now
-            let source = CString::from_str(&kernel_compiled.source).unwrap();
-            let program =
-                cudarc::nvrtc::result::create_program(source.as_c_str(), None).map_err(|err| {
-                    CompilationError::Generic {
-                        reason: format!("{err}"),
-                        backtrace: BackTrace::capture(),
-                    }
-                })?;
-            if cudarc::nvrtc::result::compile_program(program, &options).is_err() {
-                let log_raw = cudarc::nvrtc::result::get_program_log(program).map_err(|err| {
-                    CompilationError::Generic {
-                        reason: format!("{err}"),
-                        backtrace: BackTrace::capture(),
-                    }
-                })?;
-
-                let log_ptr = log_raw.as_ptr();
-                let log = CStr::from_ptr(log_ptr).to_str().unwrap();
-                let mut message = "[Compilation Error] ".to_string();
-                for line in log.split('\n') {
-                    if !line.is_empty() {
-                        message += format!("\n    {line}").as_str();
-                    }
-                }
-                Err(CompilationError::Generic {
-                    reason: format!("{message}\n[Source]  \n{}", kernel_compiled.source),
-                    backtrace: BackTrace::capture(),
-                })?;
-            };
-            cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })?
-        };
-
-        let repr = kernel_compiled.repr.unwrap();
-
-        if let Some(cache) = &mut self.ptx_cache {
-            store_compiled(
-                cache,
-                key.unwrap(),
-                PtxCacheEntry {
-                    entrypoint_name: kernel_compiled.entrypoint_name.clone(),
-                    shared_mem_bytes: repr.shared_memory_size(),
-                    ptx: ptx.clone(),
-                },
-            );
-        }
-
-        self.load_ptx(
-            ptx,
-            kernel_id.clone(),
-            kernel_compiled.entrypoint_name,
-            cube_dim,
-            repr.shared_memory_size(),
-        )?;
-        Ok(())
+        kernel: &dyn CubeKernel,
+        id: &ArtifactId<()>,
+        logger: &ServerLogger,
+    ) -> Result<CudaCompiledKernel, LaunchError> {
+        self.kernels.load(kernel, id, logger)
     }
 
-    fn load_ptx(
-        &mut self,
-        ptx: Vec<c_char>,
-        kernel_id: KernelId,
-        entrypoint_name: String,
-        cube_dim: CubeDim,
-        shared_mem_bytes: usize,
-    ) -> Result<(), CompilationError> {
-        let func_name = CString::new(entrypoint_name).unwrap();
-        // SAFETY: `ptx` is a valid null-terminated PTX binary from NVRTC. `func_name` is a
-        // null-terminated `CString` matching the kernel entry point in the compiled module.
-        let func = unsafe {
-            let module = cudarc::driver::result::module::load_data(ptx.as_ptr() as *const _)
-                .map_err(|err| CompilationError::Generic {
-                    reason: format!("Unable to load the PTX: {err}"),
-                    backtrace: BackTrace::capture(),
-                })?;
+    /// Compiles every queued kernel now, rather than inside the next launch.
+    pub fn compile_queued(&mut self, logger: &ServerLogger) {
+        self.kernels.compile_queued(logger);
+    }
 
-            cudarc::driver::result::module::get_function(module, func_name).map_err(|err| {
-                CompilationError::Generic {
-                    reason: format!("Unable to fetch the function from the module: {err:?}"),
-                    backtrace: BackTrace::capture(),
-                }
-            })?
-        };
-
-        self.modules.insert(
-            kernel_id.clone(),
-            CompiledKernel {
-                cube_dim,
-                shared_mem_bytes,
-                func,
-            },
-        );
-
-        Ok(())
+    /// Queues `kernel` to be compiled with others, by the next kernel
+    /// loaded for a launch.
+    pub fn queue_kernel(&mut self, kernel: Box<dyn CubeKernel>) {
+        self.kernels.enqueue(kernel, ());
     }
 
     pub fn execute_task(
         &mut self,
         stream: &mut Stream,
-        kernel_id: KernelId,
+        kernel: &CudaCompiledKernel,
         dispatch_count: (u32, u32, u32),
-        tensor_maps: &[CUtensorMap],
-        resources: &[GpuResource],
-        const_info: Option<*mut c_void>,
+        resources: &mut [*mut c_void],
     ) -> Result<(), LaunchError> {
-        let mut bindings = tensor_maps
-            .iter()
-            .map(|map| map as *const _ as *mut c_void)
-            .collect::<Vec<_>>();
-        bindings.extend(resources.iter().map(|memory| memory.binding));
-        bindings.extend(const_info);
-
-        let kernel = self.modules.get(&kernel_id).unwrap();
         let cube_dim = kernel.cube_dim;
         // SAFETY: `kernel.func` is a valid function handle from a loaded module.
         // `stream.sys` is a valid CUDA stream. `bindings` contains valid device pointers
@@ -304,10 +109,7 @@ impl CudaContext {
                 CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                 kernel.shared_mem_bytes as i32,
             )
-            .map_err(|err| LaunchError::Unknown {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })?;
+            .map_err(|err| launch_failed("cuFuncSetAttribute", err))?;
             cudarc::driver::result::launch_kernel(
                 kernel.func,
                 dispatch_count,
@@ -316,31 +118,23 @@ impl CudaContext {
                 // an offset pointer
                 kernel.shared_mem_bytes as u32,
                 stream.sys,
-                &mut bindings,
+                resources,
             )
-            .map_err(|err| LaunchError::Unknown {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })?;
+            .map_err(|err| launch_failed("cuLaunchKernel", err))?;
         };
 
         Ok(())
     }
+}
 
-    fn validate_shared(&self, repr: &Option<CudaComputeKernel>) -> Result<(), LaunchError> {
-        let requested = repr.as_ref().map(|repr| repr.shared_memory_size());
-        let max = self.properties.hardware.max_shared_memory_size;
-        if let Some(requested) = requested
-            && requested > max
-        {
-            Err(ResourceLimitError::SharedMemory {
-                requested,
-                max,
-                backtrace: BackTrace::capture(),
-            }
-            .into())
-        } else {
-            Ok(())
-        }
+/// A refused launch error : maps to a poisoned-device error if that call happened right after
+/// a fault.
+fn launch_failed(op: &'static str, err: cudarc::driver::DriverError) -> LaunchError {
+    match poisons_device(err.0) {
+        true => driver_error(op, err).into(),
+        false => LaunchError::Unknown {
+            reason: format!("{err}"),
+            backtrace: BackTrace::capture(),
+        },
     }
 }

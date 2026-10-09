@@ -1,8 +1,7 @@
-use core::marker::PhantomData;
-use cubecl_core::{Runtime, server, zspace::strides};
+use cubecl_core::zspace::metadata::Metadata;
 use cubecl_core::{calculate_cube_count_elemwise, server::MemoryLayout};
-use cubecl_core::{ir::StorageType, zspace::metadata::Metadata};
 use cubecl_core::{prelude::*, server::CopyDescriptor};
+use cubecl_core::{server, zspace::strides};
 use cubecl_core::{
     tensor_vector_size_parallel,
     zspace::{Shape, Strides},
@@ -10,22 +9,15 @@ use cubecl_core::{
 use cubecl_runtime::server::Handle;
 
 /// Tensor representation containing a [server handle](Handle) as well as basic tensor metadata.,
-pub struct TensorHandle<R>
-where
-    R: Runtime,
-{
+pub struct TensorHandle {
     /// The buffer where the data are stored.
     pub handle: server::Handle,
     pub metadata: Box<Metadata>,
     /// The type used as storage.
-    pub dtype: StorageType,
-    runtime: PhantomData<R>,
+    pub dtype: ElemType,
 }
 
-impl<R> core::fmt::Debug for TensorHandle<R>
-where
-    R: Runtime,
-{
+impl core::fmt::Debug for TensorHandle {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_fmt(format_args!(
             "Tensor {{ shape: {:?}, strides: {:?}, dtype: {}}}",
@@ -36,24 +28,17 @@ where
     }
 }
 
-impl<R> Clone for TensorHandle<R>
-where
-    R: Runtime,
-{
+impl Clone for TensorHandle {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
             metadata: self.metadata.clone(),
             dtype: self.dtype,
-            runtime: PhantomData,
         }
     }
 }
 
-impl<R> TensorHandle<R>
-where
-    R: Runtime,
-{
+impl TensorHandle {
     /// Create a new tensor.
     pub fn new(
         handle: server::Handle,
@@ -64,19 +49,29 @@ where
         Self {
             handle,
             metadata: Box::new(Metadata::new(shape, strides)),
-            dtype: storage.into().storage_type(),
-            runtime: PhantomData,
+            dtype: storage.into().elem_type(),
         }
     }
 
-    pub fn empty(
-        client: &ComputeClient<R>,
-        shape: impl Into<Shape>,
+    /// A tensor over `metadata` as it is, tiling included: the constructor for a handle rebuilt
+    /// from another's metadata, where [`new`](Self::new) would rebuild an untiled one from the
+    /// shape and strides alone.
+    pub fn from_metadata(
+        handle: server::Handle,
+        metadata: Metadata,
         storage: impl Into<Type>,
     ) -> Self {
+        Self {
+            handle,
+            metadata: Box::new(metadata),
+            dtype: storage.into().elem_type(),
+        }
+    }
+
+    pub fn empty(client: &Client, shape: impl Into<Shape>, storage: impl Into<Type>) -> Self {
         let storage = storage.into();
         let shape: Shape = shape.into();
-        let elem_size = storage.storage_type().size();
+        let elem_size = storage.elem_type().size();
         let MemoryLayout {
             memory: handle,
             strides,
@@ -86,7 +81,7 @@ where
     }
 
     /// Create a new tensor with a contiguous memory layout.
-    pub fn new_contiguous(shape: impl Into<Shape>, handle: Handle, storage: StorageType) -> Self {
+    pub fn new_contiguous(shape: impl Into<Shape>, handle: Handle, storage: ElemType) -> Self {
         let shape = shape.into();
         let strides = Self::contiguous_strides(&shape);
 
@@ -94,7 +89,6 @@ where
             handle,
             metadata: Box::new(Metadata::new(shape, strides)),
             dtype: storage,
-            runtime: PhantomData,
         }
     }
 
@@ -103,14 +97,21 @@ where
         self.handle.can_mut()
     }
 
-    pub fn binding(self) -> TensorBinding<R> {
-        unsafe {
-            TensorBinding::from_raw_parts(self.handle, self.metadata.strides, self.metadata.shape)
-        }
+    pub fn binding(self) -> TensorBinding {
+        let Metadata {
+            shape,
+            strides,
+            tiling,
+        } = *self.metadata;
+        let mut binding = unsafe { TensorBinding::from_raw_parts(self.handle, strides, shape) };
+        // The metadata validated this tiling against this rank, and the binding
+        // carries the same dims, so it needs no second check.
+        binding.tiling = tiling;
+        binding
     }
 
     /// Return the reference to a tensor argument.
-    pub fn into_arg(self) -> TensorArg<R> {
+    pub fn into_arg(self) -> TensorArg {
         self.binding().into_tensor_arg()
     }
 
@@ -148,21 +149,14 @@ where
         strides
     }
 }
-impl<R> TensorHandle<R>
-where
-    R: Runtime,
-{
-    pub fn zeros(
-        client: &ComputeClient<R>,
-        shape: impl Into<Shape>,
-        dtype: impl Into<Type>,
-    ) -> Self {
+impl TensorHandle {
+    pub fn zeros(client: &Client, shape: impl Into<Shape>, dtype: impl Into<Type>) -> Self {
         let dtype = dtype.into();
         let shape = shape.into();
         let num_elements: usize = shape.iter().product();
         let rank = shape.len();
         let output = Self::empty(client, shape, dtype);
-        let dtype = dtype.storage_type();
+        let dtype = dtype.elem_type();
 
         let vector_size = tensor_vector_size_parallel(
             client.io_optimized_vector_sizes(dtype.size()),
@@ -194,12 +188,12 @@ where
 
 pub(crate) mod init {
     use cubecl::prelude::*;
-    use cubecl_core::{self as cubecl, ir::StorageType};
+    use cubecl_core::{self as cubecl};
 
     #[cube(launch_unchecked, address_type = "dynamic")]
     pub fn zeros_array<C: Numeric, N: Size>(
         output: &mut [Vector<C, N>],
-        #[define(C)] _elem: StorageType,
+        #[define(C)] _elem: ElemType,
     ) {
         if ABSOLUTE_POS < output.len() {
             output[ABSOLUTE_POS] = Vector::cast_from(C::from_int(0));

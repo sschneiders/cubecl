@@ -1,23 +1,23 @@
 use crate::compute::{
-    storage::{
-        cpu::{PINNED_MEMORY_ALIGNMENT, PinnedMemoryStorage},
-        gpu::GpuStorage,
-    },
-    sync::Fence,
+    events::{Fence, driver_error},
+    storage::{cpu::PinnedMemoryStorage, gpu::GpuStorage},
 };
 use cubecl_core::{
     MemoryConfiguration,
     ir::MemoryDeviceProperties,
-    server::{Binding, Handle, ServerError},
+    server::{BufferBinding, DeviceCaptures, Handle, ServerError},
 };
-use cubecl_runtime::{
-    config::streaming::StreamPriority,
+use cubecl_server::driver::DriverError;
+use cubecl_server::storage::PINNED_MEMORY_ALIGNMENT;
+use cubecl_server::{
+    config::{memory::CudaAllocator, streaming::StreamPriority},
     logging::ServerLogger,
     memory_management::{
-        MemoryAllocationMode, MemoryManagement, MemoryManagementOptions, drop_queue,
+        ErrorGraph, FailureId, MemoryAllocationMode, MemoryManagement, MemoryManagementOptions,
+        drop_queue,
     },
-    metadata_cache::{CacheMode, MetadataCachePolicy, MetadataInfoCache},
-    stream::EventStreamBackend,
+    metadata_cache::{MetadataCachePolicy, MetadataInfoCache},
+    stream::{EventStreamBackend, StreamCapture, StreamMemory},
 };
 use std::{mem::MaybeUninit, sync::Arc};
 
@@ -26,71 +26,36 @@ pub struct Stream {
     pub sys: cudarc::driver::sys::CUstream,
     pub memory_management_gpu: MemoryManagement<GpuStorage>,
     pub memory_management_cpu: MemoryManagement<PinnedMemoryStorage>,
-    pub errors: Vec<ServerError>,
     pub drop_queue: drop_queue::PendingDropQueue<Fence>,
-    /// This stream's position in the graph-capture lifecycle (see
-    /// [`StreamCaptureState`]). Enforces the ordered `graph_prepare` →
-    /// `begin_capture` → `end_capture` transitions and gates the deferral of
-    /// fenced drop-queue flushes while a capture is recording.
-    pub capturing: StreamCaptureState,
+    /// This stream's graph capture (see [`StreamCapture`]): its position in
+    /// the lifecycle, and the memory its recorded launches were given. Enforces
+    /// the ordered `graph_prepare` → `begin_capture` → `end_capture`
+    /// transitions and gates the deferral of fenced drop-queue flushes while a
+    /// capture is recording.
+    pub capturing: StreamCapture,
     /// Reusable per-launch info buffers (kernel shapes/strides/scalars), keyed
     /// by the exact info words they were built from. Admission and
     /// least-recently-used eviction are decided by the cache's
     /// [`MetadataCachePolicy`]; the launch path sets its [`CacheMode`] from
     /// the capture lifecycle, so during graph capture every buffer is cached
-    /// and none is evicted mid-capture. See [`StreamCaptureState::cache_mode`].
+    /// and none is evicted mid-capture. See [`StreamCapture::cache_mode`].
     pub info_cache: MetadataInfoCache<Handle>,
 }
 
-/// Where a stream sits in the graph-capture lifecycle. Capture is a strict
-/// `NoCapture → Prepare → Capture → NoCapture` progression: `graph_prepare`
-/// arms the pools (`NoCapture → Prepare`), `begin_capture` opens the recording
-/// window (`Prepare → Capture`), and `end_capture` closes it (`Capture →
-/// NoCapture`). Every transition rejects an out-of-order call, so a capture can
-/// never start unprepared and two captures can never overlap on one stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamCaptureState {
-    /// No capture is prepared or recording.
-    NoCapture,
-    /// `graph_prepare` has armed the persistent pools for the warmup run;
-    /// `begin_capture` may now open the window. Slices the warmup run reserves
-    /// are retained by the memory manager's priming (`CaptureState::primed`)
-    /// until `begin_capture` calls `capture_priming_end`, so a drop-queue
-    /// flush during this window cannot recycle them — the pool still ends up
-    /// owning the capture run's full working set even though flushes are not
-    /// deferred here.
-    Prepare,
-    /// `cuStreamBeginCapture` is recording launches. A fenced drop-queue flush
-    /// (or any host sync) issued now aborts the capture
-    /// (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`), so the execution path defers
-    /// those flushes until `end_capture`, which reclaims the deferred buffers.
-    Capture,
-}
-
-impl StreamCaptureState {
-    /// Whether launches on the stream are being recorded into a graph right
-    /// now — the window during which a host sync would abort the capture.
-    pub fn is_recording(&self) -> bool {
-        matches!(self, StreamCaptureState::Capture)
+impl StreamMemory for Stream {
+    fn failure(&self, binding: &BufferBinding) -> Option<FailureId> {
+        self.memory_management_gpu
+            .failure(&binding.memory, binding.range())
     }
 
-    /// The [`CacheMode`] the metadata info cache should run in at this lifecycle
-    /// position. Both while a graph is being *prepared* (warmup, which primes
-    /// the cache) and while it is being *recorded* the cache runs in
-    /// [`CacheMode::Capture`] — caching every buffer and invalidating none — so
-    /// the capture window finds every info buffer warm and drops none out from
-    /// under a recorded launch. Normal operation uses [`CacheMode::Normal`].
-    pub fn cache_mode(&self) -> CacheMode {
-        match self {
-            StreamCaptureState::NoCapture => CacheMode::Normal,
-            StreamCaptureState::Prepare | StreamCaptureState::Capture => CacheMode::Capture,
-        }
+    fn taint(&mut self, binding: &BufferBinding, failure: FailureId, failures: &mut ErrorGraph) {
+        self.memory_management_gpu
+            .taint(&binding.memory, binding.range(), failure, failures)
     }
-}
 
-impl drop_queue::Fence for Fence {
-    fn sync(self) {
-        let _ = self.wait_sync().ok();
+    fn written(&mut self, binding: &BufferBinding, failures: &mut ErrorGraph) {
+        self.memory_management_gpu
+            .written(&binding.memory, binding.range(), failures)
     }
 }
 
@@ -101,29 +66,9 @@ pub struct CudaStreamBackend {
     mem_alignment: usize,
     logger: Arc<ServerLogger>,
     priority: StreamPriority,
-    /// Programmatic main-GPU pool layout (see
-    /// [`ComputeServer::configure_memory_pools`](cubecl_runtime::server::ComputeServer::configure_memory_pools)):
-    /// streams created after it is set build their GPU pools from it instead
-    /// of the runtime default. Auxiliary pools are unaffected.
-    #[new(default)]
-    gpu_pools_override: Option<MemoryConfiguration>,
-}
-
-impl CudaStreamBackend {
-    /// The layout streams build their main-GPU pools with, and the properties
-    /// to resolve it against.
-    pub(crate) fn gpu_pools(&self) -> (MemoryConfiguration, MemoryDeviceProperties) {
-        let config = self
-            .gpu_pools_override
-            .clone()
-            .unwrap_or_else(|| self.mem_config.clone());
-        (config, self.mem_props.clone())
-    }
-
-    /// Set the main-GPU pool layout for streams created from now on.
-    pub(crate) fn set_gpu_pools(&mut self, config: MemoryConfiguration) {
-        self.gpu_pools_override = Some(config);
-    }
+    allocator: CudaAllocator,
+    /// The device's captures, which every stream this creates takes its capture state from.
+    captures: DeviceCaptures,
 }
 
 /// Create a non-blocking CUDA stream, applying the requested priority hint.
@@ -139,7 +84,14 @@ impl CudaStreamBackend {
 ///
 /// Both calls require a current CUDA context; callers in this crate always
 /// set the context before invoking stream creation.
-pub(crate) fn create_cuda_stream(priority: StreamPriority) -> cudarc::driver::sys::CUstream {
+///
+/// # Errors
+///
+/// Returns a [`DriverError`] when the driver refuses to create the stream, flagged as poisoning
+/// the device when the context is poisoned.
+pub(crate) fn create_cuda_stream(
+    priority: StreamPriority,
+) -> Result<cudarc::driver::sys::CUstream, DriverError> {
     use cudarc::driver::sys::{self, CUstream_flags};
 
     let use_greatest = match priority {
@@ -147,25 +99,25 @@ pub(crate) fn create_cuda_stream(priority: StreamPriority) -> cudarc::driver::sy
             return cudarc::driver::result::stream::create(
                 cudarc::driver::result::stream::StreamKind::NonBlocking,
             )
-            .expect("Can create a new stream.");
+            .map_err(|err| driver_error("cuStreamCreate", err));
         }
         StreamPriority::High => true,
         StreamPriority::Low => false,
     };
 
     // SAFETY: `cuCtxGetStreamPriorityRange` writes through both pointers on
-    // success; we only read the locals after the `.expect()` confirms success.
+    // success; we only read the locals after `?` confirms success.
     let value = unsafe {
         let mut least: i32 = 0;
         let mut greatest: i32 = 0;
         sys::cuCtxGetStreamPriorityRange(&mut least, &mut greatest)
             .result()
-            .expect("Can query CUDA stream priority range.");
+            .map_err(|err| driver_error("cuCtxGetStreamPriorityRange", err))?;
         if use_greatest { greatest } else { least }
     };
 
     // SAFETY: `cuStreamCreateWithPriority` writes the new stream handle through
-    // the out pointer on success; `.expect()` ensures we only `assume_init` on
+    // the out pointer on success; `?` ensures we only `assume_init` on
     // success.
     unsafe {
         let mut stream = MaybeUninit::uninit();
@@ -175,8 +127,8 @@ pub(crate) fn create_cuda_stream(priority: StreamPriority) -> cudarc::driver::sy
             value,
         )
         .result()
-        .expect("Can create a new CUDA stream with priority.");
-        stream.assume_init()
+        .map_err(|err| driver_error("cuStreamCreateWithPriority", err))?;
+        Ok(stream.assume_init())
     }
 }
 
@@ -184,60 +136,55 @@ impl EventStreamBackend for CudaStreamBackend {
     type Stream = Stream;
     type Event = Fence;
 
-    fn create_stream(&self) -> Self::Stream {
-        let stream = create_cuda_stream(self.priority);
+    fn create_stream(&self) -> Result<Self::Stream, ServerError> {
+        let stream = create_cuda_stream(self.priority)?;
 
-        let storage = GpuStorage::new(self.mem_alignment, stream);
+        let storage = GpuStorage::new(self.mem_alignment, stream, self.allocator);
 
-        // The main GPU pool honors the programmatic pool override when one was
-        // installed (`configure_memory_pools`). The pinned pool below is left
-        // alone: the override targets GPU activations, and the other pools
-        // have deliberate configurations that must not be overridden.
-        let (gpu_config, gpu_props) = self.gpu_pools();
         let memory_management_gpu = MemoryManagement::from_configuration(
             storage,
-            &gpu_props,
-            gpu_config,
+            &self.mem_props,
+            self.mem_config.clone(),
             self.logger.clone(),
             MemoryManagementOptions::new("Main GPU Memory"),
         );
         // We use the same page size and memory pools configuration for CPU pinned memory, since we
         // expect the CPU to have at least the same amount of RAM as GPU memory.
+        // The host was never measured, so this pool states no capacity.
         let memory_management_cpu = MemoryManagement::from_configuration(
             PinnedMemoryStorage::new(),
-            &MemoryDeviceProperties {
-                max_page_size: self.mem_props.max_page_size,
-                alignment: PINNED_MEMORY_ALIGNMENT as u64,
-            },
+            &MemoryDeviceProperties::new(
+                self.mem_props.max_page_size,
+                PINNED_MEMORY_ALIGNMENT as u64,
+            ),
             self.mem_config.clone(),
             self.logger.clone(),
             MemoryManagementOptions::new("Pinned CPU Memory").mode(MemoryAllocationMode::Auto),
         );
 
-        Stream {
+        Ok(Stream {
             sys: stream,
             memory_management_gpu,
             memory_management_cpu,
-            errors: Vec::new(),
             drop_queue: Default::default(),
-            capturing: StreamCaptureState::NoCapture,
+            capturing: StreamCapture::new(&self.captures),
             info_cache: MetadataInfoCache::new(MetadataCachePolicy::default()),
-        }
+        })
     }
 
-    fn flush(stream: &mut Self::Stream) -> Self::Event {
+    fn flush(stream: &mut Self::Stream, _failures: &mut ErrorGraph) -> Self::Event {
         Fence::new(stream.sys)
     }
 
-    fn wait_event(stream: &mut Self::Stream, event: Self::Event) {
-        event.wait_async(stream.sys);
+    fn wait_event(stream: &mut Self::Stream, event: Self::Event) -> Result<(), ServerError> {
+        event.wait_async(stream.sys)
     }
 
     fn wait_event_sync(event: Self::Event) -> Result<(), ServerError> {
         event.wait_sync()
     }
 
-    fn handle_cursor(stream: &Self::Stream, binding: &Binding) -> u64 {
+    fn handle_cursor(stream: &Self::Stream, binding: &BufferBinding) -> u64 {
         // The slice cursor the sync logic compares against the origin stream's `last_synced`
         // to decide whether to wait. A freed/reallocated slice falls back to `u64::MAX`,
         // which conservatively forces a wait.
@@ -245,9 +192,5 @@ impl EventStreamBackend for CudaStreamBackend {
             .memory_management_gpu
             .get_cursor(binding.memory.clone())
             .unwrap_or(u64::MAX)
-    }
-
-    fn is_healthy(stream: &Self::Stream) -> bool {
-        stream.errors.is_empty()
     }
 }

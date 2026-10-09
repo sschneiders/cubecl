@@ -1,9 +1,9 @@
-use crate::{AddressType, OpaqueType, SemanticType, StorageType, Type};
+use crate::{AddressType, ElemType, OpaqueType, SemanticType, Type};
 use alloc::collections::{BTreeMap, BTreeSet};
 
-use enumset::EnumSetType;
+use crate::EnumSetType;
 
-pub use enumset::EnumSet;
+pub use crate::EnumSet;
 
 /// Features supported by a runtime
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
@@ -24,6 +24,12 @@ pub struct Features {
 
     /// Whether `copy_async` is supported
     pub copy_async: bool,
+    /// Whether a [`SyncScope::Device`](crate::dialect::synchronization::SyncScope::Device)
+    /// synchronization is a release and an acquire at device scope, so that one cube's writes to
+    /// storage are visible to another that synchronizes after it. Without it the same
+    /// synchronization is a cube barrier and nothing more, which is all WebGPU's memory model
+    /// promises, so a kernel whose cubes hand each other data must ask before it runs.
+    pub device_memory_scope: bool,
     /// Tensor Memory Accelerator supported features
     pub tma: EnumSet<Tma>,
     /// Whether vectors can be read from / stored to addresses not aligned
@@ -37,7 +43,9 @@ pub struct Types {
     /// Valid address types
     pub address: BTreeSet<AddressType>,
     /// Types supported by this runtime, and which usages they support.
-    pub storage: BTreeMap<StorageType, EnumSet<TypeUsage>>,
+    pub elem: BTreeMap<ElemType, EnumSet<TypeUsage>>,
+    /// Complex-specific capability families supported by this runtime.
+    pub complex: BTreeMap<ElemType, EnumSet<ComplexUsage>>,
     /// Semantic constructs supported by this runtime.
     pub semantic: BTreeSet<SemanticType>,
     /// Opaque types supported by this runtime.
@@ -48,6 +56,11 @@ pub struct Types {
     /// These may not be supported everywhere - in practice, f32 vectors are only supported in global
     /// memory.
     pub atomic: BTreeMap<Type, EnumSet<AtomicUsage>>,
+    /// Types whose [`Conversion`](TypeUsage::Conversion) the compiler emulates in software, from
+    /// their bits, rather than with an instruction of the device. A kernel that decodes such a
+    /// type from its bits itself pays no more than the conversion would, and may move what the
+    /// emulation spends into work it already does.
+    pub emulated_conversion: BTreeSet<ElemType>,
 }
 
 /// Matrix multiplication-related features
@@ -67,15 +80,15 @@ pub struct MatmulFeatures {
     /// instruction. Scales must fit a specific layout and block size.
     pub scaled_mma: BTreeSet<ScaledMmaConfig>,
     /// Types supported for ldmatrix, if any
-    pub ldmatrix: BTreeSet<StorageType>,
+    pub ldmatrix: BTreeSet<ElemType>,
     /// Types supported by stmatrix, if any
-    pub stmatrix: BTreeSet<StorageType>,
+    pub stmatrix: BTreeSet<ElemType>,
     /// Whether tensor addressing is supported for CMMA load/store
     pub cmma_tensor_addressing: bool,
 }
 
 /// Operations allowed for this type. CMMA is defined separately.
-#[derive(Debug, Hash, PartialOrd, Ord, EnumSetType)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumSetType)]
 pub enum TypeUsage {
     /// Conversion to/from the type. All types should support this.
     Conversion,
@@ -85,6 +98,17 @@ pub enum TypeUsage {
     DotProduct,
     /// Whether this type can be stored in a buffer
     Buffer,
+}
+
+/// Complex capability families allowed for a complex element type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumSetType)]
+pub enum ComplexUsage {
+    /// Arithmetic, negation, conjugation, and real/imaginary extraction.
+    Core,
+    /// Equality and inequality comparisons.
+    Compare,
+    /// Higher-level complex math functions.
+    Math,
 }
 
 impl TypeUsage {
@@ -106,10 +130,12 @@ impl TypeUsage {
 }
 
 /// Atomic operations allowed for this type.
-#[derive(Debug, Hash, PartialOrd, Ord, EnumSetType)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumSetType)]
 pub enum AtomicUsage {
     /// Atomic loads and stores
     LoadStore,
+    /// Atomic exchange
+    Exchange,
     /// Atomic add/sub
     Add,
     /// Atomic min/max
@@ -127,7 +153,7 @@ impl AtomicUsage {
 }
 
 /// Supported plane features
-#[derive(Debug, Hash, PartialOrd, Ord, EnumSetType)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumSetType)]
 pub enum Plane {
     /// Basic plane-wide operations
     Ops,
@@ -142,11 +168,11 @@ pub enum Plane {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MmaConfig {
     /// Element of the A matrix
-    pub a_type: StorageType,
+    pub a_type: ElemType,
     /// Element of the B matrix
-    pub b_type: StorageType,
+    pub b_type: ElemType,
     /// Element of the C/D matrices
-    pub cd_type: StorageType,
+    pub cd_type: ElemType,
     /// The size of the matrix on the `m` dimension
     pub m: u32,
     /// The size of the matrix on the `n` dimension
@@ -162,11 +188,11 @@ pub struct MmaConfig {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CubeMmaConfig {
     /// Element of the A matrix
-    pub a_type: StorageType,
+    pub a_type: ElemType,
     /// Element of the B matrix
-    pub b_type: StorageType,
+    pub b_type: ElemType,
     /// Element of the C/D matrices
-    pub cd_type: StorageType,
+    pub cd_type: ElemType,
     /// The granularity of the matrix on the `m` dimension
     pub m_granularity: u32,
     /// The maximum value for `m`
@@ -189,13 +215,13 @@ pub struct CubeMmaConfig {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ScaledMmaConfig {
     /// Element of the A matrix
-    pub a_type: StorageType,
+    pub a_type: ElemType,
     /// Element of the B matrix
-    pub b_type: StorageType,
+    pub b_type: ElemType,
     /// Element of the C/D matrices
-    pub cd_type: StorageType,
+    pub cd_type: ElemType,
     /// Element of the blocks scales
-    pub scales_type: StorageType,
+    pub scales_type: ElemType,
     /// The size of the matrix on the `m` dimension
     pub m: u32,
     /// The size of the matrix on the `n` dimension
@@ -209,7 +235,7 @@ pub struct ScaledMmaConfig {
 }
 
 /// Atomic features that may be supported by a ``Runtime``.
-#[derive(Debug, PartialOrd, Ord, EnumSetType)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, EnumSetType)]
 pub enum Tma {
     /// Base feature set for tensor memory accelerator features. Includes tiling and im2col
     Base,
@@ -220,13 +246,32 @@ pub enum Tma {
 }
 
 impl Features {
+    /// Whether converting `ty` is emulated in software ([`Types::emulated_conversion`]).
+    pub fn conversion_is_emulated(&self, ty: ElemType) -> bool {
+        self.types.emulated_conversion.contains(&ty)
+    }
+
     /// Get the usages for a type
-    pub fn type_usage(&self, ty: StorageType) -> EnumSet<TypeUsage> {
+    pub fn type_usage(&self, ty: ElemType) -> EnumSet<TypeUsage> {
         self.types
-            .storage
+            .elem
             .get(&ty)
             .cloned()
             .unwrap_or_else(EnumSet::empty)
+    }
+
+    /// Get the complex capability families for a type.
+    pub fn complex_usage(&self, ty: ElemType) -> EnumSet<ComplexUsage> {
+        self.types
+            .complex
+            .get(&ty)
+            .cloned()
+            .unwrap_or_else(EnumSet::empty)
+    }
+
+    /// Whether a complex type supports the requested capability family.
+    pub fn supports_complex_usage(&self, ty: ElemType, usage: ComplexUsage) -> bool {
+        self.complex_usage(ty).contains(usage)
     }
 
     /// Get the usages for an atomic type
@@ -243,7 +288,7 @@ impl Features {
         match ty.into() {
             Type::Semantic(semantic_type) => self.types.semantic.contains(&semantic_type),
             Type::Opaque(opaque_type) => self.types.opaque.contains(&opaque_type),
-            ty => self.types.storage.contains_key(&ty.storage_type()),
+            ty => self.types.elem.contains_key(&ty.elem_type()),
         }
     }
 

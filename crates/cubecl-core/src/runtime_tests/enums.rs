@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::marker::PhantomData;
+use cubecl_runtime::runtime::Runtime;
 
 use crate::{self as cubecl, IntoRuntime, as_bytes};
 use cubecl::prelude::*;
@@ -48,13 +48,11 @@ impl Default for BStructCompilationArg {
     }
 }
 
-impl<R: Runtime> Default for BStructLaunch<R> {
+// Derivable, but the type is generated.
+#[allow(clippy::derivable_impls)]
+impl Default for BStructLaunch {
     fn default() -> Self {
-        Self {
-            _phantom_runtime: PhantomData,
-            x: 0,
-            y: 0,
-        }
+        Self { x: 0, y: 0 }
     }
 }
 
@@ -152,14 +150,14 @@ pub fn kernel_runtime_variants_value(test: RuntimeEnumSingleValue, output: &mut 
     output[0] = value as f32;
 }
 
-pub fn test_scalar_enum<R: Runtime>(client: ComputeClient<R>) {
+pub fn test_scalar_enum<R: Runtime>(client: Client) {
     let array = client.empty(core::mem::size_of::<f32>());
 
     kernel_scalar_enum::launch(
         &client,
         CubeCount::new_single(),
         CubeDim::new_single(),
-        TestEnumArgs::<i32, R>::C(10),
+        TestEnumArgs::<i32>::C(10),
         unsafe { BufferArg::from_raw_parts(array.clone(), 1) },
     );
     let bytes = client.read_one_unchecked(array);
@@ -168,7 +166,7 @@ pub fn test_scalar_enum<R: Runtime>(client: ComputeClient<R>) {
     assert_eq!(actual[0], 10.0);
 }
 
-pub fn test_runtime_variants_empty<R: Runtime>(client: ComputeClient<R>) {
+pub fn test_runtime_variants_empty<R: Runtime>(client: Client) {
     let array = client.empty(core::mem::size_of::<f32>());
 
     unsafe {
@@ -186,7 +184,7 @@ pub fn test_runtime_variants_empty<R: Runtime>(client: ComputeClient<R>) {
     assert_eq!(actual[0], 20.0);
 }
 
-pub fn test_runtime_variants_value<R: Runtime>(client: ComputeClient<R>) {
+pub fn test_runtime_variants_value<R: Runtime>(client: Client) {
     let array = client.empty(core::mem::size_of::<f32>());
 
     unsafe {
@@ -206,7 +204,7 @@ pub fn test_runtime_variants_value<R: Runtime>(client: ComputeClient<R>) {
     assert_eq!(actual[0], 5.0);
 }
 
-pub fn test_runtime_variants_empty_wildcard<R: Runtime>(client: ComputeClient<R>) {
+pub fn test_runtime_variants_empty_wildcard<R: Runtime>(client: Client) {
     let array = client.empty(core::mem::size_of::<f32>());
 
     unsafe {
@@ -240,10 +238,7 @@ fn kernel_array_float_int(array: &mut ArrayFloatInt) {
     }
 }
 
-pub fn test_array_float_int<R: Runtime, T: Scalar + CubeElement>(
-    client: &ComputeClient<R>,
-    expected: T,
-) {
+pub fn test_array_float_int<R: Runtime, T: Scalar + CubeElement>(client: &Client, expected: T) {
     let array = client.empty(core::mem::size_of::<T>());
 
     kernel_array_float_int::launch(
@@ -279,7 +274,7 @@ fn kernel_tuple_enum(first: SimpleEnum<&mut [u32]>, second: SimpleEnum<&[u32]>) 
     }
 }
 
-pub fn test_tuple_enum<R: Runtime>(client: &ComputeClient<R>) {
+pub fn test_tuple_enum<R: Runtime>(client: &Client) {
     let first = client.create_from_slice(as_bytes![u32: 20]);
     let second = client.create_from_slice(as_bytes![u32: 5]);
 
@@ -287,16 +282,46 @@ pub fn test_tuple_enum<R: Runtime>(client: &ComputeClient<R>) {
         client,
         CubeCount::new_single(),
         CubeDim::new_single(),
-        SimpleEnumArgs::<&mut [u32], R>::Variant(unsafe {
+        SimpleEnumArgs::<&mut [u32]>::Variant(unsafe {
             BufferArg::from_raw_parts(first.clone(), 1)
         }),
-        SimpleEnumArgs::<&[u32], R>::Variant(unsafe { BufferArg::from_raw_parts(second, 1) }),
+        SimpleEnumArgs::<&[u32]>::Variant(unsafe { BufferArg::from_raw_parts(second, 1) }),
     );
 
     let bytes = client.read_one_unchecked(first);
     let actual = u32::from_bytes(&bytes);
 
     assert_eq!(actual[0], 5);
+}
+
+#[cube(launch)]
+pub fn kernel_comptime_option_scalar(opt: ComptimeOption<f32>, output: &mut [f32]) {
+    // The comptime marker keeps the match on the expand-time discriminant: without it, a match
+    // with a single payload arm is classified as a runtime match, which ComptimeOption is not.
+    #[comptime]
+    let value = match opt {
+        ComptimeOption::Some(x) => x,
+        ComptimeOption::None => 999.0,
+    };
+    output[0] = value;
+}
+
+pub fn test_comptime_option_scalar<R: Runtime>(client: &Client) {
+    let read = |args: ComptimeOptionArgs<f32>| {
+        let array = client.empty(core::mem::size_of::<f32>());
+        kernel_comptime_option_scalar::launch(
+            client,
+            CubeCount::new_single(),
+            CubeDim::new_single(),
+            args,
+            unsafe { BufferArg::from_raw_parts(array.clone(), 1) },
+        );
+        let bytes = client.read_one_unchecked(array);
+        f32::from_bytes(&bytes)[0]
+    };
+
+    assert_eq!(read(ComptimeOptionArgs::Some(3.5)), 3.5);
+    assert_eq!(read(ComptimeOptionArgs::None), 999.0);
 }
 
 #[allow(missing_docs)]
@@ -344,6 +369,14 @@ macro_rules! testgen_enums {
                 );
                 cubecl_core::runtime_tests::enums::test_array_float_int::<TestRuntime, i32>(
                     &client, 20,
+                );
+            }
+
+            #[$crate::runtime_tests::test_log::test]
+            fn comptime_option_scalar() {
+                let client = TestRuntime::client(&Default::default());
+                cubecl_core::runtime_tests::enums::test_comptime_option_scalar::<TestRuntime>(
+                    &client,
                 );
             }
 

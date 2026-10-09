@@ -1,0 +1,445 @@
+use core::{cell::Ref, fmt::Display};
+
+use cubecl_core::{
+    frontend::InputKind,
+    ir::{
+        AddressType, Scope,
+        dialect::{InlineAsmOp, InputSpecsAttr, MemoryClobbers, MemoryClobbersAttr},
+        interfaces::{
+            TypedExt,
+            side_effects::{MemoryEffect, MemoryEffectsOp},
+        },
+        prelude::*,
+        types::VectorType,
+    },
+};
+use itertools::Itertools;
+use pliron::{
+    attribute::AttrObj,
+    builtin::attributes::{StringAttr, UnitAttr, VecAttr},
+    opts::dce::SideEffects,
+    printable::Printable,
+};
+
+use crate::{
+    cuda::cuda_op,
+    shared::{CppValue, lowering::LowerOp, scoped_block, ty::TypeExtCPP},
+    target::Cuda,
+};
+
+/// Inline PTX. Restricted to zero or one results because C++ semantics are too hard otherwise.
+/// Note that this does not *directly* map to PTX, because it actually destructures vectors to PTX
+/// vector expressions automatically. This means more than one register can be returned if it's part
+/// of a vector expression. To denote the difference, the syntax uses `$0`, `$1` etc for Pliron
+/// values, as opposed to the usual `%0`, `%1` etc for the PTX registers.
+#[pliron_op(
+    name = "cuda.inline_ptx",
+    format = "opt_attr($cuda_inline_ptx_volatile, $UnitAttr, label($volatile))
+    attr($cuda_inline_ptx_ptx, $StringAttr) ` : ` types(CharSpace(`,`)) ` : ` operands(CharSpace(`,`))
+    opt_attr($cuda_inline_ptx_clobbers, $VecAttr)
+    opt_attr($cuda_inline_ptx_in_spec, $InputSpecsAttr, label($in_spec))
+    opt_attr($cuda_inline_ptx_memory_clobbers, $MemoryClobbersAttr, label($memory_clobbers))",
+    attributes = (
+        cuda_inline_ptx_ptx: StringAttr,
+        cuda_inline_ptx_volatile: UnitAttr,
+        cuda_inline_ptx_clobbers: VecAttr,
+        cuda_inline_ptx_memory_clobbers: MemoryClobbersAttr,
+        cuda_inline_ptx_in_spec: InputSpecsAttr,
+    ),
+    verifier = "succ"
+)]
+pub struct InlinePtxOp;
+
+impl InlinePtxOp {
+    pub fn new(
+        ctx: &mut Context,
+        result_ty: Option<TypeHandle>,
+        ptx: impl Display,
+        inputs: Vec<Value>,
+    ) -> Self {
+        let op = Operation::new(
+            ctx,
+            Self::get_concrete_op_info(),
+            result_ty.into_iter().collect(),
+            inputs,
+            vec![],
+            0,
+        );
+        let op = Self { op };
+        op.set_attr_cuda_inline_ptx_ptx(ctx, ptx.to_string().into());
+        op.set_attr_cuda_inline_ptx_memory_clobbers(ctx, MemoryClobbers::Nomem.into());
+        op
+    }
+
+    pub fn new_volatile(
+        ctx: &mut Context,
+        result_ty: Option<TypeHandle>,
+        ptx: impl Display,
+        inputs: Vec<Value>,
+    ) -> Self {
+        let op = Self::new(ctx, result_ty, ptx, inputs);
+        op.set_attr_cuda_inline_ptx_volatile(ctx, UnitAttr::new());
+        op.set_attr_cuda_inline_ptx_memory_clobbers(ctx, MemoryClobbers::Nomem.into());
+        op
+    }
+
+    pub fn set_clobbers(&self, ctx: &Context, clobbers: Vec<String>) {
+        if !clobbers.is_empty() {
+            let clobbers = clobbers
+                .into_iter()
+                .map(StringAttr::new)
+                .map(|attr| -> AttrObj { Box::new(attr) });
+            self.set_attr_cuda_inline_ptx_clobbers(ctx, VecAttr(clobbers.collect()));
+        }
+    }
+
+    pub fn clobbers(&self, ctx: &Context) -> Vec<String> {
+        let clobbers = self
+            .get_attr_cuda_inline_ptx_clobbers(ctx)
+            .map(|it| it.0.clone())
+            .unwrap_or_default();
+        clobbers
+            .into_iter()
+            .map(|it| (*it.downcast::<StringAttr>().unwrap()).into())
+            .collect()
+    }
+
+    pub fn raw_ptx<'a>(&self, ctx: &'a Context) -> Ref<'a, str> {
+        Ref::map(self.get_attr_cuda_inline_ptx_ptx(ctx).unwrap(), |it| {
+            it.as_str()
+        })
+    }
+
+    pub fn is_volatile(&self, ctx: &Context) -> bool {
+        self.get_attr_cuda_inline_ptx_volatile(ctx).is_some()
+    }
+
+    pub fn inputs(&self, ctx: &Context) -> Vec<Value> {
+        self.get_operation().deref(ctx).operands().collect()
+    }
+
+    pub fn result(&self, ctx: &Context) -> Option<Value> {
+        self.get_operation().deref(ctx).results().next()
+    }
+}
+
+#[op_interface_impl]
+impl SideEffects for InlinePtxOp {
+    fn has_side_effects(&self, ctx: &Context) -> bool {
+        self.get_attr_cuda_inline_ptx_volatile(ctx).is_some()
+    }
+}
+
+#[op_interface_impl]
+impl MemoryEffectsOp for InlinePtxOp {
+    fn memory_effects(&self, ctx: &Context) -> Vec<MemoryEffect> {
+        match &self
+            .get_attr_cuda_inline_ptx_memory_clobbers(ctx)
+            .unwrap()
+            .0
+        {
+            MemoryClobbers::Nomem => vec![],
+            MemoryClobbers::Readonly => vec![MemoryEffect::ReadAll],
+            MemoryClobbers::Explicit {
+                reads_spaces,
+                writes_spaces,
+            } => {
+                let mut out = vec![];
+                for space in reads_spaces.0.iter() {
+                    out.push(MemoryEffect::ReadAllInSpace(*space));
+                }
+                for space in writes_spaces.0.iter() {
+                    out.push(MemoryEffect::WriteAllInSpace(*space));
+                }
+                let specs = self.get_attr_cuda_inline_ptx_in_spec(ctx).unwrap();
+                for (value, spec) in self.inputs(ctx).into_iter().zip(specs.0.iter()) {
+                    match spec.kind {
+                        InputKind::MemIn => {
+                            out.push(MemoryEffect::Read(value));
+                        }
+                        InputKind::MemOut => {
+                            out.push(MemoryEffect::Write(value));
+                        }
+                        InputKind::MemInout => {
+                            out.push(MemoryEffect::Read(value));
+                            out.push(MemoryEffect::Write(value));
+                        }
+                        InputKind::In => {}
+                    }
+                }
+                out
+            }
+            MemoryClobbers::ReadWrite => vec![MemoryEffect::ReadAll, MemoryEffect::WriteAll],
+        }
+    }
+}
+
+#[macro_export]
+macro_rules! ptx_block {
+    ($($lines: expr)*) => {{
+        let mut out = String::from("{\n\t");
+        $(
+            out.push_str(&$lines);
+            out.push_str("\n\t");
+        )*
+        out.push_str("}");
+        out
+    }};
+}
+
+cuda_op!(InlinePtxOp, |op, ctx| {
+    let mut ptx = op.raw_ptx(ctx).to_owned();
+    let result = op.result(ctx);
+    let inputs = op.inputs(ctx);
+
+    // The result is `$0` and the inputs follow it, which is the order the constraint lists below
+    // state them in, and so the order the PTX registers are numbered in.
+    let operands: Vec<TypeHandle> = result
+        .iter()
+        .chain(inputs.iter())
+        .map(|val| val.get_type(ctx))
+        .collect();
+    ptx = substitute_placeholders(&ptx, &registers_of(ctx, &operands));
+
+    let out_regs = result
+        .iter()
+        .flat_map(|val| flatten_result(ctx, val.get_type(ctx)))
+        .join(", ");
+    let input_regs = inputs
+        .iter()
+        .flat_map(|val| flatten_operand(ctx, *val))
+        .join(", ");
+
+    let volatile = if op.is_volatile(ctx) { "volatile" } else { "" };
+    let clobbers = if let Some(clobbers) = op.get_attr_cuda_inline_ptx_clobbers(ctx) {
+        let names = clobbers.0.iter();
+        let names = names
+            .map(|it| it.downcast_ref::<StringAttr>().unwrap().as_str())
+            .map(|name| format!(r#""{name}""#))
+            .join(", ");
+        format!(": {names}")
+    } else {
+        String::new()
+    };
+
+    let asm = format!("asm {volatile}({ptx:?} : {out_regs} : {input_regs} {clobbers});",);
+
+    if let Some(result) = result {
+        let block = scoped_block!(
+            format!("{} result;", result.get_type(ctx).to_cpp(ctx))
+            asm
+            "return result;"
+        );
+        format!("{} = {block};", result.fmt_left(ctx))
+    } else {
+        asm
+    }
+});
+
+fn flatten_result(ctx: &Context, ty: TypeHandle) -> Vec<String> {
+    if ty.is_vector(ctx) {
+        let vec = ty.vector_size(ctx);
+        let constraint = infer_constraint_letter(ctx, ty.scalar_ty(ctx));
+        (0..vec)
+            .map(|i| format!(r#""={constraint}"(result.i_{i})"#))
+            .collect()
+    } else {
+        let constraint = infer_constraint_letter(ctx, ty.get_type(ctx));
+        vec![format!(r#""={constraint}"(result)"#)]
+    }
+}
+
+fn flatten_operand(ctx: &Context, val: Value) -> Vec<String> {
+    if val.get_type(ctx).deref(ctx).is::<VectorType>() {
+        let vec = val.vector_size(ctx);
+        let constraint = infer_constraint_letter(ctx, val.scalar_ty(ctx));
+        (0..vec)
+            .map(|i| format!(r#""{constraint}"({}.i_{i})"#, val.name(ctx)))
+            .collect()
+    } else {
+        let constraint = infer_constraint_letter(ctx, val.get_type(ctx));
+        vec![format!(r#""{constraint}"({})"#, val.name(ctx))]
+    }
+}
+
+/// The PTX registers each operand stands for, in operand order. A vector operand takes one register
+/// per element and reads as a PTX vector expression.
+fn registers_of(ctx: &Context, operands: &[TypeHandle]) -> Vec<String> {
+    let mut ptx_idx = 0;
+    operands
+        .iter()
+        .map(|ty| {
+            if ty.deref(ctx).is::<VectorType>() {
+                let vec = ty.vector_size(ctx);
+                let elements = (0..vec).map(|i| format!("%{}", ptx_idx + i)).join(", ");
+                ptx_idx += vec;
+                format!("{{{elements}}}")
+            } else {
+                let register = format!("%{ptx_idx}");
+                ptx_idx += 1;
+                register
+            }
+        })
+        .collect()
+}
+
+/// Replace every `$idx` in `ptx` with the registers of operand `idx`.
+///
+/// One pass, reading the whole digit run after each `$`. Substituting one operand at a time with
+/// `str::replace` rewrites the `$1` inside `$10` as well, so a template with eleven or more
+/// operands lost its last ones and then panicked for the one it had just destroyed.
+///
+/// A `$` that no digit follows is left where it is. An operand the template never names, or a name
+/// no operand answers, is a disagreement between the two and panics: the constraint list and the
+/// register numbering are built from the operands, so neither side can be silently dropped.
+fn substitute_placeholders(ptx: &str, registers: &[String]) -> String {
+    let mut named = vec![false; registers.len()];
+    let mut out = String::with_capacity(ptx.len());
+    let mut rest = ptx;
+
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let digits = after
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(after.len());
+        let (index, tail) = after.split_at(digits);
+        match index.parse::<usize>() {
+            Err(_) => out.push('$'),
+            Ok(idx) => match registers.get(idx) {
+                Some(register) => {
+                    out.push_str(register);
+                    named[idx] = true;
+                }
+                None => panic!(
+                    "PTX string {ptx:?} substitutes argument ${idx}, but the op states {} operand(s).",
+                    registers.len()
+                ),
+            },
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+
+    if let Some(idx) = named.iter().position(|seen| !seen) {
+        panic!("Tried substituting argument ${idx} in PTX string {ptx:?}, but it wasn't found.")
+    }
+    out
+}
+
+fn infer_constraint_letter(ctx: &Context, ty: TypeHandle) -> char {
+    if ty.is_bool(ctx) {
+        'b'
+    } else if ty.is_int_of_width(ctx, 16) {
+        'h'
+    } else if ty.is_int_of_width(ctx, 32) {
+        'r'
+    } else if ty.is_int_of_width(ctx, 64) {
+        'l'
+    } else if ty.is_index(ctx) {
+        match ctx.address_type() {
+            AddressType::U32 => 'r',
+            AddressType::U64 => 'l',
+        }
+    } else if ty.is_float32(ctx) {
+        'f'
+    } else if ty.is_float64(ctx) {
+        'd'
+    } else if ty.is_ptr(ctx) {
+        'l'
+    } else {
+        panic!(
+         "The register type could not be deduced from Pliron type. The type {} is not supported. 
+Supported types are: bool, i16, i32, i64, f32, f64, pointers.
+Please use cube.reinterpret_cast if you have different type.
+See the constraints from here: https://docs.nvidia.com/cuda/inline-ptx-assembly/index.html#constraints",
+        ty.disp(ctx));
+    }
+}
+
+#[op_interface_impl]
+impl LowerOp<Cuda> for InlineAsmOp {
+    fn lower(&self, scope: &Scope) -> Vec<Value> {
+        let ctx = scope.ctx_mut();
+        let ptx = self.asm(ctx).as_str().to_owned();
+        let inputs = self.inputs(ctx);
+        let results = self
+            .get_operation()
+            .opt_result(ctx)
+            .map(|res| res.get_type(ctx));
+        let inline_ptx = InlinePtxOp::new(ctx, results, ptx, inputs);
+        let mem_clobbers = self.memory_clobbers(ctx).clone();
+        if !self.pure(ctx) {
+            inline_ptx.set_attr_cuda_inline_ptx_volatile(ctx, UnitAttr::new());
+        }
+        match &mem_clobbers {
+            MemoryClobbers::Nomem => {}
+            MemoryClobbers::Readonly
+            | MemoryClobbers::Explicit { .. }
+            | MemoryClobbers::ReadWrite => {
+                inline_ptx.set_attr_cuda_inline_ptx_clobbers(
+                    ctx,
+                    VecAttr(vec![Box::new(StringAttr::new("memory".into()))]),
+                );
+            }
+        }
+        inline_ptx.set_attr_cuda_inline_ptx_memory_clobbers(ctx, mem_clobbers.into());
+        inline_ptx.set_attr_cuda_inline_ptx_in_spec(ctx, self.in_specs(ctx).into());
+
+        inline_ptx
+            .get_operation()
+            .insert_before(ctx, self.get_operation());
+        inline_ptx.get_operation().results(ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::substitute_placeholders;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    fn registers(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("%{i}")).collect()
+    }
+
+    #[test]
+    fn substitutes_every_operand() {
+        let out = substitute_placeholders("add.s32 $0, $1, $2;", &registers(3));
+        assert_eq!(out, "add.s32 %0, %1, %2;");
+    }
+
+    // `$1` is a prefix of `$10`. Replacing operands one at a time rewrote the `$1` inside `$10`
+    // first, which destroyed the eleventh placeholder and then panicked for not finding it.
+    #[test]
+    fn a_two_digit_placeholder_is_not_eaten_by_its_prefix() {
+        let template = "op $0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10;";
+        let out = substitute_placeholders(template, &registers(11));
+        assert_eq!(out, "op %0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10;");
+    }
+
+    #[test]
+    fn a_vector_operand_reads_as_a_ptx_vector() {
+        let registers = vec!["{%0, %1}".to_string(), "%2".to_string()];
+        let out = substitute_placeholders("ld.v2 $0, [$1];", &registers);
+        assert_eq!(out, "ld.v2 {%0, %1}, [%2];");
+    }
+
+    #[test]
+    fn a_dollar_no_digit_follows_stays_put() {
+        let out = substitute_placeholders("mov $0, $x;", &registers(1));
+        assert_eq!(out, "mov %0, $x;");
+    }
+
+    #[test]
+    #[should_panic(expected = "but the op states 2 operand(s)")]
+    fn a_placeholder_no_operand_answers_is_refused() {
+        substitute_placeholders("op $0, $1, $2;", &registers(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "wasn't found")]
+    fn an_operand_the_template_never_names_is_refused() {
+        substitute_placeholders("op $0;", &registers(2));
+    }
+}

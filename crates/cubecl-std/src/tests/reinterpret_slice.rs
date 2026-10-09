@@ -1,5 +1,6 @@
 use cubecl::prelude::*;
 use cubecl_core as cubecl;
+use cubecl_runtime::runtime::Runtime;
 
 use crate::{ReinterpretSlice, ReinterpretSliceMut};
 use half::f16;
@@ -10,7 +11,7 @@ fn kernel_read_global<N: Size>(input: &[Vector<i8, N>], output: &mut [f16]) {
     output[UNIT_POS as usize] = list.read(UNIT_POS as usize);
 }
 
-pub fn run_test_read_global<R: Runtime>(client: ComputeClient<R>, vector_size: usize) {
+pub fn run_test_read_global<R: Runtime>(client: Client, vector_size: usize) {
     if !client.features().memory_reinterpret {
         return; // can't run test
     }
@@ -43,7 +44,7 @@ fn kernel_write_global<N: Size>(output: &mut [Vector<i8, N>], input: &[f16]) {
     list.write(UNIT_POS as usize, input[UNIT_POS as usize]);
 }
 
-pub fn run_test_write_global<R: Runtime>(client: ComputeClient<R>, vector_size: usize) {
+pub fn run_test_write_global<R: Runtime>(client: Client, vector_size: usize) {
     if !client.features().memory_reinterpret {
         return; // can't run test
     }
@@ -75,10 +76,10 @@ fn kernel_read_shared_memory(output: &mut [f16]) {
     let mut mem = Shared::<[Vector<i8, Const<4>>]>::new_slice(1usize);
     if UNIT_POS == 0 {
         let mut vector = Vector::empty();
-        vector.insert(0, 0_i8);
-        vector.insert(1, 60_i8);
-        vector.insert(2, 64_i8);
-        vector.insert(3, -56_i8);
+        vector.insert(0usize, 0_i8);
+        vector.insert(1usize, 60_i8);
+        vector.insert(2usize, 64_i8);
+        vector.insert(3usize, -56_i8);
         mem[0] = vector;
     }
     sync_cube();
@@ -86,7 +87,7 @@ fn kernel_read_shared_memory(output: &mut [f16]) {
     output[UNIT_POS as usize] = list.read(UNIT_POS as usize);
 }
 
-pub fn run_test_read_shared_memory<R: Runtime>(client: ComputeClient<R>) {
+pub fn run_test_read_shared_memory<R: Runtime>(client: Client) {
     if !client.features().memory_reinterpret {
         return; // can't run test
     }
@@ -120,7 +121,7 @@ fn kernel_write_shared_memory<N: Size>(output: &mut [Vector<i8, N>], input: &[f1
     output[2 * unit_pos + 1] = mem[2 * unit_pos + 1];
 }
 
-pub fn run_test_write_shared_memory<R: Runtime>(client: ComputeClient<R>) {
+pub fn run_test_write_shared_memory<R: Runtime>(client: Client) {
     if !client.features().memory_reinterpret {
         return; // can't run test
     }

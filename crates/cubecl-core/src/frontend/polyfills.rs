@@ -1,4 +1,8 @@
-use cubecl_ir::{ElemType, Type, Value};
+use alloc::vec;
+use core::f32::consts::PI;
+
+use cubecl_ir::{Type, cube_op, interfaces::TypedExt, prelude::*};
+use num_traits::One;
 
 use crate::prelude::*;
 use crate::{self as cubecl, unexpanded};
@@ -21,9 +25,66 @@ pub mod set_polyfill {
 
     /// Expand function of [`set_polyfill()`].
     pub fn expand<E: Scalar, N: Size>(scope: &Scope, ty: Type) {
-        scope.register_type::<E>(ty.storage_type());
+        scope.register_type::<E>(ty.elem_type());
         scope.register_size::<N>(ty.vector_size());
     }
+}
+
+/// Floor modulo using integer arithmetic, preserving precision for supported inputs.
+/// Division by zero and signed `MIN % -1` have no portable result or error guarantee.
+pub fn expand_signed_mod_floor(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    define_scalar!(I);
+    define_size!(N);
+    scope.register_value_type::<I, N>(lhs);
+    signed_mod_floor::expand::<I, N>(scope, lhs.into(), rhs.into()).read_value(scope)
+}
+
+#[cube]
+fn signed_mod_floor<I: Int, N: Size>(lhs: Vector<I, N>, rhs: Vector<I, N>) -> Vector<I, N> {
+    let remainder = lhs % rhs;
+    let zero = Vector::new(I::from_int(0));
+    let different_signs = (remainder ^ rhs).less_than(&zero);
+    let adjust = remainder.not_equal(&zero).vec_and(different_signs);
+    remainder + select_many(adjust, rhs, zero)
+}
+
+/// Lower NaN-preserving clamp to the corresponding binary operations.
+pub fn expand_clamp_nan(scope: &Scope, input: Value, min: Value, max: Value) -> Value {
+    use cubecl_ir::dialect::cmp::{FMaxNanOp, FMinNanOp};
+    let upper = FMinNanOp::new(scope.ctx_mut(), input, max);
+    let upper = scope.register_with_result(&upper);
+    let lower = FMaxNanOp::new(scope.ctx_mut(), upper, min);
+    scope.register_with_result(&lower)
+}
+
+/// Portable lowering for NaN-preserving minimum.
+pub fn expand_min_nan(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    define_scalar!(F);
+    define_size!(N);
+    scope.register_value_type::<F, N>(lhs);
+    min_nan_fallback::expand::<F, N>(scope, lhs.into(), rhs.into()).read_value(scope)
+}
+
+#[cube]
+fn min_nan_fallback<F: Float, N: Size>(lhs: Vector<F, N>, rhs: Vector<F, N>) -> Vector<F, N> {
+    let value = lhs.min(rhs);
+    let value = select_many(rhs.is_nan(), rhs, value);
+    select_many(lhs.is_nan(), lhs, value)
+}
+
+/// Portable lowering for NaN-preserving maximum.
+pub fn expand_max_nan(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    define_scalar!(F);
+    define_size!(N);
+    scope.register_value_type::<F, N>(lhs);
+    max_nan_fallback::expand::<F, N>(scope, lhs.into(), rhs.into()).read_value(scope)
+}
+
+#[cube]
+fn max_nan_fallback<F: Float, N: Size>(lhs: Vector<F, N>, rhs: Vector<F, N>) -> Vector<F, N> {
+    let value = lhs.max(rhs);
+    let value = select_many(rhs.is_nan(), rhs, value);
+    select_many(lhs.is_nan(), lhs, value)
 }
 
 #[cube]
@@ -52,48 +113,37 @@ fn erf_positive<F: Float, N: Size>(x: Vector<F, N>) -> Vector<F, N> {
     one - (tmp * t * (-x * x).exp())
 }
 
-#[allow(missing_docs)]
-pub fn expand_erf(scope: &Scope, input: Value, out: Value) {
-    scope.register_type::<ElemA>(input.ty.storage_type());
-    scope.register_size::<SizeA>(input.vector_size());
-    let res = erf::expand::<ElemA, SizeA>(scope, input.into());
-    assign::expand_no_check(scope, res, &mut out.into());
-}
-
 #[cube]
-fn himul_i64<N: Size>(lhs: Vector<i32, N>, rhs: Vector<i32, N>) -> Vector<i32, N> {
+fn himul_i64<I: Int, N: Size>(lhs: Vector<I, N>, rhs: Vector<I, N>) -> Vector<I, N> {
     let shift = Vector::new(32);
     let mul = (Vector::<i64, N>::cast_from(lhs) * Vector::<i64, N>::cast_from(rhs)) >> shift;
     Vector::cast_from(mul)
 }
 
 #[cube]
-fn himul_u64<N: Size>(lhs: Vector<u32, N>, rhs: Vector<u32, N>) -> Vector<u32, N> {
+fn himul_u64<I: Int, N: Size>(lhs: Vector<I, N>, rhs: Vector<I, N>) -> Vector<I, N> {
     let shift = Vector::new(32);
     let mul = (Vector::<u64, N>::cast_from(lhs) * Vector::<u64, N>::cast_from(rhs)) >> shift;
     Vector::cast_from(mul)
 }
 
 #[allow(missing_docs)]
-pub fn expand_himul_64(scope: &Scope, lhs: Value, rhs: Value, out: Value) {
-    scope.register_size::<SizeA>(lhs.vector_size());
-    match lhs.ty.elem_type() {
-        ElemType::Int(_) => {
-            let res = himul_i64::expand::<SizeA>(scope, lhs.into(), rhs.into());
-            assign::expand_no_check(scope, res, &mut out.into());
-        }
-        ElemType::UInt(_) => {
-            let res = himul_u64::expand::<SizeA>(scope, lhs.into(), rhs.into());
-            assign::expand_no_check(scope, res, &mut out.into());
-        }
-        _ => unreachable!(),
-    };
+pub fn expand_s_himul_64(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    scope.register_value_type::<ElemA, SizeA>(lhs);
+    himul_i64::expand::<ElemA, SizeA>(scope, lhs.into(), rhs.into()).value(scope)
+}
+
+#[allow(missing_docs)]
+pub fn expand_u_himul_64(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    scope.register_value_type::<ElemA, SizeA>(lhs);
+    himul_u64::expand::<ElemA, SizeA>(scope, lhs.into(), rhs.into()).value(scope)
 }
 
 #[cube]
-fn himul_sim<N: Size>(lhs: Vector<u32, N>, rhs: Vector<u32, N>) -> Vector<u32, N> {
-    let low_mask = Vector::new(0xffff);
-    let shift = Vector::new(16);
+fn himul_sim<T: Int, N: Size>(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N> {
+    let half_bits = T::size_bits().comptime() / 2;
+    let low_mask = Vector::new(T::new(comptime!((1i64 << half_bits) - 1)));
+    let shift = Vector::new(T::new(half_bits as i64));
 
     let lhs_low = lhs & low_mask;
     let lhs_hi = (lhs >> shift) & low_mask;
@@ -113,8 +163,370 @@ fn himul_sim<N: Size>(lhs: Vector<u32, N>, rhs: Vector<u32, N>) -> Vector<u32, N
 }
 
 #[allow(missing_docs)]
-pub fn expand_himul_sim(scope: &Scope, lhs: Value, rhs: Value, out: Value) {
-    scope.register_size::<SizeA>(lhs.vector_size());
-    let res = himul_sim::expand::<SizeA>(scope, lhs.into(), rhs.into());
-    assign::expand_no_check(scope, res, &mut out.into());
+pub fn expand_himul_sim(scope: &Scope, lhs: Value, rhs: Value) -> Value {
+    scope.register_value_type::<ElemA, SizeA>(lhs);
+    himul_sim::expand::<ElemA, SizeA>(scope, lhs.into(), rhs.into()).value(scope)
+}
+
+/// Portable implementation of a four-byte signed dot product with accumulation.
+#[cube]
+pub fn dp4a_polyfill<N: Size>(
+    a: Vector<i32, N>,
+    b: Vector<i32, N>,
+    c: Vector<i32, N>,
+) -> Vector<i32, N> {
+    let a = Vector::<u32, N>::reinterpret(a);
+    let b = Vector::<u32, N>::reinterpret(b);
+    let shift_8 = Vector::new(8);
+    let shift_16 = Vector::new(16);
+    let shift_24 = Vector::new(24);
+    let byte_mask = Vector::new(0xff);
+    let sign_mask = Vector::new(0x80);
+    let sign_offset = Vector::<i32, N>::new(0x80);
+
+    let a0 = Vector::<i32, N>::cast_from((a & byte_mask) ^ sign_mask) - sign_offset;
+    let a1 = Vector::<i32, N>::cast_from(((a >> shift_8) & byte_mask) ^ sign_mask) - sign_offset;
+    let a2 = Vector::<i32, N>::cast_from(((a >> shift_16) & byte_mask) ^ sign_mask) - sign_offset;
+    let a3 = Vector::<i32, N>::cast_from((a >> shift_24) ^ sign_mask) - sign_offset;
+
+    let b0 = Vector::<i32, N>::cast_from((b & byte_mask) ^ sign_mask) - sign_offset;
+    let b1 = Vector::<i32, N>::cast_from(((b >> shift_8) & byte_mask) ^ sign_mask) - sign_offset;
+    let b2 = Vector::<i32, N>::cast_from(((b >> shift_16) & byte_mask) ^ sign_mask) - sign_offset;
+    let b3 = Vector::<i32, N>::cast_from((b >> shift_24) ^ sign_mask) - sign_offset;
+
+    c + a0 * b0 + a1 * b1 + a2 * b2 + a3 * b3
+}
+
+#[allow(missing_docs)]
+pub fn expand_dp4a_polyfill(scope: &Scope, a: Value, b: Value, c: Value) -> Value {
+    scope.register_size::<SizeA>(a.vector_size(scope.ctx()));
+    dp4a_polyfill::expand::<SizeA>(scope, a.into(), b.into(), c.into()).value(scope)
+}
+
+#[cube]
+pub fn log1p<T: Float, N: Size>(input: Vector<T, N>) -> Vector<T, N> {
+    (input + Vector::one()).ln()
+}
+
+#[cube]
+pub fn expm1<T: Float, N: Size>(x: Vector<T, N>) -> Vector<T, N> {
+    let sq = x * x;
+    let a = sq * Vector::new(T::new(0.5_f32));
+    let b = sq * x * Vector::new(T::new(1.0_f32 / 6.0_f32));
+    let taylor = x + a + b;
+    let is_small = x.abs().less_than(&Vector::new(T::new(1e-5_f32)));
+    select_many(is_small, taylor, x.exp() - Vector::one())
+}
+
+/// `powf` without any edge case handling. Useful as a common mapping for the backend version that
+/// doesn't handle edge cases normally.
+#[cube_op(name = "polyfill.simple_pow")]
+#[result_ty(same_as = base)]
+pub struct SimplePowOp {
+    pub base: Value,
+    pub exp: Value,
+}
+
+/// use the simple version because otherwise we'd get an infinite lowering loop
+#[cube]
+fn simple_pow<T: Float, N: Size>(base: Vector<T, N>, exp: Vector<T, N>) -> Vector<T, N> {
+    intrinsic!(|scope| {
+        let base = base.read_value(scope);
+        let exp = exp.read_value(scope);
+        let powf = SimplePowOp::new(scope.ctx_mut(), base, exp);
+        scope.register_with_result(&powf).into()
+    })
+}
+
+#[cube]
+pub fn powf<T: Float, N: Size>(base: Vector<T, N>, exp: Vector<T, N>) -> Vector<T, N> {
+    let modulo = exp.mod_floor(Vector::new(T::new(2.0_f32)));
+    let is_even = modulo.equal(&Vector::zero());
+    let is_odd = modulo.equal(&Vector::one());
+    let is_neg_base = base.less_than(&Vector::zero());
+
+    let even_res = simple_pow(base.abs(), exp);
+    let odd_neg_res = -(simple_pow(-base, exp));
+    let default = simple_pow(base, exp);
+
+    let sel1 = select_many(is_odd.vec_and(is_neg_base), odd_neg_res, default);
+    select_many(is_even, even_res, sel1)
+}
+
+#[cube]
+pub fn powi<T: Float, N: Size>(base: Vector<T, N>, exp: Vector<i32, N>) -> Vector<T, N> {
+    let is_even = exp.is_multiple_of(2);
+    let is_neg_base = base.less_than(&Vector::zero());
+    let exp = Vector::cast_from(exp);
+
+    let even_res = simple_pow(base.abs(), exp);
+    let odd_neg_res = -(simple_pow(-base, exp));
+    let default = simple_pow(base, exp);
+
+    let sel1 = select_many((!is_even).vec_and(is_neg_base), odd_neg_res, default);
+    select_many(is_even, even_res, sel1)
+}
+
+/// Wrapping integer power, interpreting the exponent as `u32`.
+#[cube]
+pub fn powi_int<T: Int, N: Size>(base: Vector<T, N>, exp: Vector<i32, N>) -> Vector<T, N> {
+    // Use unsigned arithmetic so intermediate squares wrap on C++ backends too.
+    // Narrow integers can use u32: truncating the final result preserves their low bits
+    // and avoids C++ integer promotion turning multiplication into signed arithmetic.
+    if T::size_bits().comptime() <= 32 {
+        Vector::cast_from(powi_int_unsigned::<u32, N>(Vector::cast_from(base), exp))
+    } else {
+        Vector::cast_from(powi_int_unsigned::<u64, N>(Vector::cast_from(base), exp))
+    }
+}
+
+// Only instantiate with u32 or u64 to keep multiplication unsigned on every backend.
+#[cube]
+fn powi_int_unsigned<T: Int, N: Size>(base: Vector<T, N>, exp: Vector<i32, N>) -> Vector<T, N> {
+    let one_u = Vector::<u32, N>::new(1);
+    let one_t = Vector::<T, N>::new(T::from_int(1));
+
+    // Integer powers use an unsigned exponent, matching primitive integer `pow` semantics.
+    let mut exp = Vector::<u32, N>::cast_from(exp);
+    let mut result = one_t;
+    let mut factor = base;
+
+    #[unroll]
+    for _ in 0..32 {
+        // TODO: implement peephole optimization for masked multiplication
+        result *= select_many((exp & one_u).equal(&one_u), factor, one_t);
+        factor *= factor;
+        exp >>= one_u;
+    }
+
+    result
+}
+
+#[cube]
+pub fn recip<T: Float, N: Size>(input: Vector<T, N>) -> Vector<T, N> {
+    Vector::one() / input
+}
+
+#[cube]
+pub fn to_degrees<T: Float, N: Size>(input: Vector<T, N>) -> Vector<T, N> {
+    input * Vector::new(T::new(comptime!(180.0_f32 / PI)))
+}
+
+#[cube]
+pub fn to_radians<T: Float, N: Size>(input: Vector<T, N>) -> Vector<T, N> {
+    input * Vector::new(T::new(comptime!(PI / 180.0_f32)))
+}
+
+pub mod bitwise {
+    use super::*;
+
+    #[cube]
+    pub fn u64_leading_zeros<I: Int, N: Size>(x: Vector<I, N>) -> Vector<u32, N> {
+        let shift = Vector::new(I::new(32));
+
+        let low = Vector::<u32, N>::cast_from(x);
+        let high = Vector::<u32, N>::cast_from(x >> shift);
+        let low_zeros = Vector::leading_zeros(low);
+        let high_zeros = Vector::leading_zeros(high);
+
+        select_many(
+            high_zeros.equal(&Vector::new(32)),
+            low_zeros + high_zeros,
+            high_zeros,
+        )
+    }
+
+    #[cube]
+    pub fn u64_trailing_zeros<I: Int, N: Size>(x: Vector<I, N>) -> Vector<u32, N> {
+        let shift = Vector::new(I::new(32));
+
+        let low = Vector::<u32, N>::cast_from(x);
+        let high = Vector::<u32, N>::cast_from(x >> shift);
+        let low_tz = Vector::trailing_zeros(low);
+        let high_tz = Vector::trailing_zeros(high);
+
+        let high_tz = select_many(
+            high_tz.equal(&Vector::new(32)),
+            Vector::new(64),
+            high_tz + Vector::new(32),
+        );
+        select_many(low_tz.equal(&Vector::new(32)), high_tz, low_tz)
+    }
+
+    #[cube]
+    pub fn u64_ffs<I: Int, N: Size>(x: Vector<I, N>) -> Vector<u32, N> {
+        let shift = Vector::new(I::new(32));
+
+        let low = Vector::<u32, N>::cast_from(x);
+        let high = Vector::<u32, N>::cast_from(x >> shift);
+        let low_ffs = Vector::find_first_set(low);
+        let high_ffs = Vector::find_first_set(high);
+
+        let high_ffs = select_many(
+            high_ffs.equal(&Vector::new(0)),
+            high_ffs,
+            high_ffs + Vector::new(32),
+        );
+        select_many(low_ffs.equal(&Vector::new(0)), high_ffs, low_ffs)
+    }
+}
+
+/// The plane reductions and scans, as folds over the shuffles.
+///
+/// A backend that has cross-lane shuffles but no reduction of its own gets them from here; the
+/// C++ backends and the LLVM one share these.
+pub mod plane {
+    use super::*;
+    use crate::prelude::{
+        CUBE_DIM, CubeAdd, CubeMul, CubePartialOrd, PLANE_DIM, UNIT_POS_PLANE, max, min,
+        plane_shuffle_up, plane_shuffle_xor, select,
+    };
+
+    #[cube]
+    pub trait PlaneOp<T: Scalar, N: Size> {
+        fn apply(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N>;
+    }
+
+    pub struct OpAdd;
+    pub struct OpMul;
+    pub struct OpMin;
+    pub struct OpMax;
+
+    #[cube]
+    impl<T: Scalar + CubeAdd, N: Size> PlaneOp<T, N> for OpAdd {
+        fn apply(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N> {
+            lhs + rhs
+        }
+    }
+    #[cube]
+    impl<T: Scalar + CubeMul, N: Size> PlaneOp<T, N> for OpMul {
+        fn apply(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N> {
+            lhs * rhs
+        }
+    }
+    #[cube]
+    impl<T: Scalar + CubePartialOrd, N: Size> PlaneOp<T, N> for OpMin {
+        fn apply(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N> {
+            min(lhs, rhs)
+        }
+    }
+    #[cube]
+    impl<T: Scalar + CubePartialOrd, N: Size> PlaneOp<T, N> for OpMax {
+        fn apply(lhs: Vector<T, N>, rhs: Vector<T, N>) -> Vector<T, N> {
+            max(lhs, rhs)
+        }
+    }
+
+    #[cube]
+    fn plane_dim_checked() -> u32 {
+        min(PLANE_DIM, CUBE_DIM)
+    }
+
+    #[cube]
+    pub fn plane_reduce<T: Scalar, N: Size, Op: PlaneOp<T, N>>(val: Vector<T, N>) -> Vector<T, N> {
+        let plane_dim = plane_dim_checked();
+        let mut acc = val;
+        let mut offset = 1;
+        while offset < plane_dim {
+            acc = Op::apply(acc, plane_shuffle_xor(acc, offset));
+            offset *= 2;
+        }
+        acc
+    }
+
+    #[cube]
+    pub fn plane_reduce_inclusive<T: Scalar, N: Size, Op: PlaneOp<T, N>>(
+        val: Vector<T, N>,
+    ) -> Vector<T, N> {
+        let plane_dim = plane_dim_checked();
+        let mut acc = val;
+        let mut offset = 1;
+        while offset < plane_dim {
+            let tmp = Op::apply(acc, plane_shuffle_up(acc, offset));
+            if UNIT_POS_PLANE >= offset {
+                acc = tmp;
+            }
+            offset *= 2;
+        }
+        acc
+    }
+
+    #[cube]
+    pub fn plane_reduce_exclusive<T: Numeric, N: Size, Op: PlaneOp<T, N>>(
+        val: Vector<T, N>,
+        #[comptime] default: i64,
+    ) -> Vector<T, N> {
+        let inclusive = plane_reduce_inclusive::<T, N, Op>(val);
+        let shfl = plane_shuffle_up(inclusive, 1);
+        select(UNIT_POS_PLANE == 0, Vector::new(T::from_int(default)), shfl)
+    }
+}
+
+/// Where a lane's registers sit in the tile, for the manual `mma.sync` matrix API.
+///
+/// Unlike the cooperative API, whose fragment layout is the hardware's business, the manual one
+/// hands a kernel the registers and expects it to know which element of the tile each holds.
+/// NVIDIA documents that mapping, and every backend generating `mma.sync` has to agree with it
+/// exactly -- a kernel that indexes its own fragment differently from the way the instruction
+/// reads it computes a wrong answer rather than failing -- so it is written once here and the
+/// C++ and LLVM backends both expand it.
+///
+/// Derived from the PTX shape documentation:
+/// <https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-for-mma>
+pub mod mma {
+    use super::*;
+    use crate::ir::types::MatrixIdent;
+
+    /// The row of the tile that `lane_id`'s `i`th element holds.
+    #[cube]
+    pub fn row_index(
+        lane_id: u32,
+        i: u32,
+        #[comptime] elems_per_reg: usize,
+        #[comptime] ident: MatrixIdent,
+    ) -> u32 {
+        let elems_per_reg = elems_per_reg as u32;
+        match ident {
+            MatrixIdent::A => {
+                let group_id = lane_id / 4;
+                let odd_register = (i / elems_per_reg) & 1;
+                group_id + odd_register * 8
+            }
+            MatrixIdent::B => {
+                let thread_id_in_group = lane_id % 4;
+                let offset = thread_id_in_group * elems_per_reg + (i % elems_per_reg);
+                let reg = i / elems_per_reg;
+                offset + elems_per_reg * 4 * reg
+            }
+            MatrixIdent::Accumulator => {
+                let group_id = lane_id / 4;
+                let offset = (i << 2) & 8;
+                group_id + offset
+            }
+        }
+    }
+
+    /// The column of the tile that `lane_id`'s `i`th element holds.
+    #[cube]
+    pub fn col_index(
+        lane_id: u32,
+        i: u32,
+        #[comptime] elems_per_reg: usize,
+        #[comptime] ident: MatrixIdent,
+    ) -> u32 {
+        let elems_per_reg = elems_per_reg as u32;
+        match ident {
+            MatrixIdent::A => {
+                let thread_id_in_group = lane_id % 4;
+                let offset = thread_id_in_group * elems_per_reg + (i % elems_per_reg);
+                let group_2 = (i / (2 * elems_per_reg)) & 1;
+                offset + 4 * elems_per_reg * group_2
+            }
+            MatrixIdent::B => lane_id >> 2,
+            MatrixIdent::Accumulator => {
+                let thread_id_in_group = lane_id % 4;
+                (thread_id_in_group * 2) + (i % 2)
+            }
+        }
+    }
 }

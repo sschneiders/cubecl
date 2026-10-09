@@ -3,12 +3,14 @@
 use cubecl_common::bytes::Bytes;
 use cubecl_core as cubecl;
 use cubecl_core::prelude::*;
+use cubecl_core::runtime_tests::capture_status;
 use cubecl_core::server::Handle;
 use cubecl_cuda::CudaRuntime;
+use cubecl_server::runtime::Runtime;
 use std::sync::Mutex;
 
-/// Graph capture toggles device-global allocation state (persistent mode) on
-/// the one cached client, and `CU_STREAM_CAPTURE_MODE_GLOBAL` makes any
+/// Graph capture holds the one cached client's stream for its whole window,
+/// and `CU_STREAM_CAPTURE_MODE_GLOBAL` makes any
 /// concurrent unsafe call (alloc, sync) in the process abort a recording
 /// capture — so two captures must not overlap: exactly one capture at a time
 /// per device, as in real use. Serialize the tests instead of relying on
@@ -40,8 +42,8 @@ fn cuda_graph_capture_replay() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -50,7 +52,7 @@ fn cuda_graph_capture_replay() {
         );
     };
 
-    // Prepare arms the persistent pool; it is mandatory before a capture.
+    // Prepare starts the warmup run; it is mandatory before a capture.
     client.graph_prepare().expect("graph_prepare");
 
     // Warm up: compile the kernel and allocate every buffer, so capture stays
@@ -64,26 +66,21 @@ fn cuda_graph_capture_replay() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Replay executes the recorded launch; the output is input + 1.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
     // Replaying again re-runs it deterministically.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 }
 
 /// A capture window that has to grow the memory pool must be REJECTED, not handed back.
 ///
-/// A stream-ordered allocation (`cuMemAllocAsync`) issued while recording is captured as a memory
-/// node, and a graph holding an allocation node it never frees cannot be relaunched: the first
-/// `cuGraphLaunch` succeeds and every later one fails with `CUDA_ERROR_INVALID_VALUE`. Nothing
-/// else catches this — instantiation succeeds and `cuGraphUpload` returns `CUDA_SUCCESS` — so a
-/// caller that trusted `stop_capture` would only discover it on its second replay, far from the
-/// cause. Warmup usually leaves the persistent pool able to serve the recorded run, so real
-/// workloads hit the growth path only intermittently; this forces it by allocating a size the pool
-/// has never seen inside the window.
+/// The server rejects storage growth while recording, so every replay uses buffers
+/// prepared during warmup. Force that guard by requesting an allocation larger than
+/// the pool has served before, then verify that capture is rejected.
 #[test]
 fn cuda_graph_capture_growing_the_pool_is_rejected() {
     let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -93,8 +90,8 @@ fn cuda_graph_capture_growing_the_pool_is_rejected() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -116,8 +113,7 @@ fn cuda_graph_capture_growing_the_pool_is_rejected() {
 
     assert!(
         rejected.is_err(),
-        "a capture that grew the pool recorded a memory node and is not relaunchable, so \
-         stop_capture must reject it rather than return a graph that fails on its second replay"
+        "stop_capture must reject a capture that tried to grow the memory pool"
     );
 
     drop(grown);
@@ -135,8 +131,8 @@ fn cuda_graph_input_rewrite() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(n * core::mem::size_of::<f32>());
 
-    let launch = |client: &ComputeClient<CudaRuntime>| {
-        add_one::launch::<CudaRuntime>(
+    let launch = |client: &Client| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -154,7 +150,7 @@ fn cuda_graph_input_rewrite() {
     launch(&client);
     let graph = client.stop_capture().expect("stop_capture");
 
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output.clone()).unwrap();
     assert_eq!(f32::from_bytes(&out), &[2.0, 3.0, 4.0, 5.0]);
 
@@ -164,7 +160,7 @@ fn cuda_graph_input_rewrite() {
         &input,
         Bytes::from_bytes_vec(f32::as_bytes(&[10.0, 20.0, 30.0, 40.0]).to_vec()),
     );
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out = client.read_one(output).unwrap();
     assert_eq!(f32::from_bytes(&out), &[11.0, 21.0, 31.0, 41.0]);
 }
@@ -178,11 +174,10 @@ fn cuda_graph_input_rewrite() {
 /// reallocates sentinel buffers over its freed slice, then replays.
 ///
 /// The graph's own output stays correct (its first kernel rewrites `tmp`
-/// before the second reads it — write-before-read), and with buffer retention
-/// (`graph_prepare` routes capture-phase allocations into the persistent pool,
-/// warmup populates it, `end_capture` pins those slices) a later allocation
-/// can no longer reuse `tmp`'s slice, so replay does **not** clobber the
-/// sentinels. This is the acceptance test for that retention.
+/// before the second reads it — write-before-read), and because `end_capture`
+/// guards every page the recording touched, a later allocation can no longer
+/// reuse `tmp`'s slice, so replay does **not** clobber the sentinels. This is
+/// the acceptance test for that guard.
 #[test]
 fn cuda_graph_intermediate_recycling() {
     let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,15 +187,15 @@ fn cuda_graph_intermediate_recycling() {
     let input = client.create_from_slice(f32::as_bytes(&[1.0, 2.0, 3.0, 4.0]));
     let output = client.empty(bytes);
 
-    let run = |client: &ComputeClient<CudaRuntime>, tmp: &Handle| {
-        add_one::launch::<CudaRuntime>(
+    let run = |client: &Client, tmp: &Handle| {
+        add_one::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
             unsafe { BufferArg::from_raw_parts(input.clone(), n) },
             unsafe { BufferArg::from_raw_parts(tmp.clone(), n) },
         );
-        mul_two::launch::<CudaRuntime>(
+        mul_two::launch(
             client,
             CubeCount::Static(1, 1, 1),
             CubeDim::new(client, n),
@@ -209,19 +204,18 @@ fn cuda_graph_intermediate_recycling() {
         );
     };
 
-    // Prepare: capture-phase allocations now go to the persistent pool and are
-    // snapshotted for retention.
+    // Prepare: the warmup run below leaves the pools holding `tmp`.
     client.graph_prepare().expect("graph_prepare");
 
-    // Warm up so `tmp` is compiled + allocated in the persistent pool (then
-    // freed, so the capture run reuses it without a fresh malloc).
+    // Warm up so `tmp` is compiled and allocated, then freed, so the capture
+    // run reuses its slice without a fresh allocation.
     {
         let tmp = client.empty(bytes);
         run(&client, &tmp);
         let _ = client.read_one(output.clone()).unwrap();
     }
 
-    // Capture the two-kernel computation; `tmp` reuses the warm persistent slice.
+    // Capture the two-kernel computation; `tmp` reuses the warm slice.
     client.start_capture().expect("start_capture");
     let tmp = client.empty(bytes);
     run(&client, &tmp);
@@ -237,7 +231,7 @@ fn cuda_graph_intermediate_recycling() {
     // Replay. The graph's own OUTPUT is correct regardless: its first kernel
     // rewrites `tmp` before the second reads it (write-before-read), so
     // external reuse cannot corrupt the graph's result.
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let out_bytes = client.read_one(output).unwrap();
     let out = f32::from_bytes(&out_bytes);
     println!("graph output: {out:?} (want [4, 6, 8, 10])");
@@ -267,7 +261,7 @@ fn add_one_tensor(input: &Tensor<f32>, output: &mut Tensor<f32>) {
 }
 
 /// Decode-shaped stress: capture a window of many launches (well past the
-/// drop-queue flush threshold of 64 pushes, so the deferred-flush/pool-priming
+/// drop-queue flush threshold of 64 pushes, so the deferred-flush/staging-priming
 /// path is exercised) of a `Tensor` kernel that reads `shape(0)`, forcing
 /// every launch through the dynamic-metadata staging + info-cache path. Then
 /// verify the recorded pass did not execute, two replays re-run it exactly,
@@ -279,7 +273,7 @@ fn cuda_graph_many_launches_dynamic_metadata() {
 
     // One pass: ping-pong `dst = src + 1` between `a` and `b`. The identical
     // sequence is run once as warmup and once recorded.
-    fn run_pass(client: &ComputeClient<CudaRuntime>, a: &Handle, b: &Handle) {
+    fn run_pass(client: &Client, a: &Handle, b: &Handle) {
         for i in 0..PASS_LAUNCHES {
             let (src, dst) = if i % 2 == 0 { (a, b) } else { (b, a) };
             add_one_tensor::launch(
@@ -339,8 +333,8 @@ fn cuda_graph_many_launches_dynamic_metadata() {
     let graph = client.stop_capture().expect("stop_capture");
 
     // Warmup + 2 replays = 3 executed passes (the recorded pass ran 0 times).
-    unsafe { graph.replay() };
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(0.0, 3);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),
@@ -356,7 +350,7 @@ fn cuda_graph_many_launches_dynamic_metadata() {
     let fresh = f32::as_bytes(&[100.0f32; N]).to_vec();
     client.write(&a, Bytes::from_bytes_vec(fresh.clone()));
     client.write(&b, Bytes::from_bytes_vec(fresh));
-    unsafe { graph.replay() };
+    unsafe { graph.replay() }.expect("replay enqueues");
     let (exp_a, exp_b) = simulate(100.0, 1);
     assert_eq!(
         f32::from_bytes(&client.read_one(a.clone()).unwrap()),
@@ -366,4 +360,18 @@ fn cuda_graph_many_launches_dynamic_metadata() {
         f32::from_bytes(&client.read_one(b.clone()).unwrap()),
         &exp_b[..]
     );
+}
+
+/// See [`capture_status::a_capture_is_seen_by_every_client_of_its_stream`].
+#[test]
+fn cuda_graph_capture_is_seen_by_every_client_of_its_stream() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    capture_status::a_capture_is_seen_by_every_client_of_its_stream::<CudaRuntime>();
+}
+
+/// See [`capture_status::a_prepared_capture_ends_at_stop_capture`].
+#[test]
+fn cuda_graph_prepared_capture_ends_at_stop_capture() {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    capture_status::a_prepared_capture_ends_at_stop_capture::<CudaRuntime>();
 }

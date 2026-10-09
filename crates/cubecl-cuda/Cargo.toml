@@ -18,13 +18,16 @@ workspace = true
 [features]
 default = [
     "std",
-    "cubecl-runtime/default",
+    "cubecl-server/default",
     "cubecl-common/default",
     "cubecl-core/default",
 ]
+cpp = []
+pliron-dump = ["cubecl-cpp/pliron-dump", "cubecl-llvm/pliron-dump"]
 ptx-wmma = []
+persistence = ["cubecl-server/persistence"]
 std = [
-    "cubecl-runtime/std",
+    "cubecl-server/std",
     "cubecl-common/std",
     "cubecl-core/std",
     "cubecl-cpp/std",
@@ -32,7 +35,7 @@ std = [
 
 tracing = [
     "dep:tracing",
-    "cubecl-runtime/tracing",
+    "cubecl-server/tracing",
     "cubecl-common/tracing",
     "cubecl-core/tracing",
 ]
@@ -44,16 +47,24 @@ log = { workspace = true }
 tracing = { workspace = true, features = ["attributes"], optional = true }
 
 bytemuck = { workspace = true }
-cubecl-common = { path = "../cubecl-common", version = "=0.11.0-pre.2", default-features = false, features = [
+cubecl-common = { workspace = true, features = [
     "hash",
 ] }
-cubecl-environment = { path = "../cubecl-environment", version = "=0.11.0-pre.2", default-features = false }
-cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.2", default-features = false }
-cubecl-cpp = { path = "../cubecl-cpp", version = "=0.11.0-pre.2", default-features = false, features = [
-    "cuda",
+cubecl-environment = { workspace = true }
+cubecl-core = { workspace = true, features = [
+    "nvidia",
 ] }
-cubecl-runtime = { path = "../cubecl-runtime", version = "=0.11.0-pre.2", default-features = false, features = [
-    "channel-mutex",
+cubecl-cpp = { workspace = true, features = [
+] }
+cubecl-llvm = { workspace = true, features = [
+    "std",
+    "nvptx",
+] }
+cubecl-monitoring = { workspace = true, features = [
+    "gpu-engine-counters",
+    "nvml",
+] }
+cubecl-server = { workspace = true, features = [
     "std",
 ] }
 cudarc = { workspace = true }
@@ -64,14 +75,13 @@ serde = { workspace = true }
 
 
 [dev-dependencies]
-cubecl-core = { path = "../cubecl-core", version = "=0.11.0-pre.2", features = [
+cubecl-core = { workspace = true, default-features = true, features = [
     "export_tests",
 ] }
-cubecl-std = { path = "../cubecl-std", version = "=0.11.0-pre.2", features = [
+cubecl-std = { workspace = true, default-features = true, features = [
     "export_tests",
 ] }
 paste = { workspace = true }
-pretty_assertions = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 
 [build-dependencies]

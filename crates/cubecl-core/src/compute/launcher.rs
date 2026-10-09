@@ -1,40 +1,38 @@
 use alloc::{boxed::Box, vec::Vec};
-use core::marker::PhantomData;
 
-use crate::Runtime;
 use crate::prelude::{BufferArg, TensorArg, TensorMapArg, TensorMapKind};
-use crate::{InfoBuilder, KernelSettings, ScalarArgType};
+use crate::{InfoBuilder, ScalarArgType};
 #[cfg(feature = "std")]
 use core::cell::RefCell;
-use cubecl_ir::{AddressType, Scope, StorageType, Type};
-use cubecl_runtime::server::{Binding, CubeCount, TensorMapBinding};
-use cubecl_runtime::{
-    client::ComputeClient,
-    kernel::{CubeKernel, KernelTask},
-    server::KernelArguments,
-};
+use cubecl_ir::{AddressType, ElemType, Scope, settings::KernelSettings};
+use cubecl_runtime::kernel::BufferIOAttr;
+use cubecl_runtime::server::{BufferBinding, CubeCount, KernelResource, TensorMapBinding};
+use cubecl_runtime::{client::Client, kernel::CubeKernel, server::KernelArguments};
 
 #[cfg(feature = "std")]
 std::thread_local! {
     static INFO: RefCell<InfoBuilder> = RefCell::new(InfoBuilder::default());
     // Only used for resolving types
-    static SCOPE: RefCell<Scope> = RefCell::new(Scope::root(false));
+    static SCOPE: RefCell<Scope> = RefCell::new(Scope::dummy());
 }
 
 /// Prepare a kernel for [launch](KernelLauncher::launch).
-pub struct KernelLauncher<R: Runtime> {
-    buffers: Vec<Binding>,
-    tensor_maps: Vec<TensorMapBinding>,
+pub struct KernelLauncher {
+    resources: Vec<KernelResource>,
+    /// What the caller declared each resource is for, indexed like
+    /// `resources` — see [`declare_io`](Self::declare_io).
+    declared_io: Vec<BufferIOAttr>,
+    /// The declaration the next registered resources fall under.
+    declaring: BufferIOAttr,
     address_type: AddressType,
     pub settings: KernelSettings,
     #[cfg(not(feature = "std"))]
     info: InfoBuilder,
     #[cfg(not(feature = "std"))]
     pub scope: Scope,
-    _runtime: PhantomData<R>,
 }
 
-impl<R: Runtime> KernelLauncher<R> {
+impl KernelLauncher {
     #[cfg(feature = "std")]
     pub fn with_scope<T>(&mut self, fun: impl FnMut(&Scope) -> T) -> T {
         SCOPE.with_borrow(fun)
@@ -61,45 +59,29 @@ impl<R: Runtime> KernelLauncher<R> {
     }
 
     /// Register a scalar to be launched from raw data.
-    pub fn register_scalar_raw(&mut self, bytes: &[u8], dtype: StorageType) {
+    pub fn register_scalar_raw(&mut self, bytes: &[u8], dtype: ElemType) {
         self.with_info(|info| info.scalars.push_raw(bytes, dtype));
     }
 
     /// Launch the kernel.
     #[track_caller]
-    pub fn launch<K: CubeKernel>(
-        self,
-        cube_count: CubeCount,
-        kernel: K,
-        client: &ComputeClient<R>,
-    ) {
+    pub fn launch<K: CubeKernel>(self, cube_count: CubeCount, kernel: K, client: &Client) {
         let bindings = self.into_bindings();
-        let kernel = Box::new(KernelTask::<R::Compiler, K>::new(kernel));
+        let kernel = Box::new(kernel);
 
         client.launch(kernel, cube_count, bindings)
     }
 
-    /// Launch the kernel without check bounds.
+    /// Drop a launcher that will never launch, releasing what it registered.
     ///
-    /// # Safety
-    ///
-    /// The kernel must not:
-    /// - Contain any out of bounds reads or writes. Doing so is immediate UB.
-    /// - Contain any loops that never terminate. These may be optimized away entirely or cause
-    ///   other unpredictable behaviour.
-    #[track_caller]
-    pub unsafe fn launch_unchecked<K: CubeKernel>(
-        self,
-        cube_count: CubeCount,
-        kernel: K,
-        client: &ComputeClient<R>,
-    ) {
-        unsafe {
-            let bindings = self.into_bindings();
-            let kernel = Box::new(KernelTask::<R::Compiler, K>::new(kernel));
-
-            client.launch_unchecked(kernel, cube_count, bindings)
-        }
+    /// With `std` a launcher's scalars and metadata accumulate in a
+    /// thread-local [`InfoBuilder`] that only building the bindings drains, so
+    /// a launcher built to register arguments and then dropped — what the
+    /// `create_dummy_kernel` launch variant does — would leave that state
+    /// behind for the next real launch on the same thread to pick up as extra
+    /// arguments. Discarding drains it instead.
+    pub fn discard(self) {
+        let _ = self.into_bindings();
     }
 
     /// We need to create the bindings in the same order they are defined in the compilation step.
@@ -116,8 +98,8 @@ impl<R: Runtime> KernelLauncher<R> {
         let address_type = self.address_type;
         let info = self.with_info(|info| info.finish(address_type));
 
-        bindings.buffers = self.buffers;
-        bindings.tensor_maps = self.tensor_maps;
+        bindings.resources = self.resources;
+        bindings.declared_io = self.declared_io;
         bindings.info = info;
 
         bindings
@@ -125,21 +107,68 @@ impl<R: Runtime> KernelLauncher<R> {
 }
 
 // Tensors/arrays
-impl<R: Runtime> KernelLauncher<R> {
-    /// Push a new input tensor to the state.
-    pub fn register_tensor(&mut self, tensor: TensorArg<R>, ty: Type) {
-        if let Some(tensor) = self.process_tensor(tensor, ty) {
-            self.buffers.push(tensor);
+impl KernelLauncher {
+    /// Declare what the kernel does with the buffers registered from here on,
+    /// until the next declaration.
+    ///
+    /// The generated launch functions call this before each argument with
+    /// what the signature proves — `&Tensor` cannot be written, `&mut Tensor`
+    /// may be read — so a launch that fails before running, a kernel that
+    /// does not compile above all, taints only the buffers the kernel could
+    /// have written. The compiled kernel's own answer still wins once it
+    /// exists; this one is the answer that survives compilation failing. A
+    /// launcher that never declares leaves every resource
+    /// [`ReadWrite`](BufferIOAttr::ReadWrite), the loud fallback.
+    pub fn declare_io(&mut self, io: BufferIOAttr) {
+        self.declaring = io;
+    }
+
+    /// An aliasing argument writes the buffer it aliases in place, however
+    /// that buffer's own argument was declared — the aliased buffer usually
+    /// arrives through a `&Tensor`, and it is the one buffer an in-place
+    /// kernel exists to produce. The alias registers no resource of its own,
+    /// so its declaration lands on the buffer at `input_pos` instead: a
+    /// declaration built from each signature position alone would call that
+    /// buffer read-only and leave the in-place output unnamed by a failure,
+    /// which is silent garbage on a read.
+    fn alias_io(&mut self, input_pos: usize) {
+        if self.declaring.is_writable()
+            && let Some(io) = self.declared_io.get_mut(input_pos)
+        {
+            *io = BufferIOAttr::ReadWrite;
         }
     }
 
-    fn process_tensor(&mut self, tensor: TensorArg<R>, ty: Type) -> Option<Binding> {
+    /// Record a resource.
+    fn push_resource(&mut self, resource: KernelResource) {
+        let io = match &resource {
+            // A tensor map's global side is written through TMA operations no
+            // signature shows — a map registered from a `&TensorMap` can
+            // still be a store's destination — so the declaration is clamped
+            // to the same answer the visibility analysis gives it.
+            KernelResource::TensorMap(_) => BufferIOAttr::ReadWrite,
+            KernelResource::Buffer(_) => self.declaring,
+        };
+        self.declared_io.push(io);
+        self.resources.push(resource);
+    }
+
+    /// Push a new input tensor to the state.
+    pub fn register_tensor(&mut self, tensor: TensorArg, elem_size: usize) {
+        if let Some(tensor) = self.process_tensor(tensor, elem_size) {
+            self.push_resource(KernelResource::Buffer(tensor));
+        }
+    }
+
+    fn process_tensor(&mut self, tensor: TensorArg, elem_size: usize) -> Option<BufferBinding> {
         let tensor = match tensor {
             TensorArg::Handle { handle, .. } => handle,
-            TensorArg::Alias { .. } => return None,
+            TensorArg::Alias { input_pos, .. } => {
+                self.alias_io(input_pos);
+                return None;
+            }
         };
 
-        let elem_size = ty.size();
         let buffer_len = tensor.handle.size_in_used() / elem_size as u64;
         let address_type = self.address_type;
 
@@ -155,19 +184,21 @@ impl<R: Runtime> KernelLauncher<R> {
     }
 
     /// Push a new input array to the state.
-    pub fn register_buffer(&mut self, array: BufferArg<R>, ty: Type) {
-        if let Some(tensor) = self.process_buffer(array, ty) {
-            self.buffers.push(tensor);
+    pub fn register_buffer(&mut self, array: BufferArg, elem_size: usize) {
+        if let Some(tensor) = self.process_buffer(array, elem_size) {
+            self.push_resource(KernelResource::Buffer(tensor));
         }
     }
 
-    fn process_buffer(&mut self, array: BufferArg<R>, ty: Type) -> Option<Binding> {
+    fn process_buffer(&mut self, array: BufferArg, elem_size: usize) -> Option<BufferBinding> {
         let array = match array {
             BufferArg::Handle { handle, .. } => handle,
-            BufferArg::Alias { .. } => return None,
+            BufferArg::Alias { input_pos, .. } => {
+                self.alias_io(input_pos);
+                return None;
+            }
         };
 
-        let elem_size = ty.size();
         let buffer_len = array.handle.size_in_used() / elem_size as u64;
         let address_type = self.address_type;
         self.with_info(|info| info.metadata.register_buffer(buffer_len, address_type));
@@ -175,28 +206,73 @@ impl<R: Runtime> KernelLauncher<R> {
     }
 
     /// Push a new tensor to the state.
-    pub fn register_tensor_map<K: TensorMapKind>(&mut self, map: TensorMapArg<R, K>, ty: Type) {
+    pub fn register_tensor_map<K: TensorMapKind>(
+        &mut self,
+        map: TensorMapArg<K>,
+        elem_size: usize,
+    ) {
         let binding = self
-            .process_tensor(map.tensor, ty)
+            .process_tensor(map.tensor, elem_size)
             .expect("Can't use alias for TensorMap");
 
         let map = map.metadata.clone();
-        self.tensor_maps.push(TensorMapBinding { binding, map });
+        self.push_resource(KernelResource::TensorMap(TensorMapBinding { binding, map }));
     }
 }
 
-impl<R: Runtime> KernelLauncher<R> {
+impl KernelLauncher {
     pub fn new(settings: KernelSettings) -> Self {
         Self {
             address_type: settings.address_type,
             settings,
-            buffers: Vec::new(),
-            tensor_maps: Vec::new(),
-            _runtime: PhantomData,
+            resources: Vec::new(),
+            declared_io: Vec::new(),
+            declaring: BufferIOAttr::ReadWrite,
             #[cfg(not(feature = "std"))]
             info: InfoBuilder::default(),
             #[cfg(not(feature = "std"))]
-            scope: Scope::root(false),
+            scope: Scope::dummy(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl_ir::settings::{Dim3, ExecutionMode};
+
+    fn settings() -> KernelSettings {
+        KernelSettings::new(Dim3::new_single(), ExecutionMode::Checked, AddressType::U32)
+    }
+
+    fn info_of(launcher: KernelLauncher) -> Vec<u64> {
+        launcher.into_bindings().info.data
+    }
+
+    /// `create_dummy_kernel` registers arguments into a launcher it never
+    /// launches. With `std` those registrations land in a thread-local that
+    /// only building the bindings drains, so the launcher has to be discarded
+    /// rather than dropped — otherwise the next real launch on the same
+    /// thread inherits them as extra arguments.
+    #[test]
+    fn a_discarded_launcher_leaves_nothing_for_the_next_launch() {
+        let empty = info_of(KernelLauncher::new(settings()));
+
+        // A registered scalar is visible in the info a launcher produces, so
+        // the equality below is a real claim about the thread-local, not a
+        // comparison of two things that could never differ.
+        let mut registered = KernelLauncher::new(settings());
+        registered.register_scalar(1u32);
+        assert_ne!(info_of(registered), empty);
+
+        let mut dummy = KernelLauncher::new(settings());
+        dummy.register_scalar(1u32);
+        dummy.discard();
+
+        assert_eq!(
+            info_of(KernelLauncher::new(settings())),
+            empty,
+            "a discarded launcher left its scalars behind for the next launch"
+        );
     }
 }

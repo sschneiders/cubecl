@@ -1,0 +1,52 @@
+[package]
+authors = ["marcantoinem <marc-antoine.m@outlook.com>"]
+categories = ["science"]
+description = "LLVM compiler for CubeCL"
+edition.workspace = true
+keywords = ["llvm"]
+license.workspace = true
+name = "cubecl-llvm"
+readme.workspace = true
+repository = "https://github.com/tracel-ai/cubecl/tree/main/crates/cubecl-llvm"
+version.workspace = true
+
+
+[lints]
+workspace = true
+
+
+[features]
+default = ["std", "cubecl-core/default", "cubecl-runtime/default"]
+
+pliron-dump = []
+std = ["cubecl-core/std", "cubecl-runtime/std"]
+
+tracing = ["cubecl-core/tracing", "cubecl-runtime/tracing", "cubecl-opt/tracing"]
+amdgpu = []
+nvptx = ["cubecl-core/nvidia"]
+
+
+[dependencies]
+cubecl-core = { workspace = true, features = [
+    "amd",
+    "std",
+] }
+cubecl-environment = { workspace = true }
+cubecl-opt = { workspace = true, features = [
+    "std",
+] }
+cubecl-runtime = { workspace = true, features = [
+    "std",
+] }
+
+derive-new = { workspace = true }
+half = { workspace = true }
+pliron = { workspace = true, features = ["std"] }
+pliron-llvm = { workspace = true, features = ["llvm-sys"] }
+thiserror = { workspace = true }
+# Not used directly, depended on to select its features.
+llvm-sys = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+tracel-llvm-bundler = { workspace = true }

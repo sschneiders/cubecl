@@ -2,6 +2,7 @@
 
 use core::f32;
 use core::f32::consts::PI;
+use cubecl_runtime::runtime::Runtime;
 
 use core::fmt::Display;
 
@@ -10,8 +11,8 @@ use crate::{self as cubecl, as_type};
 use cubecl::prelude::*;
 use cubecl_runtime::server::Handle;
 
-pub(crate) fn assert_equals_approx<R: Runtime, F: num_traits::Float + CubeElement + Display>(
-    client: &ComputeClient<R>,
+pub(crate) fn assert_equals_approx<F: num_traits::Float + CubeElement + Display>(
+    client: &Client,
     output: Handle,
     expected: &[F],
     epsilon: F,
@@ -87,7 +88,7 @@ macro_rules! test_unary_impl {
             expected: $expected:expr
         }),*],
         $epsilon:expr) => {
-        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: ComputeClient<R>) {
+        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: Client) {
             #[cube(launch_unchecked, fast_math = FastMath::all())]
             fn test_function<$float_type: Float, In: Size, Out: Size>(
                 input: &[Vector<$float_type, In>], output: &mut [Vector<$float_type, Out>]
@@ -104,7 +105,7 @@ macro_rules! test_unary_impl {
                 let input_handle = client.create_from_slice($float_type::as_bytes(input));
 
                 unsafe {
-                    test_function::launch_unchecked::<$float_type, R>(
+                    test_function::launch_unchecked::<$float_type>(
                         &client,
                         CubeCount::Static(1, 1, 1),
                         CubeDim::new_1d((input.len() / $input_vectorization as usize) as u32),
@@ -115,7 +116,7 @@ macro_rules! test_unary_impl {
                     )
                 };
 
-                assert_equals_approx::<R, $float_type>(&client, output_handle, $expected, $float_type::new($epsilon));
+                assert_equals_approx::<$float_type>(&client, output_handle, $expected, $float_type::new($epsilon));
             }
             )*
         }
@@ -133,7 +134,7 @@ macro_rules! test_unary_impl_fixed {
             input: $input:expr,
             expected: $expected:expr
         }),*]) => {
-        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: ComputeClient<R>) {
+        pub fn $test_name<R: Runtime, $float_type: Float + num_traits::Float + CubeElement + Display>(client: Client) {
             #[cube(launch_unchecked)]
             fn test_function<$float_type: Float, N: Size>(
                 input: &[Vector<$float_type, N>],
@@ -151,7 +152,7 @@ macro_rules! test_unary_impl_fixed {
                 let input_handle = client.create_from_slice($float_type::as_bytes(input));
 
                 unsafe {
-                    test_function::launch_unchecked::<$float_type, R>(
+                    test_function::launch_unchecked::<$float_type>(
                         &client,
                         CubeCount::Static(1, 1, 1),
                         CubeDim::new_1d((input.len() / $input_vectorization as usize) as u32),
@@ -181,7 +182,7 @@ macro_rules! test_unary_impl_int {
             input: $input:expr,
             expected: $expected:expr
         }),*]) => {
-        pub fn $test_name<R: Runtime, $int_type: Int + CubeElement>(client: ComputeClient<R>) {
+        pub fn $test_name<R: Runtime, $int_type: Int + CubeElement>(client: Client) {
             #[cube(launch_unchecked)]
             fn test_function<$int_type: Int, N: Size>(
                 input: &[Vector<$int_type, N>],
@@ -199,7 +200,7 @@ macro_rules! test_unary_impl_int {
                 let input_handle = client.create_from_slice($int_type::as_bytes(input));
 
                 unsafe {
-                    test_function::launch_unchecked::<$int_type, R>(
+                    test_function::launch_unchecked::<$int_type>(
                         &client,
                         CubeCount::Static(1, 1, 1),
                         CubeDim::new_1d((input.len() / $input_vectorization as usize) as u32),
@@ -230,7 +231,7 @@ macro_rules! test_unary_impl_int_fixed {
             input: $input:expr,
             expected: $expected:expr
         }),*]) => {
-        pub fn $test_name<R: Runtime, $int_type: Int + CubeElement>(client: ComputeClient<R>) {
+        pub fn $test_name<R: Runtime, $int_type: Int + CubeElement>(client: Client) {
             #[cube(launch_unchecked)]
             fn test_function<$int_type: Int, N: Size>(
                 input: &[Vector<$int_type, N>],
@@ -248,7 +249,7 @@ macro_rules! test_unary_impl_int_fixed {
                 let input_handle = client.create_from_slice($int_type::as_bytes(input));
 
                 unsafe {
-                    test_function::launch_unchecked::<$int_type, R>(
+                    test_function::launch_unchecked::<$int_type>(
                         &client,
                         CubeCount::Static(1, 1, 1),
                         CubeDim::new_1d((input.len() / $input_vectorization as usize) as u32),
@@ -286,6 +287,24 @@ test_unary_impl!(test_sin, F, Vector::sin, [
         out_vectorization: 4,
         input: as_type![F: 0., 1.570_796_4, 3.141_592_7, -1.570_796_4],
         expected: as_type![F: 0., 1., 0., -1.]
+    },
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.977_530_1, -0.279_415_5, -0.937_999_96, 0.989_358_25, 0.066_321_895, -0.536_572_93, 0.912_945_3, 0.132_351_76]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.977_530_1, -0.279_415_5, -0.937_999_96, 0.989_358_25, 0.066_321_895, -0.536_572_93, 0.912_945_3, 0.132_351_76]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.977_530_1, -0.279_415_5, -0.937_999_96, 0.989_358_25, 0.066_321_895, -0.536_572_93, 0.912_945_3, 0.132_351_76]
     }
 ]);
 
@@ -328,6 +347,24 @@ test_unary_impl!(test_cos, F, Vector::cos, [
         out_vectorization: 4,
         input: as_type![F: 0., 1.570_796_4, 3.141_592_7, -1.570_796_4],
         expected: as_type![F: 1., 0., -1., 0.]
+    },
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.210_795_8, 0.960_170_27, 0.346_635_3, -0.145_500_03, 0.997_798_26, 0.843_853_95, 0.408_082_07, 0.991_202_83]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.210_795_8, 0.960_170_27, 0.346_635_3, -0.145_500_03, 0.997_798_26, 0.843_853_95, 0.408_082_07, 0.991_202_83]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: 4.5, 6., -7.5, 8., -12.5, 12., 20., -25.],
+        expected: as_type![F: -0.210_795_8, 0.960_170_27, 0.346_635_3, -0.145_500_03, 0.997_798_26, 0.843_853_95, 0.408_082_07, 0.991_202_83]
     }
 ]);
 
@@ -475,6 +512,66 @@ test_unary_impl!(test_tanh, F, Vector::tanh, [
         out_vectorization: 4,
         input: as_type![F: 0., 1., -1., 2.],
         expected: as_type![F: 0., 0.761_594_2, -0.761_594_2, 0.964_027_6]
+    },
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: 0.25, 0.5, 0.75, -0.25, 3., -4., 0.125, -0.75],
+        expected: as_type![F: 0.244_918_66, 0.462_117_17, 0.635_148_94, -0.244_918_66, 0.995_054_8, -0.999_329_3, 0.124_353, -0.635_148_94]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: 0.25, 0.5, 0.75, -0.25, 3., -4., 0.125, -0.75],
+        expected: as_type![F: 0.244_918_66, 0.462_117_17, 0.635_148_94, -0.244_918_66, 0.995_054_8, -0.999_329_3, 0.124_353, -0.635_148_94]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: 0.25, 0.5, 0.75, -0.25, 3., -4., 0.125, -0.75],
+        expected: as_type![F: 0.244_918_66, 0.462_117_17, 0.635_148_94, -0.244_918_66, 0.995_054_8, -0.999_329_3, 0.124_353, -0.635_148_94]
+    }
+]);
+
+test_unary_impl!(test_exp, F, Vector::exp, [
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: 0., 1., -1., 2., 0.5, -0.5, -2., 1.5],
+        expected: as_type![F: 1., 2.718_281_7, 0.367_879_45, 7.389_056, 1.648_721_2, 0.606_530_67, 0.135_335_28, 4.481_689]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: 0., 1., -1., 2., 0.5, -0.5, -2., 1.5],
+        expected: as_type![F: 1., 2.718_281_7, 0.367_879_45, 7.389_056, 1.648_721_2, 0.606_530_67, 0.135_335_28, 4.481_689]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: 0., 1., -1., 2., 0.5, -0.5, -2., 1.5],
+        expected: as_type![F: 1., 2.718_281_7, 0.367_879_45, 7.389_056, 1.648_721_2, 0.606_530_67, 0.135_335_28, 4.481_689]
+    }
+]);
+
+test_unary_impl!(test_ln, F, Vector::ln, [
+    {
+        input_vectorization: 1,
+        out_vectorization: 1,
+        input: as_type![F: 1., 2., 0.5, 10., 0.25, 4., 100., 0.125],
+        expected: as_type![F: 0., 0.693_147_2, -0.693_147_2, 2.302_585_1, -1.386_294_4, 1.386_294_4, 4.605_170_2, -2.079_441_5]
+    },
+    {
+        input_vectorization: 2,
+        out_vectorization: 2,
+        input: as_type![F: 1., 2., 0.5, 10., 0.25, 4., 100., 0.125],
+        expected: as_type![F: 0., 0.693_147_2, -0.693_147_2, 2.302_585_1, -1.386_294_4, 1.386_294_4, 4.605_170_2, -2.079_441_5]
+    },
+    {
+        input_vectorization: 4,
+        out_vectorization: 4,
+        input: as_type![F: 1., 2., 0.5, 10., 0.25, 4., 100., 0.125],
+        expected: as_type![F: 0., 0.693_147_2, -0.693_147_2, 2.302_585_1, -1.386_294_4, 1.386_294_4, 4.605_170_2, -2.079_441_5]
     }
 ]);
 
@@ -716,6 +813,8 @@ test_unary_impl!(test_inverse_sqrt, F, Vector::inverse_sqrt, [
     }
 ]);
 
+// No zero vector: its normalization is `0 / 0`, and these kernels opt into fast math, under which
+// a compiler may assume no NaN arises (Metal folds it to 1).
 test_unary_impl!(
     test_normalize,
     F,
@@ -724,8 +823,8 @@ test_unary_impl!(
         {
             input_vectorization: 1,
             out_vectorization: 1,
-            input: as_type![F: -1., 0., 1., 5.],
-            expected: as_type![F: -1., f32::NAN, 1., 1.]
+            input: as_type![F: -1., -2.5, 1., 5.],
+            expected: as_type![F: -1., -1., 1., 1.]
         },
         {
             input_vectorization: 2,
@@ -738,18 +837,6 @@ test_unary_impl!(
             out_vectorization: 4,
             input: as_type![F: -1., 0., 1., 5.],
             expected: as_type![F: -0.192, 0.0, 0.192, 0.962]
-        },
-        {
-            input_vectorization: 4,
-            out_vectorization: 4,
-            input: as_type![F: 0., 0., 0., 0.],
-            expected: as_type![F: f32::NAN, f32::NAN, f32::NAN, f32::NAN]
-        },
-        {
-            input_vectorization: 2,
-            out_vectorization: 2,
-            input: as_type![F: 0., 0., 1., 0.],
-            expected: as_type![F: f32::NAN, f32::NAN, 1., 0.]
         }
     ]
 );
@@ -825,7 +912,7 @@ test_unary_impl_fixed!(
     ]
 );
 
-pub fn test_expm1_f32<R: Runtime>(client: ComputeClient<R>) {
+pub fn test_expm1_f32<R: Runtime>(client: Client) {
     #[cube(launch_unchecked)]
     fn test_function<In: Size, Out: Size>(
         input: &[Vector<f32, In>],
@@ -849,7 +936,7 @@ pub fn test_expm1_f32<R: Runtime>(client: ComputeClient<R>) {
         let input_handle = client.create_from_slice(f32::as_bytes(input));
 
         unsafe {
-            test_function::launch_unchecked::<R>(
+            test_function::launch_unchecked(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d((input.len() / input_vectorization) as u32),
@@ -1000,6 +1087,8 @@ macro_rules! testgen_unary {
             add_test!(test_sinh);
             add_test!(test_cosh);
             add_test!(test_tanh);
+            add_test!(test_exp);
+            add_test!(test_ln);
             add_test!(test_asin);
             add_test!(test_acos);
             add_test!(test_atan);
@@ -1046,7 +1135,7 @@ test_unary_impl_int!(test_abs_int, I, Abs::abs, [
     }
 ]);
 
-pub fn test_vector_sum_int<R: Runtime, I: Int + CubeElement>(client: ComputeClient<R>) {
+pub fn test_vector_sum_int<R: Runtime, I: Int + CubeElement>(client: Client) {
     #[cube(launch_unchecked)]
     fn test_function<I: Int, In: Size, Out: Size>(
         input: &[Vector<I, In>],
@@ -1064,7 +1153,7 @@ pub fn test_vector_sum_int<R: Runtime, I: Int + CubeElement>(client: ComputeClie
         let input_handle = client.create_from_slice(I::as_bytes(input));
 
         unsafe {
-            test_function::launch_unchecked::<I, R>(
+            test_function::launch_unchecked::<I>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(input.len() as u32),
@@ -1087,7 +1176,7 @@ pub fn test_vector_sum_int<R: Runtime, I: Int + CubeElement>(client: ComputeClie
         let input_handle = client.create_from_slice(I::as_bytes(input));
 
         unsafe {
-            test_function::launch_unchecked::<I, R>(
+            test_function::launch_unchecked::<I>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(2),
@@ -1110,7 +1199,7 @@ pub fn test_vector_sum_int<R: Runtime, I: Int + CubeElement>(client: ComputeClie
         let input_handle = client.create_from_slice(I::as_bytes(input));
 
         unsafe {
-            test_function::launch_unchecked::<I, R>(
+            test_function::launch_unchecked::<I>(
                 &client,
                 CubeCount::Static(1, 1, 1),
                 CubeDim::new_1d(1),

@@ -1,0 +1,578 @@
+use core::fmt::{self, Debug};
+
+use crate::{
+    CanMaterialize, ConstantValue, ElemType,
+    dialect::synchronization::SyncScope,
+    interfaces::memory_slot::MemoryValue,
+    prelude::*,
+    types::{AtomicType, PointerType, VectorType, scalar::*},
+};
+use alloc::string::ToString;
+use derive_new::new;
+use itertools::Itertools;
+use pliron::{
+    alloc::vec::Vec,
+    attribute::{AttrObj, AttributeDict},
+    builtin::{attr_interfaces::TypedAttrInterface, ops::ConstantOp, types::IntegerType},
+    context::Context,
+    derive::{op_interface, type_interface},
+    op::OpId,
+    printable::{self, Printable},
+    r#type::{TypeHandle, type_cast},
+    utils::apint::APInt,
+    value::Use,
+};
+
+pub mod aliasing;
+pub mod control_flow;
+pub mod memory_slot;
+pub mod side_effects;
+pub mod traits;
+pub mod uniformity;
+
+#[macro_export]
+macro_rules! verify_op_succ {
+    () => {
+        fn verify(
+            _op: &dyn pliron::op::Op,
+            _ctx: &pliron::context::Context,
+        ) -> pliron::result::Result<()>
+        where
+            Self: Sized,
+        {
+            Ok(())
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! verify_ty_succ {
+    () => {
+        fn verify(
+            _op: &dyn pliron::r#type::Type,
+            _ctx: &pliron::context::Context,
+        ) -> pliron::result::Result<()>
+        where
+            Self: Sized,
+        {
+            Ok(())
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! verify_attr_succ {
+    () => {
+        fn verify(
+            _op: &dyn pliron::attribute::Attribute,
+            _ctx: &pliron::context::Context,
+        ) -> pliron::result::Result<()>
+        where
+            Self: Sized,
+        {
+            Ok(())
+        }
+    };
+}
+
+// Pure marker
+#[op_interface]
+pub trait ReturnLike: IsTerminatorInterface + NResultsInterface<0> {
+    verify_op_succ!();
+}
+
+#[op_interface]
+pub trait TriviallyUnrollable: MaterializableOp {
+    verify_op_succ!();
+}
+
+/// Op that can be rematerialized from a set of operands.
+/// Should be implemented for anything that doesn't have regions or successors.
+#[op_interface]
+pub trait MaterializableOp {
+    verify_op_succ!();
+    fn materialize(
+        &self,
+        ctx: &mut Context,
+        result_ty: Vec<TypeHandle>,
+        operands: Vec<Value>,
+        attributes: AttributeDict,
+    ) -> Ptr<Operation>;
+}
+
+CanMaterialize!(ConstantOp);
+
+#[op_interface]
+pub trait Synchronizes {
+    verify_op_succ!();
+
+    /// Synchronizes at least at this scope. Should be used for optimizations where smaller scopes
+    /// are more conservative (i.e. marking shared memory as unused).
+    fn minimum_scope(&self, ctx: &Context) -> SyncScope;
+    /// Synchronizes at most at this scope. Should be used for optimizations where larger scopes
+    /// are more conservative (i.e. making memory writes visible).
+    fn maximum_scope(&self, ctx: &Context) -> SyncScope;
+}
+
+macro_rules! synchronizes {
+    ($ty: ty, $scope: expr) => {
+        #[::pliron::derive::op_interface_impl]
+        impl crate::interfaces::Synchronizes for $ty {
+            #[allow(unused_variables)]
+            fn minimum_scope(&self, ctx: &::pliron::context::Context) -> SyncScope {
+                $scope
+            }
+            #[allow(unused_variables)]
+            fn maximum_scope(&self, ctx: &::pliron::context::Context) -> SyncScope {
+                $scope
+            }
+        }
+    };
+}
+pub(crate) use synchronizes;
+
+#[type_interface]
+pub trait AlignedType {
+    verify_ty_succ!();
+
+    fn align(&self, ctx: &Context) -> usize;
+}
+
+#[macro_export]
+macro_rules! aligned {
+    ($ty: ty, $align: expr) => {
+        #[::pliron::derive::type_interface_impl]
+        impl $crate::interfaces::AlignedType for $ty {
+            #[allow(unused_variables)]
+            fn align(&self, ctx: &::pliron::context::Context) -> usize {
+                $align
+            }
+        }
+    };
+}
+
+#[type_interface]
+pub trait SizedType: AlignedType {
+    verify_ty_succ!();
+    fn size(&self, ctx: &Context) -> usize;
+    fn size_bits(&self, ctx: &Context) -> usize {
+        self.size(ctx) * 8
+    }
+}
+
+#[macro_export]
+macro_rules! sized {
+    ($ty: ty, $size: expr) => {
+        #[::pliron::derive::type_interface_impl]
+        impl $crate::interfaces::SizedType for $ty {
+            #[allow(unused_variables)]
+            fn size(&self, ctx: &::pliron::context::Context) -> usize {
+                $size
+            }
+        }
+    };
+}
+
+#[type_interface]
+pub trait MaybeVectorizedType {
+    verify_ty_succ!();
+
+    fn vector_size(&self, ctx: &Context) -> usize;
+    fn try_vector_size(&self, ctx: &Context) -> Option<usize> {
+        Some(self.vector_size(ctx))
+    }
+}
+
+#[macro_export]
+macro_rules! scalar {
+    ($ty: ty) => {
+        #[::pliron::derive::type_interface_impl]
+        impl $crate::interfaces::MaybeVectorizedType for $ty {
+            fn vector_size(&self, _ctx: &::pliron::context::Context) -> usize {
+                1
+            }
+        }
+
+        #[::pliron::derive::type_interface_impl]
+        impl $crate::interfaces::ScalarizableType for $ty {
+            fn scalar_type(&self, ctx: &Context) -> ::pliron::r#type::TypeHandle {
+                use ::pliron::r#type::Type;
+                self.get_self_handle(ctx)
+            }
+        }
+
+        #[::pliron::derive::type_interface_impl]
+        impl $crate::interfaces::HasElementType for $ty {
+            fn element_type(&self, ctx: &Context) -> Option<::pliron::r#type::TypeHandle> {
+                use ::pliron::r#type::Type;
+                Some(self.get_self_handle(ctx))
+            }
+        }
+    };
+}
+
+#[type_interface]
+pub trait MaybePackedType {
+    verify_ty_succ!();
+
+    fn packing_factor(&self, ctx: &Context) -> usize;
+}
+
+macro_rules! not_packed {
+    ($ty: ty) => {
+        #[::pliron::derive::type_interface_impl]
+        impl crate::interfaces::MaybePackedType for $ty {
+            fn packing_factor(&self, _ctx: &::pliron::context::Context) -> usize {
+                1
+            }
+        }
+    };
+}
+pub(crate) use not_packed;
+
+#[type_interface]
+pub trait ScalarizableType {
+    verify_ty_succ!();
+    fn scalar_type(&self, ctx: &Context) -> TypeHandle;
+}
+
+#[type_interface]
+pub trait ScalarType {
+    verify_ty_succ!();
+    fn elem_type(&self, ctx: &Context) -> ElemType;
+}
+
+#[type_interface]
+pub trait IndexableType {
+    verify_ty_succ!();
+
+    fn indexed_type(&self, ctx: &Context) -> TypeHandle;
+}
+
+#[type_interface]
+pub trait HasElementType {
+    verify_ty_succ!();
+    fn element_type(&self, ctx: &Context) -> Option<TypeHandle>;
+}
+
+#[op_interface]
+pub trait SimplifyInterface {
+    verify_op_succ!();
+    fn check_fold(&self, ctx: &Context, operand_attrs: &[Option<AttrObj>]) -> Option<Value>;
+}
+
+#[op_interface]
+pub trait CanonicalizeInterface {
+    verify_op_succ!();
+    fn canonicalize(&self, ctx: &mut Context, rewriter: &mut MatchRewriter) -> Result<()>;
+}
+
+#[derive(new, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ExpressionValue(u64);
+
+impl Printable for ExpressionValue {
+    fn fmt(&self, _: &Context, _: &printable::State, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "e{}", self.0)
+    }
+}
+
+#[derive(new, Clone, PartialEq, Eq, Hash)]
+pub struct Expression {
+    pub result_type: TypeHandle,
+    #[new(default)]
+    pub result_idx: usize,
+    pub op_id: OpId,
+    pub operands: Vec<ExpressionValue>,
+    pub attributes: AttributeDict,
+    #[new(default)]
+    pub mem_value: Option<MemoryValue>,
+}
+
+impl Printable for Expression {
+    fn fmt(&self, ctx: &Context, _: &printable::State, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut opds = self.operands.iter().map(|it| it.disp(ctx).to_string());
+        write!(
+            f,
+            "result{} = {} ({}{}) {} : {}",
+            self.result_idx,
+            self.op_id,
+            opds.join(", "),
+            self.mem_value
+                .map(|it| alloc::format!(", {it}"))
+                .unwrap_or_default(),
+            self.attributes.disp(ctx),
+            self.result_type.disp(ctx)
+        )
+    }
+}
+
+impl Debug for Expression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Expression")
+            .field("result_type", &self.result_type)
+            .field("result_idx", &self.result_idx)
+            .field("op_id", &self.op_id.to_string())
+            .field("operands", &self.operands)
+            .field("attributes", &self.attributes)
+            .field("mem_value", &self.mem_value)
+            .finish()
+    }
+}
+
+#[op_interface]
+pub trait ExpressionCanonicalize: OneResultInterface {
+    verify_op_succ!();
+    fn canonical_expression(&self, ctx: &Context, operands: Vec<ExpressionValue>) -> Expression;
+}
+
+#[attr_interface]
+pub trait ConstantAttr: TypedAttrInterface {
+    verify_attr_succ!();
+    fn as_const_val(&self, ctx: &Context) -> ConstantValue;
+    fn as_int(&self, ctx: &Context) -> Option<APInt> {
+        let _ = ctx;
+        None
+    }
+    fn float_as_f64(&self, _ctx: &Context) -> Option<f64> {
+        None
+    }
+}
+
+#[macro_export]
+macro_rules! try_cast_ty {
+    ($ty: expr, $ctx: expr, $interface: ty) => {
+        $crate::prelude::type_cast::<$interface>(&*$ty)
+            .ok_or_else(|| {
+                $crate::alloc::format!(
+                    "Expected type {} {} to implement {}",
+                    $ty.get_type_id(),
+                    $ty.disp($ctx),
+                    stringify!($interface)
+                )
+            })
+            .unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! try_cast_op {
+    ($op: expr, $ctx: expr, $interface: ty) => {
+        $crate::prelude::op_cast::<$interface>(&*$op)
+            .ok_or_else(|| {
+                $crate::alloc::format!(
+                    "Expected op {} {} to implement {}",
+                    $op.get_opid(),
+                    $op.disp($ctx),
+                    stringify!($interface)
+                )
+            })
+            .unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! match_ty {
+    (($handle: expr) { $($ty: ty => $body: expr,)*; _ => $default: expr }) => {
+        (|| {
+            $(if $handle.is::<$ty>() {
+                return $body;
+            })*
+            $default
+        })()
+    };
+    (($handle: expr) { $($ty: ty => $body: expr,)* }) => {
+        (|| {
+            $(if $handle.is::<$ty>() {
+                return $body;
+            })*
+            unreachable!()
+        })()
+    };
+}
+
+pub trait TypedExt: Typed {
+    fn size(&self, ctx: &Context) -> usize {
+        let ty = self.get_type(ctx).deref(ctx);
+        let sized = try_cast_ty!(ty, ctx, dyn SizedType);
+        sized.size(ctx)
+    }
+
+    fn size_bits(&self, ctx: &Context) -> usize {
+        let ty = self.get_type(ctx).deref(ctx);
+        let sized = try_cast_ty!(ty, ctx, dyn SizedType);
+        sized.size_bits(ctx)
+    }
+
+    fn unpacked_size_bits(&self, ctx: &Context) -> usize {
+        self.element_ty(ctx).scalar_ty(ctx).size_bits(ctx) / self.packing_factor(ctx)
+    }
+
+    fn align(&self, ctx: &Context) -> usize {
+        let ty = self.get_type(ctx).deref(ctx);
+        let aligned = try_cast_ty!(ty, ctx, dyn AlignedType);
+        aligned.align(ctx)
+    }
+
+    fn is_ptr(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.is::<PointerType>()
+    }
+
+    fn is_atomic(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.is::<AtomicType>()
+    }
+
+    fn is_vector(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.is::<VectorType>()
+    }
+
+    fn is_vector_of_size(&self, ctx: &Context, size: usize) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.downcast_ref::<VectorType>()
+            .is_some_and(|it| it.vectorization == size)
+    }
+
+    fn is_immutable(&self, ctx: &Context) -> bool {
+        !self.is_ptr(ctx)
+    }
+
+    fn vector_size(&self, ctx: &Context) -> usize {
+        let ty = self.get_type(ctx).deref(ctx);
+        let maybe_vec = try_cast_ty!(ty, ctx, dyn MaybeVectorizedType);
+        maybe_vec.vector_size(ctx)
+    }
+
+    fn try_get_vector_size(&self, ctx: &Context) -> Option<usize> {
+        let ty = self.get_type(ctx).deref(ctx);
+        let maybe_vec = type_cast::<dyn MaybeVectorizedType>(&*ty)?;
+        maybe_vec.try_vector_size(ctx)
+    }
+
+    fn packing_factor(&self, ctx: &Context) -> usize {
+        let ty = self.get_type(ctx).deref(ctx);
+        let maybe_packed = try_cast_ty!(ty, ctx, dyn MaybePackedType);
+        maybe_packed.packing_factor(ctx)
+    }
+
+    fn scalar_ty(&self, ctx: &Context) -> TypeHandle {
+        let ty = self.element_ty(ctx).deref(ctx);
+        let scalarizable = try_cast_ty!(ty, ctx, dyn ScalarizableType);
+        scalarizable.scalar_type(ctx)
+    }
+
+    fn element_ty(&self, ctx: &Context) -> TypeHandle {
+        let ty = self.get_type(ctx).deref(ctx);
+        let has_element_type = try_cast_ty!(ty, ctx, dyn HasElementType);
+        has_element_type
+            .element_type(ctx)
+            .expect("Expected element type to be some")
+    }
+
+    fn unwrap_ptr(&self, ctx: &Context) -> TypeHandle {
+        if let Some(ptr) = self.get_type(ctx).deref(ctx).downcast_ref::<PointerType>() {
+            ptr.inner
+        } else {
+            self.get_type(ctx)
+        }
+    }
+
+    fn try_get_scalar_ty(&self, ctx: &Context) -> Option<TypeHandle> {
+        let ty = self.get_type(ctx).deref(ctx);
+        let scalarizable = type_cast::<dyn ScalarizableType>(&*ty)?;
+        Some(scalarizable.scalar_type(ctx))
+    }
+
+    fn try_get_scalar_elem_ty(&self, ctx: &Context) -> Option<TypeHandle> {
+        let ty = self.get_type(ctx).deref(ctx);
+        let has_elem = type_cast::<dyn HasElementType>(&*ty)?;
+        let ty = has_elem.element_type(ctx)?.deref(ctx);
+        let scalarizable = type_cast::<dyn ScalarizableType>(&*ty)?;
+        Some(scalarizable.scalar_type(ctx))
+    }
+
+    fn is_index(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.is::<IndexType>()
+    }
+
+    fn is_int(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.is::<IntegerType>()
+    }
+
+    fn is_signed_int(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.downcast_ref::<IntegerType>()
+            .is_some_and(|it| it.is_signed())
+    }
+
+    fn is_unsigned_int(&self, ctx: &Context) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.downcast_ref::<IntegerType>()
+            .is_some_and(|it| !it.is_signed())
+    }
+
+    fn is_int_of_width(&self, ctx: &Context, width: usize) -> bool {
+        let ty = self.get_type(ctx).deref(ctx);
+        ty.downcast_ref::<IntegerType>()
+            .is_some_and(|it| it.width() as usize == width)
+    }
+
+    fn is_float64(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<Float64Type>()
+    }
+
+    fn is_float32(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<Float32Type>()
+    }
+
+    fn is_tfloat32(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<TFloat32Type>()
+    }
+
+    fn is_float16(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<Float16Type>()
+    }
+
+    fn is_bfloat16(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<BFloat16Type>()
+    }
+
+    fn is_float(&self, ctx: &Context) -> bool {
+        self.is_float16(ctx)
+            | self.is_float32(ctx)
+            | self.is_float64(ctx)
+            | self.is_tfloat32(ctx)
+            | self.is_bfloat16(ctx)
+    }
+
+    fn is_bool(&self, ctx: &Context) -> bool {
+        self.get_type(ctx).deref(ctx).is::<BoolType>()
+    }
+}
+
+impl<T: Typed> TypedExt for T {}
+
+pub trait TypeExt {
+    fn as_ptr(&self, ctx: &Context) -> PointerType;
+}
+
+impl TypeExt for TypeHandle {
+    fn as_ptr(&self, ctx: &Context) -> PointerType {
+        *TypedHandle::from_handle(*self, ctx)
+            .expect("Should be pointer")
+            .deref(ctx)
+    }
+}
+
+pub trait ValueExt {
+    fn replace_all_uses_except_with(&self, ctx: &Context, except: Use<Value>, other: &Value);
+}
+
+impl ValueExt for Value {
+    fn replace_all_uses_except_with(&self, ctx: &Context, except: Use<Value>, other: &Value) {
+        self.replace_some_uses_with(ctx, |_, r#use| r#use != &except, other);
+    }
+}

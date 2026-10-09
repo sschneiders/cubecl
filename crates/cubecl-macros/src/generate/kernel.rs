@@ -3,19 +3,29 @@ use std::collections::HashMap;
 use darling::usage::{CollectLifetimes as _, CollectTypeParams as _, GenericsExt as _, Purpose};
 use inflections::case::to_snake_case;
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote, quote_spanned};
+use quote::{ToTokens, format_ident, quote, quote_spanned};
 use syn::{Ident, TypeParamBound, parse_quote};
 
 use crate::{
     parse::{
         kernel::{
-            DefinedGeneric, KernelBody, KernelFn, Launch, anon_lifetime_to_static,
+            DefinedGeneric, ExecutionMode, KernelBody, KernelFn, Launch, anon_lifetime_to_static,
             map_type_normalized, strip_ref,
         },
         signature::KernelReturns,
     },
-    paths::{frontend_type, prelude_type},
+    paths::{core_type, frontend_type, prelude_type},
 };
+
+impl ToTokens for ExecutionMode {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        let ty = prelude_type("ExecutionMode");
+        tokens.extend(match self {
+            ExecutionMode::Checked => quote![#ty::Checked],
+            ExecutionMode::Unchecked => quote![#ty::Unchecked],
+        });
+    }
+}
 
 impl KernelFn {
     pub fn to_tokens_mut(&mut self) -> TokenStream {
@@ -120,8 +130,16 @@ impl Launch {
             .comptime_params()
             .map(|param| &param.ty)
             .collect_type_params_cloned(&Purpose::Declare.into(), &declared_type_params);
-        let lifetimes: Vec<_> = declared_lifetimes.difference(&used_lifetimes).collect();
-        let type_params: Vec<_> = declared_type_params.difference(&used_type_params).collect();
+        let lifetimes: Vec<_> = generics
+            .lifetimes()
+            .map(|param| &param.lifetime)
+            .filter(|lifetime| !used_lifetimes.contains(*lifetime))
+            .collect();
+        let type_params: Vec<_> = generics
+            .type_params()
+            .map(|param| &param.ident)
+            .filter(|ident| !used_type_params.contains(*ident))
+            .collect();
 
         (!lifetimes.is_empty() || !type_params.is_empty()).then(
             || quote![__ty: ::core::marker::PhantomData<(#(&#lifetimes (),)* #(#type_params),*)>],
@@ -149,10 +167,23 @@ impl Launch {
 
     pub fn arg_registers(&self) -> (TokenStream, TokenStream) {
         let launch_arg = prelude_type("LaunchArg");
+        let io_attr = prelude_type("BufferIOAttr");
         let mut defined = quote! {};
         let mut args = quote! {};
 
         self.runtime_params().enumerate().for_each(|(i, input)| {
+            // What the signature proves about the argument's buffers: `&T`
+            // cannot be written, so a launch that fails before running leaves
+            // it alone; anything else may be, so it takes the failure. The
+            // compiled kernel's visibility analysis overrides this once the
+            // kernel compiles — this declaration is the answer that survives
+            // compilation failing.
+            let declared = match &input.ty {
+                syn::Type::Reference(r) if r.mutability.is_none() => {
+                    quote![#io_attr::ReadOnly]
+                }
+                _ => quote![#io_attr::ReadWrite],
+            };
             let ty = strip_ref(input.ty.clone());
             let ty = anon_lifetime_to_static(ty);
             let ident = &input.name;
@@ -160,6 +191,7 @@ impl Launch {
 
             args.extend(quote! {#var,});
             defined.extend(quote! {
+                launcher.declare_io(#declared);
                 let #var = <#ty as #launch_arg>::register(#ident, &mut launcher);
             });
         });
@@ -196,6 +228,7 @@ impl Launch {
 
     fn define_body(&self) -> TokenStream {
         let kernel_builder = prelude_type("KernelBuilder");
+        let kernel_metadata = prelude_type("KernelMetadata");
         let io_map = self.io_mappings();
         let mut mapping = HashMap::new();
         for param in self.func.sig.parameters.iter() {
@@ -234,15 +267,15 @@ impl Launch {
             .process_generic_names(&self.func.sig.generics);
 
         quote! {
-            let mut builder = #kernel_builder::default();
-            builder.runtime_properties(__R::target_properties());
-            builder.device_properties(self.client.properties());
+            let __name = <Self as #kernel_metadata>::id(self).entrypoint_name(&self.settings.kernel_name);
+            let mut builder = #kernel_builder::new(self.settings.clone().kernel_name(__name));
+            builder.runtime_properties(self.target_properties.as_ref().clone());
+            builder.device_properties(&self.device_properties);
 
             #register_type
-            self.settings.address_type.register(&mut builder.scope);
             #io_map
             expand #generics(&mut builder.scope, #(#args,)*);
-            builder.build(self.settings.clone())
+            builder.build()
         }
     }
 
@@ -351,10 +384,12 @@ impl Launch {
             let kernel_metadata = prelude_type("KernelMetadata");
             let cube_kernel = prelude_type("CubeKernel");
             let kernel_settings = prelude_type("KernelSettings");
-            let compute_client = prelude_type("ComputeClient");
+            let device_properties = prelude_type("DeviceProperties");
+            let target_properties = prelude_type("TargetProperties");
+            let private = core_type("__private");
             let kernel_definition: syn::Path = prelude_type("KernelDefinition");
             let kernel_id = prelude_type("KernelId");
-            let storage_ty = prelude_type("StorageType");
+            let elem_ty = prelude_type("ElemType");
 
             let kernel_name = self.kernel_name();
             let define = self.define_body();
@@ -384,14 +419,15 @@ impl Launch {
                 settings.extend(quote![.debug_symbols()]);
             }
             if let Some(cluster_dim) = &self.args.cluster_dim {
-                settings.extend(quote![.cluster_dim(#cluster_dim)]);
+                settings.extend(quote![.cluster_dim(#cluster_dim.into())]);
             }
 
             quote! {
                 #[doc = #kernel_doc]
                 pub struct #kernel_name #generics #where_clause {
                     settings: #kernel_settings,
-                    client: #compute_client<__R>,
+                    device_properties: #private::Arc<#device_properties>,
+                    target_properties: #private::Arc<#target_properties>,
                     #(#compilation_args,)*
                     #(#const_params,)*
                     #phantom_data
@@ -403,12 +439,14 @@ impl Launch {
                 impl #generics #kernel_name #generic_names #where_clause {
                     pub fn new(
                         settings: #kernel_settings,
-                        client: #compute_client<__R>,
+                        device_properties: #private::Arc<#device_properties>,
+                        target_properties: #private::Arc<#target_properties>,
                         #(#compilation_args,)*
                         #(#const_params),*) -> Self {
                         Self {
                             settings: #settings,
-                            client,
+                            device_properties,
+                            target_properties,
                             #(#args,)*
                             #(#param_names,)*
                             #phantom_data_init
@@ -425,13 +463,14 @@ impl Launch {
                         #kernel_id::new::<Self>()
                             .address_type(address_type)
                             .cube_dim(self.settings.cube_dim.clone())
+                            .mode(self.settings.execution_mode)
                             .info(#info_ty_name #info_generics {
                                 #(#info_names: self.#info_names.clone(),)*
                                 #phantom_data_init
                             })
                     }
 
-                    fn address_type(&self) -> #storage_ty {
+                    fn address_type(&self) -> #elem_ty {
                         self.settings.address_type.unsigned_type()
                     }
                 }
@@ -471,7 +510,7 @@ impl Launch {
             settings.extend(quote![.debug_symbols()]);
         }
         if let Some(cluster_dim) = &self.args.cluster_dim {
-            settings.extend(quote![.cluster_dim(#cluster_dim)]);
+            settings.extend(quote![.cluster_dim(#cluster_dim.into())]);
         }
 
         let generics = &self.kernel_generics;
