@@ -107,6 +107,22 @@ fn a_relay_loads_what_its_cubes_write_coherently() {
     }
 }
 
+/// A `sync_storage` publishes at device scope on both sides of the cube barrier: the
+/// PTX carries the paired acq-rel device fences (the megakernel handoff contract).
+#[test]
+fn sync_storage_lowering_carries_the_device_fences() {
+    let ptx = ptx_of(relay_kernel(Wait::Load), 70);
+    let fences = ptx.matches("fence.acq_rel.gpu").count();
+    assert!(
+        fences >= 2,
+        "sync_storage lowers to a release fence, the barrier, and an acquire fence:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("barrier.cta.sync") || ptx.contains("bar.sync"),
+        "the cube barrier:\n{ptx}"
+    );
+}
+
 /// An `atomic_add` whose result is dropped observes no other cube, so the input beside it still
 /// loads through the non-coherent cache.
 #[test]
