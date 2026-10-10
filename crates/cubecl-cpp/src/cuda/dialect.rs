@@ -68,9 +68,15 @@ cuda_op!(SyncOp, |op, ctx| {
     match op.scope(ctx).0 {
         SyncScope::Plane => "__syncwarp();\n",
         SyncScope::Cube => "__syncthreads();\n",
-        // `__syncthreads` orders this block's memory for this block. The fence is what carries
-        // the writes out to device scope, so a cube that synchronizes later reads them.
-        SyncScope::Device => "__threadfence();\n__syncthreads();\n",
+        // `__syncthreads` orders this block's memory for this block. The fences are what carry
+        // the writes out to device scope and pull the other cubes' writes in: the fence
+        // RELEASE before the barrier publishes this cube's plain stores at device scope, and
+        // the fence ACQUIRE after the barrier orders every later (weak) load after the other
+        // cubes' published stores — without it a reader SM's L1 keeps serving lines it cached
+        // earlier in the launch (measured on the mai megakernel: cross-cube handoffs lost
+        // deterministically). Mirrors the LLVM/NVPTX path's paired fence.acq_rel.gpu around
+        // barrier.cta (upstream #1654).
+        SyncScope::Device => "__threadfence();\n__syncthreads();\n__threadfence();\n",
         SyncScope::Unit => "",
     }
     .into()

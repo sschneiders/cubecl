@@ -41,9 +41,10 @@ __builtin_amdgcn_fence(__ATOMIC_ACQ_REL, \"wavefront\");
 __builtin_amdgcn_wave_barrier();\n"
         }
         SyncScope::Cube => "__syncthreads();\n",
-        // As on CUDA: `__syncthreads` is the block's own ordering, and the fence is what makes
-        // this block's writes visible to the others.
-        SyncScope::Device => "__threadfence();\n__syncthreads();\n",
+        // As on CUDA: `__syncthreads` is the block's own ordering, and the fences make this
+        // block's writes visible to the others and the others' writes visible here (the
+        // acquire side of the pair — see the cuda dialect's note).
+        SyncScope::Device => "__threadfence();\n__syncthreads();\n__threadfence();\n",
         SyncScope::Unit => "",
     }
     .into()
