@@ -516,7 +516,7 @@ impl Client {
     /// changes.
     pub fn interop<S: ServerStorage, Re: Send>(
         &self,
-        task: impl FnOnce(&mut S, StreamId) -> Re + Send,
+        task: impl FnOnce(&mut S, StreamId) -> Result<Re, ServerError> + Send,
     ) -> Result<Re, ServerError> {
         let stream_id = self.stream_id();
         if !self.is_service::<S>() {
@@ -532,7 +532,7 @@ impl Client {
                 let server = (server as &mut dyn Any)
                     .downcast_mut::<S>()
                     .expect("is_service passed, so this is the server's type");
-                Ok(task(server, stream_id))
+                task(server, stream_id)
             })
             .unwrap_or_resume()
     }
