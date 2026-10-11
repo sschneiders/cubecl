@@ -8,6 +8,7 @@ mod device;
 mod runtime;
 
 pub use compiler::{CudaCompilationOptions, CudaCompiler, CudaRepresentation};
+pub use compute::CudaServer;
 pub use device::*;
 pub use runtime::*;
 
