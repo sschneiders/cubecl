@@ -499,6 +499,44 @@ impl Client {
             .unwrap_or_resume()
     }
 
+    /// Run `task` once against the concrete server `S`, with this client's
+    /// current stream id handed in as the second argument — the escape hatch
+    /// for native-library interop (cuBLASLt: the raw `CUstream` and the device
+    /// pointers behind a batch of handles, resolved in ONE device-actor round
+    /// trip instead of one per resource).
+    ///
+    /// The same claim check as [`Client::get_resource`] guards it: a task
+    /// naming a server type this client doesn't run is refused, never
+    /// downcast blindly. The task runs on the device actor thread (like every
+    /// submit), so it must be `Send` and must not block on device work —
+    /// metadata lookups and raw-resolve reads only.
+    ///
+    /// Additive fork patch (perf-gemm-interop, 2026-10-11): mirrors
+    /// [`Client::get_resource`]'s submit path verbatim; no existing path
+    /// changes.
+    pub fn interop<S: ServerStorage, Re: Send>(
+        &self,
+        task: impl FnOnce(&mut S, StreamId) -> Re + Send,
+    ) -> Result<Re, ServerError> {
+        let stream_id = self.stream_id();
+        if !self.is_service::<S>() {
+            return Err(ServerError::ServiceMismatch {
+                client: format!("{}", self.service_id()),
+                requested: String::from(core::any::type_name::<S>()),
+                backtrace: BackTrace::capture(),
+            });
+        }
+
+        self.device
+            .submit_blocking(move |server| {
+                let server = (server as &mut dyn Any)
+                    .downcast_mut::<S>()
+                    .expect("is_service passed, so this is the server's type");
+                Ok(task(server, stream_id))
+            })
+            .unwrap_or_resume()
+    }
+
     fn do_create_from_slices(
         &self,
         descriptors: Vec<MemoryLayoutDescriptor>,

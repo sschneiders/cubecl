@@ -616,6 +616,25 @@ impl CudaServer {
         self.ctx.comm_stream
     }
 
+    /// The raw `CUstream` that `stream_id` currently resolves to, cast to
+    /// `u64` so it can cross the `Client::interop` boundary as a plain
+    /// integer — the library-interop seam (cuBLASLt launches on the SAME
+    /// stream cubecl's kernels run on, so stream ordering needs no event
+    /// plumbing).
+    ///
+    /// Mirrors [`Self::command`]'s resolve path (context current + stream
+    /// resolve) but touches no bindings, so no cross-stream alignment runs —
+    /// ordering against kernels already enqueued on this stream is the CUDA
+    /// stream's own in-order guarantee.
+    ///
+    /// Additive fork patch (perf-gemm-interop, 2026-10-11): no existing path
+    /// changes.
+    pub fn interop_raw_stream(&mut self, stream_id: StreamId) -> Result<u64, ServerError> {
+        self.unsafe_set_current();
+        let mut streams = self.streams.resolve(stream_id, [].into_iter())?;
+        Ok(streams.current().sys as u64)
+    }
+
     fn command_no_inputs(&mut self, stream_id: StreamId) -> Result<Command<'_>, ServerError> {
         self.command(stream_id, [].into_iter())
     }
