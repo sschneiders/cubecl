@@ -6,6 +6,8 @@ pub(crate) mod driver;
 pub(crate) mod events;
 pub(crate) mod modules;
 #[cfg(test)]
+mod asm_ordering;
+#[cfg(test)]
 mod register_budget;
 pub(crate) mod storage;
 pub(crate) mod stream;

@@ -99,6 +99,10 @@ pub(super) fn load_ptx(ctx: &Context, op: &LoadOp) -> String {
     let buffer_reg = format_reg_and_inc(&mut reg_count);
     let (stride_reg, stride_constraint) =
         get_value_regs_decl_constraints(ctx, stride, false, &mut reg_count);
+    // The load reads memory the host compiler cannot see through the
+    // constraints alone: the `"memory"` clobber makes the read an ordering
+    // point, so the compiler cannot move it across a fence in either
+    // direction.
     format!(
         r#"// load
 {{
@@ -107,6 +111,7 @@ asm volatile(
     "{{{regs_decl}}}, [{buffer_reg}], {stride_reg};\n"
     : {out_constraints}
     : "l"({ptr}){stride_constraint}
+    : "memory"
 );
 }}
 "#
@@ -139,6 +144,9 @@ pub(super) fn store_ptx(ctx: &Context, op: &StoreOp) -> String {
     // we start at 2 because of the buffer address calculation
     let (regs_decl, in_constraints) =
         get_value_regs_decl_constraints(ctx, matrix, false, &mut reg_count);
+    // The store writes memory the constraints do not name: the `"memory"`
+    // clobber makes it an ordering barrier for the host compiler, so a store
+    // cannot move past a fence that publishes it.
     format!(
         r#"// store
 asm volatile(
@@ -147,6 +155,7 @@ asm volatile(
     :
     : "l"({destination}),
       {in_constraints}{stride_constraint}
+    : "memory"
 );
 "#
     )
