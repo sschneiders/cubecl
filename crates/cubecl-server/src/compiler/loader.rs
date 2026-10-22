@@ -650,7 +650,7 @@ impl<'k, T: CompilationTarget> Job<'k, T> {
         }
 
         finalizing.insert(source.clone());
-        if let Some(artifact) = target.stored_for_source(source) {
+        if let Some(artifact) = target.stored_for_source(&self.id, source) {
             self.step = Step::Ready {
                 artifact,
                 source: Some(source.clone()),
@@ -691,7 +691,7 @@ impl<'k, T: CompilationTarget> Job<'k, T> {
             else {
                 unreachable!("matched right above");
             };
-            self.step = match target.stored_for_source(&source) {
+            self.step = match target.stored_for_source(&self.id, &source) {
                 Some(artifact) => Step::Ready {
                     artifact,
                     source: Some(source),
@@ -1492,7 +1492,7 @@ mod tests {
             }
         }
 
-        fn stored_for_source(&mut self, source: &str) -> Option<u32> {
+        fn stored_for_source(&mut self, _id: &ArtifactId<()>, source: &str) -> Option<u32> {
             self.by_source.remove(source)
         }
 

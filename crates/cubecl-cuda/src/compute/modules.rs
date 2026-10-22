@@ -60,6 +60,30 @@ impl CudaModules {
             compiler,
         }
     }
+
+    /// A `CudaModules` over a store opened unconditionally, whatever the
+    /// configuration says the compilation cache should be — the tests of the
+    /// store's behavior cannot drive that process global without racing
+    /// whatever read it first.
+    #[cfg(test)]
+    pub(crate) fn with_store(compiler: CudaArtifactCompiler, backend: CudaBackend) -> Self {
+        let fingerprint = cache_namespace(
+            &format!("ptx_sm{}", compiler.arch().version),
+            backend,
+            compiler.options().ptx_version,
+        );
+
+        Self {
+            ptx_store: ArtifactStore::open(
+                StoreNames {
+                    kernels: "cuda",
+                    sources: "cuda-second-line",
+                },
+                fingerprint,
+            ),
+            compiler,
+        }
+    }
 }
 
 impl CompilationTarget for CudaModules {
@@ -78,8 +102,19 @@ impl CompilationTarget for CudaModules {
         self.ptx_store.take(&id.kernel)
     }
 
-    fn stored_for_source(&mut self, source: &str) -> Option<CudaArtifact> {
-        self.ptx_store.take_by_source(source)
+    fn stored_for_source(&mut self, id: &ArtifactId<()>, source: &str) -> Option<CudaArtifact> {
+        // The second chance crosses kernel ids: what it serves was finalized
+        // for another kernel, whose register budget the asking kernel's own
+        // id need not carry. The budget changes the machine code — the PTX
+        // declares it where the backend can, and the load JITs under it
+        // (see `load`) — so an artifact only ever moves between kernels that
+        // declare the same one. A mismatch leaves the entry for the kernel
+        // it belongs to (`take_by_source` clones rather than removes a
+        // same-build entry): the asker finalizes and keeps its own, under
+        // its own budget, and the id's budget byte keeps cached runs
+        // reproducible.
+        let artifact = self.ptx_store.take_by_source(source)?;
+        (artifact.max_registers == id.kernel.max_registers).then_some(artifact)
     }
 
     fn load(
@@ -88,6 +123,15 @@ impl CompilationTarget for CudaModules {
         artifact: &CudaArtifact,
     ) -> Result<CudaCompiledKernel, CompilationError> {
         dump_ptx(&id.kernel, &artifact.ptx);
+        if std::env::var_os("CUBECL_DEBUG_MAXREG").is_some() {
+            eprintln!(
+                "[maxreg] load kernel={} id_max_registers={:?} artifact_max_registers={:?} cubin_bytes={}",
+                id.kernel.short_name(),
+                id.kernel.max_registers,
+                artifact.max_registers,
+                artifact.cubin.len(),
+            );
+        }
 
         let func_name = CString::new(artifact.entrypoint_name.clone()).unwrap();
         // SAFETY: `cubin` is machine code a driver assembled for this device's architecture, and

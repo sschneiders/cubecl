@@ -112,8 +112,18 @@ pub trait CompilationTarget {
     /// [`ArtifactCompiler::source`] — for [`store`](Self::store) to
     /// put back under the kernel asking. `None`, the default, for a backend
     /// that keeps no artifact by source.
-    fn stored_for_source(&mut self, source: &str) -> Option<ArtifactOf<Self>> {
-        let _ = source;
+    ///
+    /// `id` is the asking kernel's, so a backend whose artifact carries
+    /// per-kernel compilation state can refuse what was finalized under a
+    /// different one: whatever the state is, it is in the kernel id (see
+    /// [`KernelId`]), and an artifact that does not match the kernel asking
+    /// must not be handed to it.
+    fn stored_for_source(
+        &mut self,
+        id: &ArtifactId<VariantOf<Self>>,
+        source: &str,
+    ) -> Option<ArtifactOf<Self>> {
+        let _ = (id, source);
         None
     }
 

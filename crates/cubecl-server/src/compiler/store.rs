@@ -160,6 +160,38 @@ impl<A: StoreValue> ArtifactStore<A> {
         }
     }
 
+    /// [`with_sources`](Self::with_sources) over databases opened directly,
+    /// whatever the configuration says the compilation cache should be. For
+    /// tests (and embedders that manage their own storage): the
+    /// configuration is a process global, so a test that needs a live store
+    /// cannot rely on it without racing whatever read it first.
+    pub fn open(names: StoreNames, fingerprint: impl AsRef<str>) -> Self {
+        fn open_store<K: StoreKey, V: StoreValue>(
+            name: &'static str,
+            fingerprint: &str,
+        ) -> Option<Store<K, V>> {
+            #[cfg(compilation_cache)]
+            {
+                Some(Store::new(
+                    StoreOptions::new()
+                        .storage(Namespace::scoped(name, fingerprint))
+                        .cache(CacheOption::Lazy),
+                ))
+            }
+            #[cfg(not(compilation_cache))]
+            {
+                let _ = (name, fingerprint);
+                None
+            }
+        }
+
+        Self {
+            by_kernel: open_store(names.kernels, fingerprint.as_ref()),
+            by_source: open_store(names.sources, fingerprint.as_ref()),
+            build_id: build_id_hash(),
+        }
+    }
+
     /// Whether anything is kept between runs, which is what binds a backend's
     /// loaded kernels to the active environment.
     pub fn persists(&self) -> bool {

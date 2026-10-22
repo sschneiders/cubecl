@@ -149,25 +149,28 @@ mod tests {
         }
     }
 
-    /// Compiles `kernel` for `backend` and loads it the way the runtime does,
-    /// returning the artifact (with its PTX) and the loaded function.
-    fn compile_and_load(
-        backend: CudaBackend,
+    /// The id `hog_kernel(cap, ..)` compiles under.
+    fn hog_id(
         cap: Option<u32>,
-        context: *mut CUctx_st,
-    ) -> (CudaArtifact, *mut sys::CUfunc_st) {
-        let (arch, sm_arch) = arch_of();
-        let client = CudaRuntime::client(&Default::default());
-        let properties = client.properties_shared();
-        drop(client);
-        let compiler =
-            CudaArtifactCompiler::new((*properties).clone(), options_of(sm_arch), arch, context);
-        let client = CudaRuntime::client(&Default::default());
-        let (properties, target_properties) = (
-            client.properties_shared(),
-            client.target_properties_shared(),
-        );
-        drop(client);
+        properties: Arc<DeviceProperties>,
+        target_properties: Arc<TargetProperties>,
+    ) -> ArtifactId<()> {
+        ArtifactId {
+            kernel: hog_kernel(cap, properties, target_properties).id(),
+            variant: (),
+        }
+    }
+
+    /// Lowers and finalizes `hog_kernel(cap, ..)` with `compiler`, the
+    /// compilation half of [`compile_and_load`], for the tests that keep the
+    /// artifact themselves.
+    fn finalize_kernel(
+        cap: Option<u32>,
+        backend: CudaBackend,
+        compiler: &CudaArtifactCompiler,
+        properties: Arc<DeviceProperties>,
+        target_properties: Arc<TargetProperties>,
+    ) -> CudaArtifact {
         let kernel = hog_kernel(cap, properties, target_properties);
         let id = ArtifactId {
             kernel: kernel.id(),
@@ -183,9 +186,35 @@ mod tests {
             )
         })
         .expect("the probe kernel compiles");
-        let artifact = compiler
+        compiler
             .finalize(&id, lowered)
-            .expect("the artifact finalizes");
+            .expect("the artifact finalizes")
+    }
+
+    /// Compiles `kernel` for `backend` and loads it the way the runtime does,
+    /// returning the artifact (with its PTX) and the loaded function.
+    fn compile_and_load(
+        backend: CudaBackend,
+        cap: Option<u32>,
+        context: *mut CUctx_st,
+    ) -> (CudaArtifact, *mut sys::CUfunc_st) {
+        let (arch, sm_arch) = arch_of();
+        let client = CudaRuntime::client(&Default::default());
+        let (properties, target_properties) = (
+            client.properties_shared(),
+            client.target_properties_shared(),
+        );
+        drop(client);
+        let compiler =
+            CudaArtifactCompiler::new((*properties).clone(), options_of(sm_arch), arch, context);
+        let artifact = finalize_kernel(
+            cap,
+            backend,
+            &compiler,
+            properties.clone(),
+            target_properties.clone(),
+        );
+        let id = hog_id(cap, properties, target_properties);
         let mut modules = CudaModules::new(compiler, backend);
         let loaded = modules.load(&id, &artifact).expect("the artifact loads");
         (artifact, loaded.func)
@@ -294,6 +323,87 @@ mod tests {
         assert!(
             regs_capped < regs_uncapped,
             "the option changed the allocation: {regs_capped} capped against {regs_uncapped} free"
+        );
+    }
+
+    /// The compilation store's by-source second chance never moves an
+    /// artifact across budgets. What that path serves was finalized for
+    /// ANOTHER kernel — one whose text the asking kernel's compilation
+    /// reproduces — and the budget is part of what a kernel id vouches for:
+    /// it is in the id, it shapes the machine code, and the load enforces
+    /// it. The poisoned-cache shape this closes: a kernel whose id carries a
+    /// cap, whose text an uncapped compilation already finalized (a
+    /// no-op-cap sweep run, an artifact persisted before the budget
+    /// existed), used to take that artifact and load at its natural register
+    /// count — past its own budget, with no load error.
+    #[test]
+    fn a_source_second_chance_never_crosses_the_budget() {
+        let context = current_primary_context();
+        let (arch, sm_arch) = arch_of();
+        let client = CudaRuntime::client(&Default::default());
+        let (properties, target_properties) = (
+            client.properties_shared(),
+            client.target_properties_shared(),
+        );
+        drop(client);
+        let compiler = CudaArtifactCompiler::new(
+            (*properties).clone(),
+            options_of(sm_arch),
+            arch,
+            context,
+        );
+        // The store opened unconditionally: the configured one is a process
+        // global the tests cannot race for.
+        let mut modules = CudaModules::with_store(compiler, CudaBackend::Cpp);
+        assert!(
+            modules.persists(),
+            "the test needs the by-source store live"
+        );
+
+        const SOURCE: &str = "the text an earlier kernel finalized";
+
+        // An uncapped kernel finalizes first and keeps its artifact by
+        // source.
+        let artifact_uncapped = finalize_kernel(
+            None,
+            CudaBackend::Cpp,
+            modules.compiler(),
+            properties.clone(),
+            target_properties.clone(),
+        );
+        assert!(
+            artifact_uncapped.max_registers.is_none(),
+            "the first finalization is the uncapped one"
+        );
+        let id_uncapped = hog_id(None, properties.clone(), target_properties.clone());
+        assert!(
+            modules.store(&id_uncapped, artifact_uncapped, Some(SOURCE)),
+            "the store keeps the artifact"
+        );
+
+        // The same budget asks by the source and is served — the sharing
+        // that makes the second chance worth having.
+        assert!(
+            modules.stored_for_source(&id_uncapped, SOURCE).is_some(),
+            "the artifact is served to a kernel of the same budget"
+        );
+
+        // A capped kernel asking by the same source is refused ...
+        let id_capped = hog_id(Some(CAP), properties.clone(), target_properties.clone());
+        assert_ne!(
+            id_uncapped.kernel.stable_hash(),
+            id_capped.kernel.stable_hash(),
+            "the budget is what separates the two ids"
+        );
+        assert!(
+            modules.stored_for_source(&id_capped, SOURCE).is_none(),
+            "an artifact finalized under another budget is never served across it"
+        );
+
+        // ... and the entry survives for the kernel it belongs to.
+        assert!(
+            modules.stored_for_source(&id_uncapped, SOURCE).is_some(),
+            "the refused ask leaves the entry to its own kernel"
         );
     }
 }
