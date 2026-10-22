@@ -107,6 +107,13 @@ impl<C: Compiler> CompiledKernel<C> {
         let entrypoint_name = definition.settings.kernel_name.clone();
         let cube_dim = definition.settings.cube_dim.into();
         let max_registers = definition.settings.max_registers;
+        #[cfg(feature = "std")]
+        if std::env::var_os("CUBECL_DEBUG_MAXREG").is_some() {
+            std::eprintln!(
+                "[maxreg] compile kernel={} def_max_registers={max_registers:?}",
+                definition.settings.kernel_name
+            );
+        }
 
         // A hand-written kernel is already in the target language: there is no
         // IR to hand the compiler, so neither analysis it produces exists.

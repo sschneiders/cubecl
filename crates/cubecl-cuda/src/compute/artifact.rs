@@ -159,6 +159,13 @@ impl ArtifactCompiler for CudaArtifactCompiler {
     ) -> Result<Self::Artifact, LaunchError> {
         let io = lowered.io.take();
         let max_registers = lowered.max_registers;
+        if std::env::var_os("CUBECL_DEBUG_MAXREG").is_some() {
+            eprintln!(
+                "[maxreg] finalize entry={} backend={:?} lowered_max_registers={max_registers:?}",
+                lowered.entrypoint_name,
+                backend_of(&lowered),
+            );
+        }
         let (ptx, shared_mem_bytes) = match (backend_of(&lowered), &lowered.repr) {
             // What the LLVM backend hands back is already PTX, so no `nvrtc*`
             // call belongs here. The driver still JITs it when the module
