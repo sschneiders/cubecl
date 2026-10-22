@@ -1,12 +1,14 @@
 pub(crate) mod artifact;
+#[cfg(test)]
+mod asm_ordering;
 pub(crate) mod capture;
 pub(crate) mod communication;
+#[cfg(test)]
+mod comptime_init;
 pub(crate) mod context;
 pub(crate) mod driver;
 pub(crate) mod events;
 pub(crate) mod modules;
-#[cfg(test)]
-mod asm_ordering;
 #[cfg(test)]
 mod register_budget;
 pub(crate) mod storage;

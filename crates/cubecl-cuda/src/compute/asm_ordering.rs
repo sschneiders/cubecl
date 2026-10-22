@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::{CudaBackend, CudaCompilationOptions, CudaCompiler};
     use crate::CudaRuntime;
+    use crate::compiler::{CudaBackend, CudaCompilationOptions, CudaCompiler};
     use cubecl_core::ir::nvidia::SmArch;
     use cubecl_core::prelude::*;
     // The expansion refers to `::cubecl`.
@@ -59,8 +59,10 @@ mod tests {
 
     fn probe_kernel_source(backend: CudaBackend) -> String {
         let client = CudaRuntime::client(&Default::default());
-        let (properties, target_properties) =
-            (client.properties_shared(), client.target_properties_shared());
+        let (properties, target_properties) = (
+            client.properties_shared(),
+            client.target_properties_shared(),
+        );
         drop(client);
         let settings = KernelSettings::new(
             *CubeDim::new_1d(32),
@@ -144,8 +146,10 @@ mod tests {
     #[test]
     fn nomem_asm_carries_no_memory_clobber() {
         let client = CudaRuntime::client(&Default::default());
-        let (properties, target_properties) =
-            (client.properties_shared(), client.target_properties_shared());
+        let (properties, target_properties) = (
+            client.properties_shared(),
+            client.target_properties_shared(),
+        );
         drop(client);
         let settings = KernelSettings::new(
             *CubeDim::new_1d(32),

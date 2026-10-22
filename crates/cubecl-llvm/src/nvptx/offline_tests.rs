@@ -35,7 +35,10 @@ fn a_register_budget_is_declared_in_the_ptx() {
         "the budget the kernel asked for:\n{capped}"
     );
     let free = ptx_of(scale_kernel(AddressType::U32), 80);
-    assert!(!free.contains(".maxnreg"), "no budget, no directive:\n{free}");
+    assert!(
+        !free.contains(".maxnreg"),
+        "no budget, no directive:\n{free}"
+    );
 }
 
 #[test]

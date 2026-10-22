@@ -271,6 +271,25 @@ impl Expression {
         }
     }
 
+    /// A comptime-known value of a native (Rust scalar) type, as source tokens.
+    ///
+    /// At expansion time such a value is a plain Rust value, not an expand —
+    /// and `IntoMut` for the native types keeps plain values plain. A mutable
+    /// local initialized from one must therefore be routed through its expand
+    /// first, or it never gets a memory slot and the first assignment to it
+    /// emits a store whose destination is the value itself.
+    pub fn as_const_native(&self, _context: &mut Context) -> Option<TokenStream> {
+        match self {
+            Expression::Variable(ManagedVar {
+                name,
+                ty: Some(ty),
+                is_const: true,
+                ..
+            }) if is_native_ty(ty) => Some(quote![#name]),
+            _ => None,
+        }
+    }
+
     pub fn as_const(&self, context: &mut Context) -> Option<TokenStream> {
         match self {
             Expression::Literal { value, .. } => Some(quote![#value]),
@@ -478,5 +497,15 @@ mod tests {
             }
             .is_always_pure()
         );
+    }
+}
+
+/// Whether `ty` names one of the native (Rust scalar) cube primitives.
+fn is_native_ty(ty: &Type) -> bool {
+    match ty {
+        Type::Path(path) => path.path.get_ident().is_some_and(|ident| {
+            crate::parse::expression::PRIMITIVES.contains(&ident.to_string().as_str())
+        }),
+        _ => false,
     }
 }

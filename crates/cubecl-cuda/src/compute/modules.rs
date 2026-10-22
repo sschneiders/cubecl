@@ -102,13 +102,14 @@ impl CompilationTarget for CudaModules {
             // a newer driver than this one, which refuses it: the PTX is
             // then assembled here instead.
             let module = match artifact.max_registers {
-                Some(registers) => load_with_register_budget(&artifact.ptx, registers)
-                    .map_err(|err| CompilationError::Generic {
+                Some(registers) => load_with_register_budget(&artifact.ptx, registers).map_err(
+                    |err| CompilationError::Generic {
                         reason: format!(
                             "Unable to load the PTX with a budget of {registers} registers: {err}"
                         ),
                         backtrace: BackTrace::capture(),
-                    })?,
+                    },
+                )?,
                 None => cudarc::driver::result::module::load_data(
                     artifact.cubin.as_ptr() as *const std::ffi::c_void
                 )

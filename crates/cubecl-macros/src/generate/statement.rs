@@ -24,6 +24,17 @@ impl Statement {
                     {
                         let expand = frontend_type("NativeExpand");
                         Some(quote_spanned![as_const.span()=> #expand::from_lit(scope, #as_const)])
+                    } else if let Some(native) =
+                        init.as_ref().and_then(|it| it.as_const_native(context))
+                    {
+                        // A comptime value of native type is a plain Rust
+                        // value at expansion, and `IntoMut` for the native
+                        // types keeps plain values plain. Route it through
+                        // its expand so the local gets a memory slot —
+                        // otherwise the first assignment stores into the
+                        // value itself, which is not a pointer.
+                        let expand = frontend_type("NativeExpand");
+                        Some(quote_spanned![native.span()=> #expand::from_lit(scope, #native)])
                     } else if let Some(as_const) = init.as_ref().and_then(|it| it.as_const(context))
                     {
                         Some(quote_spanned![as_const.span()=> #as_const.clone()])

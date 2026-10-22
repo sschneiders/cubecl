@@ -4,15 +4,17 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::CudaRuntime;
     use crate::compiler::{CudaBackend, CudaCompilationOptions, CudaCompiler};
     use crate::compute::artifact::{CudaArtifact, CudaArtifactCompiler};
     use crate::compute::modules::{CudaModules, load_with_register_budget};
-    use crate::CudaRuntime;
     use cubecl_core as cubecl;
     use cubecl_core::ir::nvidia::SmArch;
     use cubecl_core::prelude::*;
     use cubecl_cpp::cuda::arch::CudaArchitecture;
-    use cubecl_server::compiler::{ArtifactCompiler, ArtifactId, CompilationRecording, CompilationTarget};
+    use cubecl_server::compiler::{
+        ArtifactCompiler, ArtifactId, CompilationRecording, CompilationTarget,
+    };
     use cubecl_server::kernel::CompiledKernel;
     use cubecl_server::runtime::Runtime;
     use cudarc::driver::sys::{self, CUctx_st, CUfunction_attribute};
@@ -161,8 +163,10 @@ mod tests {
         let compiler =
             CudaArtifactCompiler::new((*properties).clone(), options_of(sm_arch), arch, context);
         let client = CudaRuntime::client(&Default::default());
-        let (properties, target_properties) =
-            (client.properties_shared(), client.target_properties_shared());
+        let (properties, target_properties) = (
+            client.properties_shared(),
+            client.target_properties_shared(),
+        );
         drop(client);
         let kernel = hog_kernel(cap, properties, target_properties);
         let id = ArtifactId {
@@ -179,7 +183,9 @@ mod tests {
             )
         })
         .expect("the probe kernel compiles");
-        let artifact = compiler.finalize(&id, lowered).expect("the artifact finalizes");
+        let artifact = compiler
+            .finalize(&id, lowered)
+            .expect("the artifact finalizes");
         let mut modules = CudaModules::new(compiler, backend);
         let loaded = modules.load(&id, &artifact).expect("the artifact loads");
         (artifact, loaded.func)
@@ -192,7 +198,10 @@ mod tests {
         let context = current_primary_context();
         let (_, func) = compile_and_load(CudaBackend::Cpp, None, context);
         let regs = num_regs(func);
-        assert!(regs > CAP, "{regs} registers without a cap, the cap is {CAP}");
+        assert!(
+            regs > CAP,
+            "{regs} registers without a cap, the cap is {CAP}"
+        );
     }
 
     /// The C++ backend capped: the module load JITs the PTX with the budget,
