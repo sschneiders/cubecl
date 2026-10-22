@@ -83,7 +83,19 @@ fn gen_param(ctx: &Context, func: &FuncOp, i: usize, arg: Value) -> String {
     }
     segments.push(arg.get_type(ctx).to_cpp(ctx));
     segments.push("const".into());
-    if arg.is_ptr(ctx) || arg.is_uniform_ptr(ctx) {
+    // __restrict__ on DEVICE-function params is a false promise the moment
+    // a caller passes the same buffer through different params of two
+    // inlined helpers (the megakernel pattern: one workspace slab read as
+    // one helper's `a` and written as another's `c_out`). NVRTC then (a)
+    // serves the helper's loads through the read-only cache
+    // (ld.global.nc), which the other helper's stores do not invalidate,
+    // and (b) reorders loads against those stores — measured corruption
+    // that varies per launch. Entry kernels keep __restrict__: their
+    // params are distinct buffers, and the RO-cache weight-read path
+    // rides on it.
+    if (arg.is_ptr(ctx) || arg.is_uniform_ptr(ctx))
+        && func.get_entrypoint_abi(ctx).is_some()
+    {
         segments.push("__restrict__".into());
     }
     segments.push(arg.name(ctx).to_string());
