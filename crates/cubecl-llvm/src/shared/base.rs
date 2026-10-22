@@ -35,7 +35,12 @@ use core::cell::RefCell;
 use cubecl_core::ir::nvidia::SmArch;
 use cubecl_core::{
     Compiler,
-    ir::{amd::GfxArch, dialect::scf::BranchToSCFPass, metadata::Info, rewrite::SimplifyOpsPass},
+    ir::{
+        amd::GfxArch,
+        dialect::scf::BranchToSCFPass,
+        metadata::Info,
+        rewrite::{CanonicalizePass, SimplifyOpsPass},
+    },
     post_processing::{
         bf16::LowerWideBf16CastPass,
         bitwise::PromoteBitwisePass,
@@ -48,7 +53,7 @@ use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::bytes::Bytes;
 use cubecl_opt::passes::{
     annotate_buffer_visibility::AnnotateGlobalVisibilityPass, inst_combine::InstCombinePass,
-    sccp::SCCPPass, simple_cse::SimpleCSEPass, sroa::SROAPass,
+    resolve_pending::ResolvePendingPass, sccp::SCCPPass, simple_cse::SimpleCSEPass, sroa::SROAPass,
 };
 use cubecl_runtime::{
     compiler::CompilationError, config::compilation::F16Evaluation, kernel::BufferIOAttr,
@@ -85,6 +90,8 @@ pub struct PlironOptions {
     /// Pass scalars and static metadata in the kernel parameter block.
     /// The host must use the same layout.
     pub grid_constants: bool,
+    /// Whether to retain compiled object bytes in the resulting engine for caching.
+    pub keep_object: bool,
 }
 
 #[cfg(feature = "amdgpu")]
@@ -275,8 +282,15 @@ impl PlironCompiler {
             shared_memories: shared_memories.take(),
         };
 
-        PlironEngine::compile(&ctx, module, &kernel.settings.kernel_name, requirements, io)
-            .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
+        PlironEngine::compile(
+            &ctx,
+            module,
+            &kernel.settings.kernel_name,
+            requirements,
+            io,
+            options.keep_object,
+        )
+        .map_err(|err| generic(format!("converting to LLVM IR: {err}")))
     }
 
     #[cfg(feature = "amdgpu")]
@@ -345,6 +359,7 @@ impl PlironCompiler {
         let plane_dim = arch.plane_dim();
         ctx.set_plane_dim(plane_dim);
 
+        let tensor_maps = crate::nvptx::tensor_map::TensorMapParams::new(&ctx, ir.entry_func);
         let Lowered { io, atomic_reads } = lower(&mut ctx, &ir, &NvptxLowering { plane_dim })?;
 
         let shared_memory_size = ctx.shared_memory_size();
@@ -370,6 +385,7 @@ impl PlironCompiler {
                 io,
                 atomic_reads,
                 metadata,
+                tensor_maps,
             },
         )
         .map_err(|err| {
@@ -434,9 +450,11 @@ fn lower(
     let mut func_passes = OpPass::<FuncOp, Passes>::default();
     target.prologue(&mut func_passes);
     func_passes.add_pass(SROAPass);
+    func_passes.add_pass(ResolvePendingPass);
     func_passes.add_pass(SCCPPass);
     func_passes.add_pass(SimpleCSEPass::with_memory());
     func_passes.add_pass(SimplifyOpsPass::default());
+    func_passes.add_pass(CanonicalizePass::default());
     func_passes.add_pass(PromoteBitwisePass);
     func_passes.add_pass(InstCombinePass::default());
     // LLVM converts between `f32` and `bfloat`; a wider source would round twice through `f32`.
