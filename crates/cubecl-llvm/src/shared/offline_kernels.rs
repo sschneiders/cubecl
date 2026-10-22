@@ -65,6 +65,25 @@ pub(crate) fn scale_kernel(address_type: AddressType) -> impl CubeKernel {
     )
 }
 
+/// The scale kernel under a register budget, for the PTX declaration test.
+#[cfg(feature = "nvptx")]
+pub(crate) fn capped_scale_kernel() -> impl CubeKernel {
+    let settings = KernelSettings::new(
+        *CubeDim::new_1d(64),
+        ExecutionMode::Checked,
+        AddressType::U32,
+    )
+    .kernel_name("capped_scale")
+    .max_registers(96);
+    scale::Scale::new(
+        settings,
+        device_properties(32),
+        Arc::new(TargetProperties::default()),
+        BufferCompilationArg { inplace: None },
+        BufferCompilationArg { inplace: None },
+    )
+}
+
 #[cube(launch)]
 fn plane_moves(input: &[f32], output: &mut [f32]) {
     let value = input[UNIT_POS as usize];

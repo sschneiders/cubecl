@@ -381,6 +381,7 @@ impl PlironCompiler {
             ptx_version,
             NvptxEntry {
                 cube_dim: kernel.settings.cube_dim,
+                max_registers: kernel.settings.max_registers,
                 shared_memory_size,
                 io,
                 atomic_reads,

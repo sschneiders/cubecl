@@ -89,6 +89,11 @@ pub struct KernelSettings {
     pub cluster_dim: Option<Dim3>,
     /// Execution mode
     pub execution_mode: ExecutionMode,
+    /// The register budget the kernel must compile into, if any. Backends
+    /// declare it in the PTX (`__launch_bounds__`/`.maxnreg_`), and the CUDA
+    /// loader enforces it again at module load, where the JIT honors what the
+    /// link step ignores.
+    pub max_registers: Option<u32>,
 }
 
 impl KernelSettings {
@@ -100,6 +105,7 @@ impl KernelSettings {
             debug_symbols: false,
             cluster_dim: None,
             execution_mode,
+            max_registers: None,
         }
     }
 }
@@ -132,6 +138,17 @@ impl KernelSettings {
     /// Set cluster dim
     pub fn cluster_dim(mut self, cluster_dim: Dim3) -> Self {
         self.cluster_dim = Some(cluster_dim);
+        self
+    }
+
+    /// Cap the registers the kernel may use.
+    ///
+    /// A kernel that launches more units than its register use allows per
+    /// scheduler spills instead, so the cap is what buys occupancy: at 128
+    /// registers a cube of 256 units fits two per scheduler where the same
+    /// body uncapped at 231 registers fits one.
+    pub fn max_registers(mut self, max_registers: u32) -> Self {
+        self.max_registers = Some(max_registers);
         self
     }
 }

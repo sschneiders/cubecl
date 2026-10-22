@@ -25,6 +25,19 @@ fn a_1d_cube_reads_only_the_x_thread_id() {
     );
 }
 
+/// A register budget is declared in the PTX as `.maxnreg`, and only where a
+/// budget exists.
+#[test]
+fn a_register_budget_is_declared_in_the_ptx() {
+    let capped = ptx_of(crate::shared::offline_kernels::capped_scale_kernel(), 80);
+    assert!(
+        capped.contains(".maxnreg 96"),
+        "the budget the kernel asked for:\n{capped}"
+    );
+    let free = ptx_of(scale_kernel(AddressType::U32), 80);
+    assert!(!free.contains(".maxnreg"), "no budget, no directive:\n{free}");
+}
+
 #[test]
 fn plane_moves_are_native_shuffles() {
     let ptx = ptx_of(plane_moves_kernel(), 60);

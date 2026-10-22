@@ -33,6 +33,10 @@ pub(crate) struct KernelArgs {
     /// Generate a harness, gated by `cfg(test)` unless another gate is given.
     pub harness: Option<HarnessGate>,
     pub cluster_dim: Option<Expr>,
+    /// Cap the registers the kernel compiles into, e.g. `max_registers = 128`.
+    /// Declared in the generated PTX and enforced by the loader; see
+    /// [`crate`] for what that buys at launch.
+    pub max_registers: Option<Expr>,
     pub src_file: Option<LitStr>,
     /// Base traits for a split expand trait
     pub expand_base_traits: Option<String>,

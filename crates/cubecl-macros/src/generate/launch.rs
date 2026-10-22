@@ -205,9 +205,15 @@ impl Launch {
             AddressType::U64 => quote![#addr_ty::U64],
             AddressType::Dynamic => quote![__address_type],
         };
+        let max_registers = self
+            .args
+            .max_registers
+            .as_ref()
+            .map(|cap| quote![__settings.max_registers = Some(#cap as u32);]);
 
         quote! {
             let mut __settings = #kernel_settings::new(__cube_dim.into(), #mode, #address_type);
+            #max_registers
         }
     }
 

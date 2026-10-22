@@ -57,6 +57,10 @@ pub struct CompiledKernel<C: Compiler> {
     pub repr: Option<C::Representation>,
     /// Size of a cube for the compiled kernel
     pub cube_dim: CubeDim,
+    /// The register budget the kernel was compiled under, if any. The CUDA
+    /// target carries it to the module load, which enforces it again — the
+    /// loader's JIT honors what the link step ignores.
+    pub max_registers: Option<u32>,
     /// What the kernel does with each buffer binding, by buffer position —
     /// see [`BufferIOAttr`]. `None` when the compiler kept no answer, which the
     /// launch path reads as every buffer both read and written: the
@@ -102,6 +106,7 @@ impl<C: Compiler> CompiledKernel<C> {
     ) -> Result<Self, CompilationError> {
         let entrypoint_name = definition.settings.kernel_name.clone();
         let cube_dim = definition.settings.cube_dim.into();
+        let max_registers = definition.settings.max_registers;
 
         // A hand-written kernel is already in the target language: there is no
         // IR to hand the compiler, so neither analysis it produces exists.
@@ -126,6 +131,7 @@ impl<C: Compiler> CompiledKernel<C> {
                 io: None,
                 repr: None,
                 cube_dim,
+                max_registers,
                 debug_info: None,
             });
         }
@@ -139,6 +145,7 @@ impl<C: Compiler> CompiledKernel<C> {
             io: C::buffer_io(&lower_level_ir),
             repr: Some(lower_level_ir),
             cube_dim,
+            max_registers,
             debug_info: None,
         })
     }

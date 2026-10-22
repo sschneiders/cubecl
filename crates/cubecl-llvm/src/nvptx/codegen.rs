@@ -83,6 +83,9 @@ pub struct NvptxEntry {
     pub metadata: MetadataParams,
     /// The parameters that are tensor maps.
     pub tensor_maps: TensorMapParams,
+    /// The register budget the kernel must compile into, if any, declared as
+    /// `.maxnreg_` in the PTX.
+    pub max_registers: Option<u32>,
 }
 
 pub fn emit_ptx(
@@ -156,10 +159,18 @@ fn finalize(
     // axis of one unit reads as zero rather than as a register.
     let Dim3 { x, y, z } = entry.cube_dim;
     let threads = format!("{x},{y},{z}");
-    let attributes = [
+    let mut attributes = vec![
         ("target-cpu", target_cpu.as_str()),
         ("nvvm.reqntid", threads.as_str()),
     ];
+    // The register budget rides as LLVM's `nvvm.maxnreg` function attribute,
+    // which the NVPTX backend declares as `.maxnreg_` — a constraint the
+    // assembler honors whether the PTX reaches it through the link step or a
+    // module load.
+    let max_registers = entry.max_registers.map(|regs| regs.to_string());
+    if let Some(regs) = &max_registers {
+        attributes.push(("nvvm.maxnreg", regs.as_str()));
+    }
 
     module.set_triple(TRIPLE);
     let entry_fn = module.entry_point(entrypoint)?;

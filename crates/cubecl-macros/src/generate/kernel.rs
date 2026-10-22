@@ -461,7 +461,10 @@ impl Launch {
 
                 impl #generics #kernel_metadata for #kernel_name #generic_names #where_clause {
                     fn id(&self) -> #kernel_id {
-                        // We don't use any other kernel settings with the macro.
+                        // Every setting that changes the machine code belongs
+                        // in the id, or two compilations of the same kernel
+                        // share one artifact. `max_registers` does: the cap is
+                        // declared in the PTX and enforced again at load.
                         let cube_dim = self.settings.cube_dim.clone();
                         let address_type = self.settings.address_type;
 
@@ -469,6 +472,7 @@ impl Launch {
                             .address_type(address_type)
                             .cube_dim(self.settings.cube_dim.clone())
                             .mode(self.settings.execution_mode)
+                            .max_registers_of(self.settings.max_registers)
                             .info(#info_ty_name #info_generics {
                                 #(#info_names: self.#info_names.clone(),)*
                                 #phantom_data_init

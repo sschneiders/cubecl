@@ -21,7 +21,7 @@ use std::mem::MaybeUninit;
 use std::str::FromStr;
 
 /// How much of the assembler's log a failed assembly reports.
-const ASSEMBLER_LOG_BYTES: usize = 16 * 1024;
+pub(crate) const ASSEMBLER_LOG_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 struct DriverContext(*mut CUctx_st);
@@ -77,7 +77,17 @@ pub struct CudaArtifact {
     pub shared_mem_bytes: usize,
     pub ptx: Vec<std::ffi::c_char>,
     /// The machine code the driver assembled `ptx` to, which the load hands the driver.
+    ///
+    /// Empty when the kernel declares a register budget: the load then JITs the
+    /// PTX itself, because the link step ignores `CU_JIT_MAX_REGISTERS` for PTX
+    /// input and would hand back a module past the budget.
     pub cubin: Vec<u8>,
+    /// The register budget the kernel declares, which the load enforces.
+    ///
+    /// Defaulted for entries persisted before the field existed: a stored
+    /// artifact never carried a cap, so its machine code stays the truth.
+    #[serde(default)]
+    pub max_registers: Option<u32>,
     /// See [`CudaCompiledKernel::io`](super::modules::CudaCompiledKernel::io);
     /// defaulted for entries persisted before the field existed.
     #[serde(default)]
@@ -148,6 +158,7 @@ impl ArtifactCompiler for CudaArtifactCompiler {
         mut lowered: Self::Lowered,
     ) -> Result<Self::Artifact, LaunchError> {
         let io = lowered.io.take();
+        let max_registers = lowered.max_registers;
         let (ptx, shared_mem_bytes) = match (backend_of(&lowered), &lowered.repr) {
             // What the LLVM backend hands back is already PTX, so no `nvrtc*`
             // call belongs here. The driver still JITs it when the module
@@ -159,7 +170,7 @@ impl ArtifactCompiler for CudaArtifactCompiler {
             // from: it declares its shared memory statically, so the launch
             // reserves none.
             (CudaBackend::Cpp, repr) => (
-                self.compile_to_ptx(&lowered.source)?,
+                self.compile_to_ptx(&lowered.source, max_registers)?,
                 repr.as_ref()
                     .map(|repr| repr.shared_memory_size())
                     .unwrap_or(0),
@@ -175,12 +186,22 @@ impl ArtifactCompiler for CudaArtifactCompiler {
             }
         };
 
-        let cubin = self.assemble(&ptx)?;
+        // A kernel with a register budget loads its PTX through the module JIT,
+        // which honors `CU_JIT_MAX_REGISTERS`; the link step does not, so its
+        // machine code would silently ignore the budget the kernel asked for.
+        // The PTX still carries the budget itself where the backend could
+        // declare it (`__launch_bounds__`, `.maxnreg_`), and the loader
+        // enforces it a second time whatever the PTX says.
+        let cubin = match max_registers {
+            Some(_) => Vec::new(),
+            None => self.assemble(&ptx)?,
+        };
         Ok(CudaArtifact {
             entrypoint_name: lowered.entrypoint_name,
             shared_mem_bytes,
             ptx,
             cubin,
+            max_registers,
             io,
         })
     }
@@ -193,7 +214,7 @@ impl CudaArtifactCompiler {
     ///
     /// The driver call that failed, with the assembler's log when it wrote one: PTX the
     /// assembler rejects, or a kernel past the device's limits.
-    fn assemble(&self, ptx: &[c_char]) -> Result<Vec<u8>, CompilationError> {
+    pub(crate) fn assemble(&self, ptx: &[c_char]) -> Result<Vec<u8>, CompilationError> {
         let mut log = vec![0u8; ASSEMBLER_LOG_BYTES];
         let mut options = [
             CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
@@ -270,11 +291,18 @@ impl CudaArtifactCompiler {
 
     /// Compiles `source` to PTX with NVRTC.
     ///
+    /// When `max_registers` is set it rides as NVRTC's `--maxrregcount`, so the
+    /// PTX itself declares the budget and every assembler downstream honors it.
+    ///
     /// # Errors
     ///
     /// [`CompilationError::Generic`] carrying the compiler's own log, and the source that
     /// produced it, so a kernel the compiler refuses says why.
-    fn compile_to_ptx(&self, source: &str) -> Result<Vec<c_char>, CompilationError> {
+    fn compile_to_ptx(
+        &self,
+        source: &str,
+        max_registers: Option<u32>,
+    ) -> Result<Vec<c_char>, CompilationError> {
         let arch = if self.arch.version >= 90 {
             format!("--gpu-architecture=sm_{}a", self.arch)
         } else {
@@ -285,7 +313,11 @@ impl CudaArtifactCompiler {
         let include_option = format!("--include-path={}", include_path.to_str().unwrap());
         let cccl_include_path = cccl_include_path();
         let cccl_include_option = format!("--include-path={}", cccl_include_path.to_str().unwrap());
+        let max_registers_option = max_registers.map(|regs| format!("--maxrregcount={regs}"));
         let mut options = vec![arch.as_str(), include_option.as_str(), "-lineinfo"];
+        if let Some(option) = &max_registers_option {
+            options.push(option);
+        }
         if cccl_include_path.exists() {
             options.push(&cccl_include_option);
         }
@@ -310,6 +342,9 @@ impl CudaArtifactCompiler {
                         format!("--gpu-architecture=sm_{}a", (self.arch.version / 10) * 10);
                     let mut fallback_opts =
                         vec![major_arch.as_str(), include_option.as_str(), "-lineinfo"];
+                    if let Some(option) = &max_registers_option {
+                        fallback_opts.push(option);
+                    }
                     if cccl_include_path.exists() {
                         fallback_opts.push(&cccl_include_option);
                     }

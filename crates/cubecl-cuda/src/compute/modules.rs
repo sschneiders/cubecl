@@ -2,7 +2,7 @@
 //! stores, and the modules loaded from what they hold.
 
 use crate::compiler::CudaBackend;
-use crate::compute::artifact::{CudaArtifact, CudaArtifactCompiler};
+use crate::compute::artifact::{ASSEMBLER_LOG_BYTES, CudaArtifact, CudaArtifactCompiler};
 use crate::compute::events::{driver_error, poisons_device};
 use cubecl_core::prelude::*;
 use cubecl_environment::backtrace::BackTrace;
@@ -11,8 +11,8 @@ use cubecl_server::compiler::{
     ArtifactId, ArtifactStore, CompilationError, CompilationTarget, StoreNames,
 };
 use cubecl_server::kernel::BufferIOAttr;
-use cudarc::driver::sys::CUfunc_st;
-use std::ffi::{CStr, CString, c_char};
+use cudarc::driver::sys::{self, CUfunc_st};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Arc;
 
 /// Loads CUDA modules for one device, from the PTX store when it holds the
@@ -94,25 +94,38 @@ impl CompilationTarget for CudaModules {
         // `ptx` a valid null-terminated PTX binary. `func_name` is a null-terminated `CString`
         // matching the kernel entry point in the compiled module.
         let func = unsafe {
-            // The machine code a compiling thread assembled. A stored environment may carry
-            // machine code from a newer driver than this one, which refuses it: the PTX is
+            // The machine code a compiling thread assembled. A kernel with a
+            // register budget has none: its machine code must come from the
+            // PTX, JITed with the budget as a JIT option — the link step
+            // ignores `CU_JIT_MAX_REGISTERS` for PTX input, the module JIT
+            // honors it. A stored environment may also carry machine code from
+            // a newer driver than this one, which refuses it: the PTX is
             // then assembled here instead.
-            let module = cudarc::driver::result::module::load_data(
-                artifact.cubin.as_ptr() as *const std::ffi::c_void
-            )
-            .or_else(|err| match poisons_device(err.0) {
-                true => Err(err),
-                false => cudarc::driver::result::module::load_data(
-                    artifact.ptx.as_ptr() as *const std::ffi::c_void
-                ),
-            })
-            .map_err(|err| match poisons_device(err.0) {
-                true => driver_error("cuModuleLoadData", err).into(),
-                false => CompilationError::Generic {
-                    reason: format!("Unable to load the PTX: {err}"),
-                    backtrace: BackTrace::capture(),
-                },
-            })?;
+            let module = match artifact.max_registers {
+                Some(registers) => load_with_register_budget(&artifact.ptx, registers)
+                    .map_err(|err| CompilationError::Generic {
+                        reason: format!(
+                            "Unable to load the PTX with a budget of {registers} registers: {err}"
+                        ),
+                        backtrace: BackTrace::capture(),
+                    })?,
+                None => cudarc::driver::result::module::load_data(
+                    artifact.cubin.as_ptr() as *const std::ffi::c_void
+                )
+                .or_else(|err| match poisons_device(err.0) {
+                    true => Err(err),
+                    false => cudarc::driver::result::module::load_data(
+                        artifact.ptx.as_ptr() as *const std::ffi::c_void
+                    ),
+                })
+                .map_err(|err| match poisons_device(err.0) {
+                    true => driver_error("cuModuleLoadData", err).into(),
+                    false => CompilationError::Generic {
+                        reason: format!("Unable to load the PTX: {err}"),
+                        backtrace: BackTrace::capture(),
+                    },
+                })?,
+            };
 
             cudarc::driver::result::module::get_function(module, func_name).map_err(|err| {
                 CompilationError::Generic {
@@ -151,6 +164,64 @@ fn cache_namespace(
         (CudaBackend::Llvm, None) => format!("{fingerprint}-llvm"),
         (CudaBackend::Llvm, Some(ptx_version)) => format!("{fingerprint}-llvm-{ptx_version}"),
     }
+}
+
+/// Loads the PTX of a kernel with a register budget, as a module whose entry
+/// point cannot exceed the budget.
+///
+/// `CU_JIT_MAX_REGISTERS` is a JIT option the module load applies while turning
+/// the PTX into machine code; the link step accepts the same option without
+/// honoring it for PTX input, which is why a capped kernel skips its link step
+/// and loads here instead. The PTX may also declare the budget itself
+/// (`.maxnreg_`), and where it does both mechanisms agree on the same number.
+///
+/// # Errors
+///
+/// The driver status, with the assembler's log when it wrote one.
+///
+/// # Safety
+///
+/// `ptx` must be the null-terminated PTX `cuModuleLoadData` would read, and the
+/// caller's context the current one.
+pub(crate) unsafe fn load_with_register_budget(
+    ptx: &[c_char],
+    registers: u32,
+) -> Result<*mut sys::CUmod_st, String> {
+    let mut log = vec![0u8; ASSEMBLER_LOG_BYTES];
+    let mut options = [
+        sys::CUjit_option::CU_JIT_MAX_REGISTERS,
+        sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER,
+        sys::CUjit_option::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+    ];
+    // The driver reads a size or limit option's value as the number itself, not through a
+    // pointer.
+    let mut values = [
+        registers as usize as *mut c_void,
+        log.as_mut_ptr() as *mut c_void,
+        log.len() as *mut c_void,
+    ];
+    let mut module = core::ptr::null_mut();
+
+    // SAFETY: as the caller promises. The log and the option arrays outlive the call, which
+    // reads the options and writes the log and how much of it it filled.
+    let result = unsafe {
+        sys::cuModuleLoadDataEx(
+            &mut module,
+            ptx.as_ptr() as *const c_void,
+            options.len() as u32,
+            options.as_mut_ptr(),
+            values.as_mut_ptr(),
+        )
+        .result()
+    };
+    result.map_err(|err| {
+        let log = CStr::from_bytes_until_nul(&log).map_or_else(
+            |_| String::new(),
+            |log| format!(" {}", log.to_string_lossy()),
+        );
+        format!("cuModuleLoadDataEx failed with {err}:{log}")
+    })?;
+    Ok(module)
 }
 
 /// Writes the PTX for `kernel_id` under the directory named by `CUBECL_CUDA_DUMP_PTX`, if that

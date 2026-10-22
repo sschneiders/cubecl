@@ -97,6 +97,10 @@ pub struct KernelId {
     pub address_type: AddressType,
     /// The execution mode for this kernel
     pub mode: ExecutionMode,
+    /// The register budget the kernel is compiled under, if any. Part of the
+    /// id because it changes the machine code: a capped and an uncapped
+    /// compilation of the same kernel must not share an artifact.
+    pub max_registers: Option<u32>,
     pub(crate) info: Option<Info>,
 }
 
@@ -107,6 +111,7 @@ impl Hash for KernelId {
         self.cube_dim.hash(state);
         self.mode.hash(state);
         self.info.hash(state);
+        self.max_registers.hash(state);
     }
 }
 
@@ -118,6 +123,7 @@ impl core::fmt::Debug for KernelId {
             .field("address_type", &self.address_type);
         debug_str.field("cube_dim", &self.cube_dim);
         debug_str.field("mode", &self.mode);
+        debug_str.field("max_registers", &self.max_registers);
         match &self.info {
             Some(info) => debug_str.field("info", info),
             None => debug_str.field("info", &self.info),
@@ -165,6 +171,7 @@ impl KernelId {
             cube_dim: Dim3::new_single(),
             mode: ExecutionMode::Checked,
             address_type: Default::default(),
+            max_registers: None,
         }
     }
 
@@ -173,8 +180,18 @@ impl KernelId {
     /// Can be used as a persistent kernel cache key.
     pub fn stable_format(&self) -> String {
         format!(
-            "{}-{}-{:?}-{:?}-{:?}",
-            self.type_name, self.address_type, self.cube_dim, self.mode, self.info
+            "{}-{}-{:?}-{:?}-{:?}{}",
+            self.type_name,
+            self.address_type,
+            self.cube_dim,
+            self.mode,
+            self.info,
+            // Suffix only when set, so ids of kernels compiled without a
+            // register cap stay byte-identical to what they were before the
+            // field existed and persisted caches survive the upgrade.
+            self.max_registers
+                .map(|regs| format!("-maxregs{regs}"))
+                .unwrap_or_default()
         )
     }
 
@@ -188,6 +205,12 @@ impl KernelId {
         self.cube_dim.hash(&mut hasher);
         self.mode.hash(&mut hasher);
         self.info.hash(&mut hasher);
+        // Tagged and only over `Some`, for the same stability as
+        // [`KernelId::stable_format`]: an uncapped id hashes exactly as before.
+        if let Some(regs) = self.max_registers {
+            0xFFu8.hash(&mut hasher);
+            regs.hash(&mut hasher);
+        }
 
         hasher.finalize()
     }
@@ -224,6 +247,19 @@ impl KernelId {
     /// Set the [`AddressType`].
     pub fn address_type(mut self, addr_ty: AddressType) -> Self {
         self.address_type = addr_ty;
+        self
+    }
+
+    /// Set the register budget the kernel is compiled under.
+    pub fn max_registers(mut self, max_registers: u32) -> Self {
+        self.max_registers = Some(max_registers);
+        self
+    }
+
+    /// Set the register budget from an optional setting, keeping `None` when
+    /// the kernel declares no cap.
+    pub fn max_registers_of(mut self, max_registers: Option<u32>) -> Self {
+        self.max_registers = max_registers;
         self
     }
 }
