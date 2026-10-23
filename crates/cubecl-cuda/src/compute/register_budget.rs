@@ -233,18 +233,47 @@ mod tests {
         );
     }
 
-    /// The C++ backend capped: the module load JITs the PTX with the budget,
-    /// and the function comes back within it.
+    /// The C++ backend capped: NVRTC's CUBIN carries the budget in the
+    /// SASS, and loading it directly — no JIT option anywhere — lands the
+    /// function within it.
     #[test]
-    fn the_cpp_backend_fits_the_budget_on_the_module_path() {
+    fn the_cpp_backend_bakes_the_budget_into_the_cubin() {
         let context = current_primary_context();
         let (artifact, func) = compile_and_load(CudaBackend::Cpp, Some(CAP), context);
-        // The route switch: no machine code from the link step, which would
-        // ignore the budget.
+        // The route switch: the machine code is NVRTC's own CUBIN, the
+        // budget already baked in — there is no JIT step left whose option
+        // a driver could ignore.
         assert!(
-            artifact.cubin.is_empty(),
-            "a capped kernel carries no link-step machine code"
+            !artifact.cubin.is_empty(),
+            "a capped C++ kernel carries NVRTC's CUBIN"
         );
+        assert!(num_regs(func) <= CAP, "the cap is {}", CAP);
+    }
+
+    /// The CUBIN loads standalone: `cuModuleLoadData` on the raw bytes, no
+    /// module-JIT option involved — the exact mechanism the register cap
+    /// rides on drivers whose module JIT ignores `CU_JIT_MAX_REGISTERS`.
+    #[test]
+    fn the_cubin_loads_directly_within_the_budget() {
+        let context = current_primary_context();
+        let (artifact, _) = compile_and_load(CudaBackend::Cpp, Some(CAP), context);
+        assert!(!artifact.cubin.is_empty());
+        // SAFETY: the CUBIN is NVRTC's machine code for this device's
+        // architecture, and the primary context is current.
+        let module = unsafe {
+            cudarc::driver::result::module::load_data(
+                artifact.cubin.as_ptr() as *const std::ffi::c_void
+            )
+            .expect("the NVRTC CUBIN loads without any JIT option")
+        };
+        // SAFETY: `module` is a loaded module.
+        let func = unsafe {
+            cudarc::driver::result::module::get_function(
+                module,
+                CString::new(artifact.entrypoint_name.clone()).unwrap(),
+            )
+            .expect("the entry point is found")
+        };
         assert!(num_regs(func) <= CAP, "the cap is {}", CAP);
     }
 
@@ -296,11 +325,13 @@ mod tests {
         assert!(num_regs(func) <= CAP, "the cap is {}", CAP);
     }
 
-    /// The budget held on the module path, in isolation of everything else:
-    /// the same PTX, loaded with and without the option, must come back
-    /// different — this is the load-path guarantee the link step cannot give.
+    /// The budget held on the module-JIT fallback path, in isolation: the
+    /// same PTX, loaded with and without the option, must come back
+    /// different — the load-path guarantee the CUBIN route replaced on the
+    /// C++ backend (where driver 580.173.02 stopped honoring the option for
+    /// a large PTX) but which the fallback still relies on.
     #[test]
-    fn the_module_jit_honors_the_budget_option() {
+    fn the_module_jit_distinguishes_the_budget_option() {
         let context = current_primary_context();
         let (_, uncapped) = compile_and_load(CudaBackend::Cpp, None, context);
         let regs_uncapped = num_regs(uncapped);

@@ -76,11 +76,13 @@ pub struct CudaArtifact {
     pub entrypoint_name: String,
     pub shared_mem_bytes: usize,
     pub ptx: Vec<std::ffi::c_char>,
-    /// The machine code the driver assembled `ptx` to, which the load hands the driver.
+    /// The machine code `cuModuleLoadData` takes: the link step's assembly
+    /// of the PTX — or, for a C++ kernel with a register budget, the CUBIN
+    /// NVRTC itself produced with the budget baked into the SASS, so the
+    /// load needs no JIT step a driver could fail to honor.
     ///
-    /// Empty when the kernel declares a register budget: the load then JITs the
-    /// PTX itself, because the link step ignores `CU_JIT_MAX_REGISTERS` for PTX
-    /// input and would hand back a module past the budget.
+    /// Empty for a capped LLVM-backend kernel: the load then JITs the PTX
+    /// with the budget as a JIT option (the PTX declares it as well).
     pub cubin: Vec<u8>,
     /// The register budget the kernel declares, which the load enforces.
     ///
@@ -166,22 +168,24 @@ impl ArtifactCompiler for CudaArtifactCompiler {
                 backend_of(&lowered),
             );
         }
-        let (ptx, shared_mem_bytes) = match (backend_of(&lowered), &lowered.repr) {
+        let (ptx, shared_mem_bytes, nvrtc_cubin) = match (backend_of(&lowered), &lowered.repr) {
             // What the LLVM backend hands back is already PTX, so no `nvrtc*`
             // call belongs here. The driver still JITs it when the module
             // loads, which is what it does with NVRTC's output too.
             (_, Some(CudaRepresentation::Llvm(module))) => {
-                (module.ptx.clone(), module.shared_memory_size)
+                (module.ptx.clone(), module.shared_memory_size, None)
             }
             // A precompiled kernel has no representation to read the size
             // from: it declares its shared memory statically, so the launch
             // reserves none.
-            (CudaBackend::Cpp, repr) => (
-                self.compile_to_ptx(&lowered.source, max_registers)?,
-                repr.as_ref()
+            (CudaBackend::Cpp, repr) => {
+                let (ptx, cubin) = self.compile_to_ptx_and_cubin(&lowered.source, max_registers)?;
+                let smem = repr
+                    .as_ref()
                     .map(|repr| repr.shared_memory_size())
-                    .unwrap_or(0),
-            ),
+                    .unwrap_or(0);
+                (ptx, smem, cubin)
+            }
             (CudaBackend::Llvm, _) => {
                 return Err(CompilationError::Generic {
                     reason: "the LLVM backend cannot load a precompiled kernel: it has no text to \
@@ -193,15 +197,28 @@ impl ArtifactCompiler for CudaArtifactCompiler {
             }
         };
 
-        // A kernel with a register budget loads its PTX through the module JIT,
-        // which honors `CU_JIT_MAX_REGISTERS`; the link step does not, so its
-        // machine code would silently ignore the budget the kernel asked for.
-        // The PTX still carries the budget itself where the backend could
-        // declare it (`__launch_bounds__`, `.maxnreg_`), and the loader
-        // enforces it a second time whatever the PTX says.
-        let cubin = match max_registers {
-            Some(_) => Vec::new(),
-            None => self.assemble(&ptx)?,
+        // A kernel with a register budget loads its machine code DIRECTLY:
+        // NVRTC bakes the budget into CUBIN SASS (`--maxrregcount` at
+        // `--gpu-architecture=sm_*` — the arch the device properties name,
+        // never hardcoded), and `cuModuleLoadData` takes the CUBIN with no
+        // JIT step left to ignore the cap. On driver 580.173.02 the module
+        // JIT ignored `CU_JIT_MAX_REGISTERS` for the megakernel's 60k-line
+        // PTX (every budget landed 255 registers) — the CUBIN path removes
+        // the step, not the argument. The PTX still rides along (the dump,
+        // and the loader's fallback for a stale persisted artifact that
+        // carries no CUBIN), and still declares the budget where the
+        // backend could (`__launch_bounds__`, `.maxnreg_`).
+        let cubin = match nvrtc_cubin {
+            // C++ + budget: NVRTC's own SASS, the budget already binding.
+            Some(cubin) => cubin,
+            // No budget: the link step produces the machine code, as before.
+            None => match max_registers {
+                None => self.assemble(&ptx)?,
+                // A budget on the LLVM path keeps the old contract: the
+                // loader JITs the PTX with the budget (which the PTX also
+                // declares), and the artifact carries no machine code.
+                Some(_) => Vec::new(),
+            },
         };
         Ok(CudaArtifact {
             entrypoint_name: lowered.entrypoint_name,
@@ -296,20 +313,29 @@ impl CudaArtifactCompiler {
         }
     }
 
-    /// Compiles `source` to PTX with NVRTC.
+    /// Compiles `source` with NVRTC: the PTX always, and — when
+    /// `max_registers` is set — the CUBIN alongside it.
     ///
-    /// When `max_registers` is set it rides as NVRTC's `--maxrregcount`, so the
-    /// PTX itself declares the budget and every assembler downstream honors it.
+    /// The budget rides as NVRTC's `--maxrregcount`, so the PTX declares it
+    /// AND the CUBIN's SASS was allocated under it: fetching the CUBIN
+    /// (`nvrtcGetCUBIN`, valid because the arch option names the real
+    /// `sm_*` target the device properties gave) is what makes the budget
+    /// bind on a driver whose module JIT ignores `CU_JIT_MAX_REGISTERS`.
+    /// The arch option comes from `self.arch` — the device's own compute
+    /// capability, never hardcoded.
+    ///
+    /// The CUBIN is `None` when no budget was set (the caller assembles the
+    /// PTX through the link step, as before).
     ///
     /// # Errors
     ///
     /// [`CompilationError::Generic`] carrying the compiler's own log, and the source that
     /// produced it, so a kernel the compiler refuses says why.
-    fn compile_to_ptx(
+    fn compile_to_ptx_and_cubin(
         &self,
         source: &str,
         max_registers: Option<u32>,
-    ) -> Result<Vec<c_char>, CompilationError> {
+    ) -> Result<(Vec<c_char>, Option<Vec<u8>>), CompilationError> {
         let arch = if self.arch.version >= 90 {
             format!("--gpu-architecture=sm_{}a", self.arch)
         } else {
@@ -329,8 +355,9 @@ impl CudaArtifactCompiler {
             options.push(&cccl_include_option);
         }
 
-        // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX from a program.
-        // The `CString` source is null-terminated and outlives the program. On compilation
+        // SAFETY: Calling NVRTC FFI to create, compile, and extract PTX (and,
+        // for a capped kernel, the CUBIN) from a program. The `CString`
+        // source is null-terminated and outlives the program. On compilation
         // failure, the error log is retrieved and reported before returning.
         unsafe {
             // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
@@ -364,13 +391,19 @@ impl CudaArtifactCompiler {
                         )?;
                     if cudarc::nvrtc::result::compile_program(fallback_prog, &fallback_opts).is_ok()
                     {
-                        let _ = cudarc::nvrtc::result::destroy_program(program);
-                        return cudarc::nvrtc::result::get_ptx(fallback_prog).map_err(|err| {
+                        let cubin = match max_registers {
+                            Some(_) => Some(get_cubin(fallback_prog)?),
+                            None => None,
+                        };
+                        let ptx = cudarc::nvrtc::result::get_ptx(fallback_prog).map_err(|err| {
                             CompilationError::Generic {
                                 reason: format!("{err}"),
                                 backtrace: BackTrace::capture(),
                             }
                         });
+                        let _ = cudarc::nvrtc::result::destroy_program(fallback_prog);
+                        let _ = cudarc::nvrtc::result::destroy_program(program);
+                        return ptx.map(|ptx| (ptx, cubin));
                     }
                     let _ = cudarc::nvrtc::result::destroy_program(fallback_prog);
                 }
@@ -395,12 +428,55 @@ impl CudaArtifactCompiler {
                     backtrace: BackTrace::capture(),
                 })?;
             };
-            cudarc::nvrtc::result::get_ptx(program).map_err(|err| CompilationError::Generic {
-                reason: format!("{err}"),
-                backtrace: BackTrace::capture(),
-            })
+            let cubin = match max_registers {
+                Some(_) => Some(get_cubin(program)?),
+                None => None,
+            };
+            let ptx = cudarc::nvrtc::result::get_ptx(program).map_err(|err| {
+                CompilationError::Generic {
+                    reason: format!("{err}"),
+                    backtrace: BackTrace::capture(),
+                }
+            })?;
+            Ok((ptx, cubin))
         }
     }
+}
+
+/// The CUBIN of a compiled NVRTC program: the machine code NVRTC allocated
+/// under the very options the program was compiled with — a register
+/// budget among them — which `cuModuleLoadData` takes with no JIT step in
+/// between. Valid only when the program targeted a real `sm_*`
+/// architecture, which is the only form the compiler emits.
+///
+/// # Errors
+///
+/// [`CompilationError::Generic`] carrying the NVRTC status.
+///
+/// # Safety
+///
+/// `prog` must be a program `compile_program` has succeeded on, not yet
+/// destroyed.
+unsafe fn get_cubin(prog: cudarc::nvrtc::sys::nvrtcProgram) -> Result<Vec<u8>, CompilationError> {
+    use cudarc::nvrtc::sys;
+    let mut size: usize = 0;
+    // SAFETY: as the caller promises; the size outlives the call.
+    unsafe { sys::nvrtcGetCUBINSize(prog, &mut size as *mut _).result() }.map_err(|err| {
+        CompilationError::Generic {
+            reason: format!("nvrtcGetCUBINSize: {err}"),
+            backtrace: BackTrace::capture(),
+        }
+    })?;
+    let mut cubin: Vec<u8> = Vec::with_capacity(size);
+    cubin.resize(size, 0);
+    // SAFETY: as the caller promises; the buffer is sized by the call above.
+    unsafe { sys::nvrtcGetCUBIN(prog, cubin.as_mut_ptr() as *mut c_char).result() }.map_err(
+        |err| CompilationError::Generic {
+            reason: format!("nvrtcGetCUBIN: {err}"),
+            backtrace: BackTrace::capture(),
+        },
+    )?;
+    Ok(cubin)
 }
 
 /// Which backend finalizes `lowered`: the one that compiled it, or, for a

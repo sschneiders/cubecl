@@ -43,8 +43,15 @@ pub struct CudaCompiledKernel {
 impl CudaModules {
     /// `backend` is which one compiles here; see [`cache_namespace`].
     pub fn new(compiler: CudaArtifactCompiler, backend: CudaBackend) -> Self {
+        // The `-nvrtaot` suffix is the load-scheme stamp: a capped C++
+        // kernel's artifact changed from "PTX + empty cubin" to "PTX +
+        // NVRTC CUBIN", and a persisted artifact from the old scheme would
+        // silently fall back to the module JIT that ignores the cap on
+        // driver 580.173.02. Bumping the namespace retires every stored
+        // artifact of the old scheme once, instead of trusting the
+        // loader's PTX fallback to keep the budget honest.
         let fingerprint = cache_namespace(
-            &format!("ptx_sm{}", compiler.arch().version),
+            &format!("ptx_sm{}-nvrtaot", compiler.arch().version),
             backend,
             compiler.options().ptx_version,
         );
@@ -68,7 +75,7 @@ impl CudaModules {
     #[cfg(test)]
     pub(crate) fn with_store(compiler: CudaArtifactCompiler, backend: CudaBackend) -> Self {
         let fingerprint = cache_namespace(
-            &format!("ptx_sm{}", compiler.arch().version),
+            &format!("ptx_sm{}-nvrtaot", compiler.arch().version),
             backend,
             compiler.options().ptx_version,
         );
@@ -134,18 +141,31 @@ impl CompilationTarget for CudaModules {
         }
 
         let func_name = CString::new(artifact.entrypoint_name.clone()).unwrap();
-        // SAFETY: `cubin` is machine code a driver assembled for this device's architecture, and
-        // `ptx` a valid null-terminated PTX binary. `func_name` is a null-terminated `CString`
-        // matching the kernel entry point in the compiled module.
+        // SAFETY: `cubin` is machine code a driver or NVRTC assembled for this
+        // device's architecture, and `ptx` a valid null-terminated PTX binary.
+        // `func_name` is a null-terminated `CString` matching the kernel entry
+        // point in the compiled module.
         let func = unsafe {
-            // The machine code a compiling thread assembled. A kernel with a
-            // register budget has none: its machine code must come from the
-            // PTX, JITed with the budget as a JIT option — the link step
-            // ignores `CU_JIT_MAX_REGISTERS` for PTX input, the module JIT
-            // honors it. A stored environment may also carry machine code from
-            // a newer driver than this one, which refuses it: the PTX is
-            // then assembled here instead.
+            // A kernel with a register budget loads the machine code the
+            // budget already binds: NVRTC's CUBIN for the C++ backend (the
+            // SASS was allocated under `--maxrregcount` — there is no JIT
+            // step left to ignore the cap, which driver 580.173.02 did for
+            // the megakernel's 60k-line PTX), or the PTX through the module
+            // JIT for everything else — the LLVM backend's capped kernels,
+            // and a stale persisted C++ artifact from before the CUBIN
+            // scheme.
             let module = match artifact.max_registers {
+                Some(registers) if !artifact.cubin.is_empty() => {
+                    cudarc::driver::result::module::load_data(
+                        artifact.cubin.as_ptr() as *const std::ffi::c_void
+                    )
+                    .map_err(|err| CompilationError::Generic {
+                        reason: format!(
+                            "Unable to load the CUBIN with a budget of {registers} registers: {err}"
+                        ),
+                        backtrace: BackTrace::capture(),
+                    })?
+                }
                 Some(registers) => load_with_register_budget(&artifact.ptx, registers).map_err(
                     |err| CompilationError::Generic {
                         reason: format!(
