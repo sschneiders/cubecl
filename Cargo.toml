@@ -226,11 +226,17 @@ tracel-llvm-bundler = "23.1.0-4"
 # tracel-llvm-bundler = { git = "https://github.com/tracel-ai/tracel-llvm.git", rev = "4769fd52f2205435134d6a3c606f94aad6876155" }
 # tracel-llvm-bundler = { path = "../tracel-llvm/crates/tracel-llvm-bundler" }
 
+# `nccl` is NOT here on purpose: cudarc's nccl feature is a cubecl-cuda
+# cargo feature (`nccl`) that forwards it, so a consumer graph that also
+# pulls cudarc with `dynamic-linking` (candle does) does not suddenly
+# have to LINK libnccl — the mode union decides how cudarc links, and
+# under dynamic-linking the nccl feature emits `-lnccl`. Collectives are
+# opt-in (`cubecl-cuda/nccl`); a build without them refuses them at
+# runtime (the no-device-transport defaults).
 cudarc = { version = "0.19.6", features = [
     "std",
     "driver",
     "nvrtc",
-    "nccl",
     "fallback-dynamic-loading",
     "cuda-version-from-build-system",
     "fallback-latest",

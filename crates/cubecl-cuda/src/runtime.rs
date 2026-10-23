@@ -1,8 +1,10 @@
 use crate::{
     compiler::{CudaBackend, CudaCompilationOptions},
-    compute::{CudaServer, communication::Nccl, context::CudaContext},
+    compute::{CudaServer, context::CudaContext},
     device::CudaDevice,
 };
+#[cfg(feature = "nccl")]
+use crate::compute::communication::Nccl;
 use cubecl_common::{
     device::{Device, DeviceService},
     profile::TimingMethod,
@@ -452,6 +454,7 @@ impl DeviceService for CudaServer {
         );
         let logger = Arc::new(ServerLogger::default());
         let policy = PitchedMemoryLayoutPolicy::new(device_props.memory.alignment as usize);
+        #[cfg_attr(not(feature = "nccl"), expect(unused_mut))]
         let (mut utilities, captures) = ServerUtilities::init(
             cubecl_common::device::ServiceId::of::<Self>(device_id),
             "cuda",
@@ -460,8 +463,12 @@ impl DeviceService for CudaServer {
             logger,
             policy,
         );
-        utilities.device_transport = Nccl::new(arch_version)
-            .map(|nccl| nccl.transport(utilities.properties.features.types.elem.keys().copied()));
+        #[cfg(feature = "nccl")]
+        {
+            utilities.device_transport = Nccl::new(arch_version).map(|nccl| {
+                nccl.transport(utilities.properties.features.types.elem.keys().copied())
+            });
+        }
 
         CudaServer::new(
             cuda_ctx,

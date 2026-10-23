@@ -2,6 +2,7 @@ use crate::compiler::{CudaBackend, CudaCompilationOptions};
 use crate::compute::artifact::CudaArtifactCompiler;
 use crate::compute::events::{EventProfiler, driver_error, poisons_device};
 use crate::compute::modules::{CudaCompiledKernel, CudaModules};
+#[cfg(feature = "nccl")]
 use crate::compute::storage::gpu::GpuResource;
 use crate::compute::stream::Stream;
 use cubecl_core::{ir::DeviceProperties, prelude::*};
@@ -25,6 +26,7 @@ pub(crate) struct CudaContext {
     pub transfer_stream: CUstream,
     /// One element for a communicator's first `all_reduce`, allocated with the context so that
     /// setting a group up never fails to allocate on one device after joining on the others.
+    #[cfg(feature = "nccl")]
     pub connect_element: GpuResource,
     /// The modules loaded on the device, and how to load another.
     kernels: KernelLoader<CudaModules>,
@@ -62,6 +64,7 @@ impl CudaContext {
             transfer_stream,
             // SAFETY: the context is current. The element is only ever reduced into itself, and
             // nothing reads what that leaves in it.
+            #[cfg(feature = "nccl")]
             connect_element: unsafe { cudarc::driver::result::malloc_sync(4) }
                 .map(|ptr| GpuResource::new(ptr, core::ptr::null_mut(), 4))
                 .expect("Can allocate the element communicators connect over."),

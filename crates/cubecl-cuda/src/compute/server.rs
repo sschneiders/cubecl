@@ -1,10 +1,14 @@
 use super::storage::gpu::{GpuResource, GpuStorage};
+#[cfg(feature = "nccl")]
 use crate::compute::driver::Cuda;
 use crate::compute::modules::CudaCompiledKernel;
 use crate::compute::{
-    Captures, Command, Window, communication::BYTES, context::CudaContext, events::Fence,
-    stream::CudaStreamBackend,
+    Captures, Command, Window, context::CudaContext, stream::CudaStreamBackend,
 };
+#[cfg(feature = "nccl")]
+use crate::compute::events::Fence;
+#[cfg(feature = "nccl")]
+use crate::compute::communication::BYTES;
 use cubecl_common::{bytes::Bytes, profile::ProfileDuration};
 use cubecl_core::server::{DeviceCaptures, ServerStorage};
 use cubecl_core::{
@@ -13,17 +17,22 @@ use cubecl_core::{
     ir::{ElemType, FloatKind, IntKind, MemoryDeviceProperties, UIntKind},
     prelude::*,
     server::{
-        BufferBinding, CollectiveBuffer, CommunicationId, ComputeWait, CopyDescriptor, Handle,
-        KernelArguments, KernelResource, LaunchError, ProfileError, ProfilingToken,
-        ReduceOperation, Reduction, ServerCommunication, ServerError, ServerUtilities,
+        BufferBinding, CopyDescriptor, Handle, KernelArguments, KernelResource, LaunchError,
+        ProfileError, ProfilingToken, ServerCommunication, ServerError, ServerUtilities,
         TensorMapBinding, TensorMapMeta,
     },
     zspace::SmallVec,
 };
+#[cfg(feature = "nccl")]
+use cubecl_core::server::{
+    CollectiveBuffer, CommunicationId, ComputeWait, ReduceOperation, Reduction,
+};
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_environment::future::{self, DynFut};
 use cubecl_environment::stream::StreamId;
-use cubecl_server::command::{CollectiveDriver, Collectives, DeviceStream, Refused};
+#[cfg(feature = "nccl")]
+use cubecl_server::command::{CollectiveDriver, Collectives};
+use cubecl_server::command::{DeviceStream, Refused};
 use cubecl_server::compiler::ArtifactId;
 use cubecl_server::{
     config::{CubeClRuntimeConfig, RuntimeConfig},
@@ -41,7 +50,9 @@ use cudarc::driver::sys::{
     CUtensorMapFloatOOBfill, CUtensorMapInterleave, CUtensorMapL2promotion, CUtensorMapSwizzle,
     cuTensorMapEncodeIm2col, cuTensorMapEncodeTiled,
 };
-use std::{collections::HashMap, convert::Infallible, ffi::c_void, sync::Arc};
+#[cfg(feature = "nccl")]
+use std::convert::Infallible;
+use std::{collections::HashMap, ffi::c_void, sync::Arc};
 
 /// Stage `words` into a device buffer, reusing a cached one when a launch has
 /// already staged these exact info words. The info is read-only metadata (no
@@ -81,10 +92,12 @@ fn info_buffer(command: &mut Command<'_>, words: &[u64]) -> Result<Handle, Serve
 #[derive(Debug)]
 pub struct CudaServer {
     ctx: CudaContext,
+    #[cfg_attr(not(feature = "nccl"), allow(dead_code))]
     device_id: DeviceId,
     streams: MultiStream<CudaStreamBackend>,
     utilities: Arc<ServerUtilities>,
     /// The groups this device has joined — see [`Collectives`].
+    #[cfg(feature = "nccl")]
     collectives: Collectives<Cuda>,
     /// Captured graphs owned by this server, keyed by the [`GraphId`] handed to
     /// the client. `end_capture` inserts, `replay` looks up, `graph_destroy`
@@ -433,6 +446,7 @@ impl Server for CudaServer {
     }
 }
 
+#[cfg(feature = "nccl")]
 impl ServerCommunication for CudaServer {
     fn comm_init(&mut self, device_ids: Vec<DeviceId>) -> Result<(), ServerError> {
         // A group already joined is joined once, so the membership is
@@ -715,6 +729,12 @@ impl ServerCommunication for CudaServer {
     }
 }
 
+/// No NCCL in this build: the collective surface refuses with the
+/// runtime's no-device-transport error (the trait's default methods).
+#[cfg(not(feature = "nccl"))]
+impl ServerCommunication for CudaServer {}
+
+
 impl WriteScoped for CudaServer {
     type Streams = MultiStream<CudaStreamBackend>;
 
@@ -733,6 +753,7 @@ impl WriteScoped for CudaServer {
     }
 }
 
+#[cfg_attr(not(feature = "nccl"), allow(dead_code))]
 impl CudaServer {
     /// Create a new cuda server.
     pub(crate) fn new(
@@ -767,6 +788,7 @@ impl CudaServer {
                 max_streams,
             ),
             utilities: Arc::new(utilities),
+            #[cfg(feature = "nccl")]
             collectives: Collectives::new(device_id),
             graphs: Captures::default(),
             pending_allocation_modes: HashMap::new(),
@@ -778,10 +800,12 @@ impl CudaServer {
         self.ctx.comm_stream
     }
 
+#[cfg(feature = "nccl")]
     fn transfer_stream(&self) -> CUstream {
         self.ctx.transfer_stream
     }
 
+#[cfg(feature = "nccl")]
     /// Runs one single-element `all_reduce` over the group `id`, so NCCL connects its peers now:
     /// it connects them on a communicator's first operation, which waits on the host for every
     /// peer. A single element connects the algorithm it picks, the ring on a single node.
@@ -867,6 +891,7 @@ impl CudaServer {
     /// tainted-buffer rules: a broken group, a tainted read, a failed `checked` or any later
     /// refusal leaves `dst` carrying the failure, the only report a fire-and-forget submit keeps,
     /// and breaks the group.
+#[cfg(feature = "nccl")]
     fn settle_collective<const N: usize, Plan>(
         &mut self,
         group: &CommunicationId,
@@ -909,6 +934,7 @@ impl CudaServer {
     ///
     /// A group never joined, a binding that names no live allocation, a fence the driver
     /// refuses, and whatever `collective` returns.
+#[cfg(feature = "nccl")]
     fn run_collective<const N: usize>(
         &mut self,
         stream_id: StreamId,
@@ -950,6 +976,7 @@ impl CudaServer {
     /// A reservation the device cannot back, a group never joined, a peer
     /// outside it, an element type NCCL has no name for, and NCCL's refusal
     /// to enqueue.
+#[cfg(feature = "nccl")]
     fn recv_checked(
         &mut self,
         handle: Handle,
@@ -1632,6 +1659,7 @@ fn check_tma_im2col(
 ///
 /// Sorted because a rank is a position: `send` and `recv` are the two sides of
 /// one transfer and have to agree on which device is which.
+#[cfg(feature = "nccl")]
 fn pair(this: DeviceId, peer: DeviceId) -> Vec<DeviceId> {
     let mut devices = vec![this, peer];
     devices.sort();

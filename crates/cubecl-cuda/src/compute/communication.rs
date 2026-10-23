@@ -5,27 +5,42 @@
 //! rank in one is — is the shared
 //! [`Collectives`](cubecl_server::command::Collectives)'.
 
+#[cfg(feature = "nccl")]
 use core::ffi::c_int;
+#[cfg(feature = "nccl")]
 use std::{collections::HashMap, sync::OnceLock};
 
+#[cfg(feature = "nccl")]
 use cubecl_core::{
-    ir::{ElemType, FloatKind, IntKind, UIntKind},
-    server::{CommunicationId, DeviceTransport, ReduceOperation, ServerError},
+    ir::{FloatKind, IntKind},
+    server::DeviceTransport,
 };
+#[cfg(feature = "nccl")]
+use cubecl_core::ir::UIntKind;
+use cubecl_core::ir::ElemType;
+#[cfg(feature = "nccl")]
+use cubecl_core::server::{CommunicationId, ReduceOperation, ServerError};
+#[cfg(not(feature = "nccl"))]
+use cubecl_core::server::{CommunicationId, ReduceOperation, ServerError};
 use cubecl_environment::backtrace::BackTrace;
+#[cfg(feature = "nccl")]
 use cubecl_environment::sync::Mutex;
 use cubecl_server::command::{CollectiveDriver, Elements};
+#[cfg(feature = "nccl")]
 use cudarc::nccl::sys::ncclDataType_t as NcclDataType;
+#[cfg(feature = "nccl")]
 use std::mem::MaybeUninit;
 
 use crate::compute::driver::Cuda;
 use crate::compute::storage::gpu::GpuResource;
 
 /// Global state map from [`CommunicationId`] to boxed [`cudarc::nccl::sys::ncclUniqueId`].
+#[cfg(feature = "nccl")]
 static UNIQUE_IDS_MAP: OnceLock<Mutex<HashMap<CommunicationId, cudarc::nccl::sys::ncclUniqueId>>> =
     OnceLock::new();
 
 /// The NCCL reduction for `op`.
+#[cfg(feature = "nccl")]
 fn to_nccl_op(op: ReduceOperation) -> cudarc::nccl::sys::ncclRedOp_t {
     match op {
         ReduceOperation::Sum => cudarc::nccl::sys::ncclRedOp_t::ncclSum,
@@ -34,15 +49,19 @@ fn to_nccl_op(op: ReduceOperation) -> cudarc::nccl::sys::ncclRedOp_t {
 }
 
 /// What a collective that only moves data names its buffers as, whatever they hold.
+#[cfg(feature = "nccl")]
 pub const BYTES: ElemType = ElemType::UInt(UIntKind::U8);
 
 /// NCCL 2.10.3, the first with bfloat16.
+#[cfg(feature = "nccl")]
 const NCCL_BF16_VERSION: c_int = 21003;
 
 /// NCCL 2.29.2, whose FP8 `all_reduce` stopped failing to find an algorithm.
+#[cfg(feature = "nccl")]
 const NCCL_FP8_REDUCTION_VERSION: c_int = 22902;
 
 /// NCCL reduces FP8 only on Hopper and newer.
+#[cfg(feature = "nccl")]
 const NCCL_FP8_REDUCTION_ARCH: u32 = 90;
 
 /// The elements of `dtype` that `size` bytes hold, as NCCL names them.
@@ -51,6 +70,7 @@ const NCCL_FP8_REDUCTION_ARCH: u32 = 90;
 ///
 /// [`ServerError::Generic`] for an element type NCCL has no data type for, and for a size that
 /// is not whole elements, whose last bytes NCCL would leave out.
+#[cfg(feature = "nccl")]
 fn nccl_elements(dtype: ElemType, size: u64) -> Result<Elements<NcclDataType>, ServerError> {
     let data_type = nccl_dtype(dtype).ok_or_else(|| ServerError::Generic {
         reason: format!("NCCL has no data type for {dtype:?}, so no collective over it"),
@@ -71,11 +91,13 @@ fn nccl_elements(dtype: ElemType, size: u64) -> Result<Elements<NcclDataType>, S
 
 /// The NCCL this process loads, which may predate types this crate names, and the device it
 /// runs on.
+#[cfg(feature = "nccl")]
 pub struct Nccl {
     version: c_int,
     arch_version: u32,
 }
 
+#[cfg(feature = "nccl")]
 impl Nccl {
     /// The NCCL this process loads, for a device of `arch_version`, or `None` when none loads.
     pub fn new(arch_version: u32) -> Option<Self> {
@@ -117,6 +139,7 @@ impl Nccl {
 }
 
 /// The NCCL data type for `dtype`.
+#[cfg(feature = "nccl")]
 fn nccl_dtype(dtype: ElemType) -> Option<NcclDataType> {
     Some(match dtype {
         ElemType::Float(FloatKind::E4M3) => NcclDataType::ncclFloat8e4m3,
@@ -151,6 +174,7 @@ fn nccl_dtype(dtype: ElemType) -> Option<NcclDataType> {
 }
 
 /// NCCL's refusal to enqueue `operation`.
+#[cfg(feature = "nccl")]
 fn nccl_error(operation: &str, err: cudarc::nccl::result::NcclError) -> ServerError {
     ServerError::Generic {
         reason: format!("NCCL {operation} failed: {err:?}"),
@@ -158,6 +182,7 @@ fn nccl_error(operation: &str, err: cudarc::nccl::result::NcclError) -> ServerEr
     }
 }
 
+#[cfg(feature = "nccl")]
 impl CollectiveDriver for Cuda {
     type Communicator = cudarc::nccl::sys::ncclComm_t;
     type UniqueId = cudarc::nccl::sys::ncclUniqueId;
@@ -404,7 +429,7 @@ impl CollectiveDriver for Cuda {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "nccl"))]
 mod tests {
     use super::*;
 
@@ -448,5 +473,122 @@ mod tests {
         let f32 = ElemType::Float(FloatKind::F32);
         assert_eq!(nccl_elements(f32, 12).map(|it| it.count).ok(), Some(3));
         assert!(nccl_elements(f32, 6).is_err());
+    }
+}
+
+/// The no-NCCL stub: every collective refuses with the runtime's
+/// no-device-transport error — the same answer a backend without a
+/// transport gives. The type states exist so the server plumbing
+/// ([`Collectives`] over this driver) compiles unchanged; nothing can
+/// ever mint a group, so nothing reaches an operation.
+#[cfg(not(feature = "nccl"))]
+impl CollectiveDriver for Cuda {
+    type Communicator = ();
+    type UniqueId = ();
+    type DataType = ();
+    type CommStream = ();
+
+    fn group_id(_id: &CommunicationId) -> Result<Self::UniqueId, ServerError> {
+        Err(no_nccl())
+    }
+
+    fn join(
+        _id: Self::UniqueId,
+        _ranks: usize,
+        _rank: usize,
+    ) -> Result<Self::Communicator, ServerError> {
+        Err(no_nccl())
+    }
+
+    fn elements(
+        _dtype: ElemType,
+        _size: u64,
+    ) -> Result<Elements<Self::DataType>, ServerError> {
+        Err(no_nccl())
+    }
+
+    fn all_reduce(
+        _comm: &Self::Communicator,
+        _src: &GpuResource,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _op: ReduceOperation,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn all_gather(
+        _comm: &Self::Communicator,
+        _src: &GpuResource,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn reduce_scatter(
+        _comm: &Self::Communicator,
+        _src: &GpuResource,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _op: ReduceOperation,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn broadcast(
+        _comm: &Self::Communicator,
+        _src: Option<&GpuResource>,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _root: usize,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn send(
+        _comm: &Self::Communicator,
+        _src: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _peer: usize,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn recv(
+        _comm: &Self::Communicator,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _peer: usize,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+
+    fn all_to_all(
+        _comm: &Self::Communicator,
+        _src: &GpuResource,
+        _dst: &GpuResource,
+        _elements: Elements<Self::DataType>,
+        _ranks: usize,
+        _stream: Self::CommStream,
+    ) -> Result<(), ServerError> {
+        Err(no_nccl())
+    }
+}
+
+/// The refusal every no-NCCL path gives.
+#[cfg(not(feature = "nccl"))]
+fn no_nccl() -> ServerError {
+    ServerError::Generic {
+        reason: "this build of cubecl-cuda has no NCCL (the `nccl` feature is off), so \
+                 collectives have no transport"
+            .to_string(),
+        backtrace: BackTrace::capture(),
     }
 }

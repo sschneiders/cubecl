@@ -23,6 +23,12 @@ default = [
     "cubecl-core/default",
 ]
 cpp = []
+# NCCL collectives: opt-in, because the cudarc feature it forwards
+# changes how the WHOLE graph's cudarc links (see the workspace cudarc
+# note). A build without it compiles the no-NCCL stub: every collective
+# refuses with the runtime's no-device-transport error, exactly like a
+# backend without a transport.
+nccl = ["cudarc/nccl"]
 pliron-dump = ["cubecl-cpp/pliron-dump", "cubecl-llvm/pliron-dump"]
 ptx-wmma = []
 persistence = ["cubecl-server/persistence"]

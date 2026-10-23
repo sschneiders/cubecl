@@ -32,6 +32,7 @@ pub(crate) fn cuda_present() -> bool {
 }
 
 /// The NCCL library is loadable (or linked statically).
+#[cfg(feature = "nccl")]
 pub(crate) fn nccl_present() -> bool {
     #[cfg(target_os = "windows")]
     let names = ["nccl.dll"];
