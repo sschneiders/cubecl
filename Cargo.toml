@@ -257,6 +257,10 @@ wgpu-hal = "^30.0.0"
 
 renderdoc = "0.12"
 
+# The culib presence probe (cubecl-cuda): the same crate cudarc loads its
+# libraries through, so the graph carries one copy.
+libloading = "0.9"
+
 # Build deps
 cc = "1.2"
 cfg_aliases = "0.2.2"

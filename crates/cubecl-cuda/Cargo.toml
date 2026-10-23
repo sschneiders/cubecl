@@ -46,6 +46,14 @@ tracing = [
 log = { workspace = true }
 tracing = { workspace = true, features = ["attributes"], optional = true }
 
+# The driver/NCCL presence probe (culib.rs): asked through libloading
+# directly, because cudarc's own `is_culib_present` exists only under its
+# `dynamic-loading` mode, which the graph's feature union does not
+# guarantee (a consumer pulling cudarc with `dynamic-linking` — candle
+# does, under its `cuda` feature — suppresses the fallback cfg that would
+# enable it).
+libloading = { workspace = true }
+
 bytemuck = { workspace = true }
 cubecl-common = { workspace = true, features = [
     "hash",

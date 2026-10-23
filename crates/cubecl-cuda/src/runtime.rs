@@ -519,8 +519,8 @@ impl Runtime for CudaRuntime {
         // erroring when it is not installed, so ask first. A machine with no
         // NVIDIA driver has no CUDA devices; it is not failing the question.
         //
-        // SAFETY: the call only tries to `dlopen` each candidate name.
-        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        // SAFETY: the probe only tries to `dlopen` each candidate name.
+        if !crate::culib::cuda_present() {
             return Vec::new();
         }
 
@@ -546,9 +546,9 @@ impl Runtime for CudaRuntime {
     }
 
     fn description(device: &Self::Device) -> Option<DeviceDescription> {
-        // SAFETY: the call only tries to `dlopen` each candidate name; past it,
+        // SAFETY: the probe only tries to `dlopen` each candidate name; past it,
         // the driver is loaded and initializing it cannot panic.
-        if !unsafe { cudarc::driver::sys::is_culib_present() } {
+        if !crate::culib::cuda_present() {
             return None;
         }
         cudarc::driver::result::init().ok()?;

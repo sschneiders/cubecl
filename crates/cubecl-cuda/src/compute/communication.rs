@@ -79,8 +79,8 @@ pub struct Nccl {
 impl Nccl {
     /// The NCCL this process loads, for a device of `arch_version`, or `None` when none loads.
     pub fn new(arch_version: u32) -> Option<Self> {
-        // SAFETY: the call only tries to `dlopen` each candidate name.
-        if !unsafe { cudarc::nccl::sys::is_culib_present() } {
+        // SAFETY: the probe only tries to `dlopen` each candidate name.
+        if !crate::culib::nccl_present() {
             return None;
         }
         match cudarc::nccl::result::get_nccl_version() {
