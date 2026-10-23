@@ -53,10 +53,23 @@ cuda_op!(FuncOp, |op, ctx| {
             Some(Dim3 { x, y, z }) => format!("__cluster_dims__({x}, {y}, {z})"),
             None => "".into(),
         };
-        format!(
-            r#"extern "C" __global__ {return_ty} __launch_bounds__({}) {cluster_dim}"#,
-            abi.cube_dim.num_elems(),
-        )
+        // A minBlocks above 1 tells cicc the kernel must co-schedule that
+        // many blocks per SM: it structures the body (sinks live values,
+        // lowers the working set) so the DRIVER's register allocation —
+        // both the link step and the module JIT, which ignore the
+        // `CU_JIT_MAX_REGISTERS` option on this driver — lands at or
+        // under the budget. The spill cost is cicc's to manage; the
+        // occupancy is the kernel's to keep.
+        let bounds = if abi.min_blocks_per_multiprocessor > 1 {
+            format!(
+                "__launch_bounds__({}, {})",
+                abi.cube_dim.num_elems(),
+                abi.min_blocks_per_multiprocessor,
+            )
+        } else {
+            format!("__launch_bounds__({})", abi.cube_dim.num_elems())
+        };
+        format!(r#"extern "C" __global__ {return_ty} {bounds} {cluster_dim}"#)
     } else {
         format!("__device__ {return_ty}")
     };

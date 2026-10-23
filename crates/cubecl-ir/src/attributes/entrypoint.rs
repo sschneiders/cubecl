@@ -16,13 +16,19 @@ use crate::{prelude::*, settings::Dim3};
 
 #[pliron_attr(
     name = "cube.entrypoint_abi",
-    format = "`<cube_dim: ` $cube_dim opt($cluster_dim) `>`",
+    format = "`<cube_dim: ` $cube_dim opt($cluster_dim) ` min_blocks:` $min_blocks_per_multiprocessor `>`",
     verifier = "succ"
 )]
 #[derive(new, PartialEq, Clone, Debug, Hash)]
 pub struct EntrypointAbiAttr {
     pub cube_dim: Dim3,
     pub cluster_dim: Option<Dim3>,
+    /// The `minBlocksPerMultiprocessor` half of a CUDA `__launch_bounds__`,
+    /// derived from the kernel's register budget: 0 when the budget is
+    /// absent or fits no second block. Carrying it here (rather than
+    /// re-deriving it in each backend) keeps every entry-point emission on
+    /// one definition of the number.
+    pub min_blocks_per_multiprocessor: u32,
 }
 
 dict_key!(

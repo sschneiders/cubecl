@@ -329,7 +329,23 @@ fn new_context(settings: KernelSettings) -> Rc<UnsafeCell<Context>> {
     // Start out empty and fill in once args register themselves
     let entry_func_ty = FunctionType::get(&ctx, vec![], vec![UnitType::get(&ctx).into()]);
     let entry_name = Identifier::try_new(settings.kernel_name).unwrap_or(ident("kernel_entry"));
-    let abi = EntrypointAbiAttr::new(settings.cube_dim, settings.cluster_dim);
+    // The `__launch_bounds__` minBlocks half: with a register budget, the
+    // co-residency the budget buys (64 K 32-bit registers per SM on every
+    // NVIDIA die the fork targets — Pascal through Blackwell). A budget
+    // that fits no second block, or no budget, emits 0 and the backends
+    // keep the units-only launch bounds.
+    let min_blocks = settings
+        .max_registers
+        .map(|registers| {
+            let per_block = registers as usize * settings.cube_dim.num_elems() as usize;
+            65536usize.checked_div(per_block).unwrap_or(0) as u32
+        })
+        .unwrap_or(0);
+    let abi = EntrypointAbiAttr::new(
+        settings.cube_dim,
+        settings.cluster_dim,
+        min_blocks,
+    );
     let entry_func = FuncOp::new(&mut ctx, entry_name, entry_func_ty);
     entry_func.set_visibility(&mut ctx, SymbolVisibility::Public);
     entry_func.set_entrypoint_abi(&mut ctx, abi);
