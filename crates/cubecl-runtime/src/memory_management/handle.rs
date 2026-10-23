@@ -1,9 +1,26 @@
-use crate::memory_management::MemoryHandle;
+use crate::memory_management::{EXTERNAL_POOL_POS, MemoryHandle};
 use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Foreign device memory wrapped as a handle: an allocation the caller owns
+/// (another allocator's slab, another runtime's tensor) that the pools must
+/// treat as fully opaque.
+///
+/// The `ptr` is a live device address on the runtime's device, `size_bytes`
+/// the extent the wrapper vouches for. Nothing here frees, moves or measures
+/// it — the memory outlives the handle by the caller's own liveness guarantee
+/// (see `ComputeClient::create_external`'s contract), and it is never a pool
+/// slice, so no recycle, relocation or report can ever touch it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalMemory {
+    /// The device address the wrap was built from.
+    pub ptr: u64,
+    /// The wrapped extent, in bytes.
+    pub size_bytes: u64,
+}
 
 /// Managed Memory handle
 #[derive(Debug)]
@@ -59,6 +76,11 @@ pub struct ManagedMemoryDescriptor {
     #[doc(hidden)]
     pub id: ManagedMemoryId,
     location: AtomicU64,
+    /// Set exactly when the handle wraps foreign memory
+    /// ([`ManagedMemoryHandle::external`]). Immutable for the descriptor's
+    /// whole life — a wrap's address is fixed at creation — so it reads
+    /// without atomics off the shared `Arc`.
+    external: Option<ExternalMemory>,
 }
 
 impl core::fmt::Debug for ManagedMemoryDescriptor {
@@ -66,6 +88,7 @@ impl core::fmt::Debug for ManagedMemoryDescriptor {
         f.debug_struct("ManagedMemoryDescriptor")
             .field("id", &self.id)
             .field("location", &self.location())
+            .field("external", &self.external)
             .finish()
     }
 }
@@ -119,18 +142,29 @@ impl ManagedMemoryDescriptor {
     }
 
     /// Retrieves the current location.
+    ///
+    /// For an external handle this is the fixed external sentinel: it is
+    /// "allocated" (the memory exists) and routable to no pool.
     #[doc(hidden)]
     pub fn location(&self) -> MemoryLocation {
         MemoryLocation::from_bits(self.location.load(Ordering::Relaxed))
     }
 
+    /// The foreign memory this handle wraps, if any.
+    #[doc(hidden)]
+    pub fn external(&self) -> Option<ExternalMemory> {
+        self.external
+    }
+
     /// Whether a reservation ever gave this memory a location.
     ///
     /// A handle is minted before its memory exists, and the reservation that
-    /// follows can fail: a full device, a size no pool accepts.
+    /// follows can fail: a full device, a size no pool accepts. An external
+    /// handle needs no reservation — the memory is the caller's — and counts
+    /// as allocated from birth.
     #[doc(hidden)]
     pub fn is_allocated(&self) -> bool {
-        self.location().init != 0
+        self.external.is_some() || self.location().init != 0
     }
 
     #[doc(hidden)]
@@ -193,6 +227,20 @@ impl MemoryLocation {
             init: 0,
         }
     }
+
+    /// The external sentinel: "allocated" (the memory is the caller's) and
+    /// routable to no pool ([`EXTERNAL_POOL_POS`], one the pools never
+    /// take). Fixed for an external handle's whole life — a wrap's address
+    /// never changes, so nothing ever updates this location.
+    #[doc(hidden)]
+    pub fn external() -> Self {
+        Self {
+            pool: EXTERNAL_POOL_POS,
+            page: 0,
+            slice: 0,
+            init: 1,
+        }
+    }
 }
 
 impl ManagedMemoryHandle {
@@ -204,6 +252,41 @@ impl ManagedMemoryHandle {
             descriptor: Arc::new(ManagedMemoryDescriptor {
                 id: ManagedMemoryId { value },
                 location: AtomicU64::new(MemoryLocation::uninit().to_bits()),
+                external: None,
+            }),
+            handle_count: Arc::new(()),
+        }
+    }
+
+    /// Wraps FOREIGN device memory as a handle: `[ptr, ptr + size_bytes)` is
+    /// a live device allocation the CALLER owns, which the pools treat as
+    /// fully opaque — never freed (dropping every handle frees nothing),
+    /// never moved, never handed out by an allocation, never counted in a
+    /// pool's usage.
+    ///
+    /// The descriptor carries the address from birth, so the handle is
+    /// usable as soon as it exists; nothing is sent to a server and nothing
+    /// is allocated. The location is the fixed external sentinel
+    /// ([`EXTERNAL_POOL_POS`]): "allocated", routable to no pool, so the
+    /// failure/taint bookkeeping (which has no slice to record on) passes
+    /// the handle through and the dereference resolves it straight from the
+    /// descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The caller guarantees `ptr` is a live device allocation on the
+    /// runtime's device (same context), that it stays valid while any
+    /// handle or binding naming it can reach a kernel, and that `size_bytes`
+    /// is the true extent. See the wrap entry point's contract
+    /// (`ComputeClient::create_external`) for the full rules.
+    pub unsafe fn external(ptr: u64, size_bytes: u64) -> Self {
+        let value = Self::gen_id();
+
+        Self {
+            descriptor: Arc::new(ManagedMemoryDescriptor {
+                id: ManagedMemoryId { value },
+                location: AtomicU64::new(MemoryLocation::external().to_bits()),
+                external: Some(ExternalMemory { ptr, size_bytes }),
             }),
             handle_count: Arc::new(()),
         }
@@ -355,6 +438,49 @@ pub fn optimal_align(shape: usize, elem_size: usize, buffer_align: usize) -> usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_management::EXTERNAL_POOL_POS;
+
+    /// An external handle is born "allocated" (the memory is the caller's),
+    /// at a location no pool can route, carrying the exact address and
+    /// extent it was wrapped with — and nothing about it is pooled state.
+    #[test]
+    fn an_external_handle_is_allocated_unroutable_and_faithful() {
+        // SAFETY: the test never dereferences the address; only the
+        // descriptor's bookkeeping is under test.
+        let handle = unsafe { ManagedMemoryHandle::external(0x0000_1234_5678_9000, 4096) };
+
+        assert!(handle.descriptor().is_allocated());
+        let external = handle
+            .descriptor()
+            .external()
+            .expect("the wrap is on the descriptor");
+        assert_eq!(external.ptr, 0x0000_1234_5678_9000);
+        assert_eq!(external.size_bytes, 4096);
+        assert_eq!(handle.descriptor().location().pool, EXTERNAL_POOL_POS);
+        assert_eq!(handle.descriptor().location().init, 1);
+
+        // Clones share the wrap (the descriptor is the Arc's payload).
+        let clone = handle.clone();
+        assert_eq!(
+            clone.descriptor().external(),
+            handle.descriptor().external()
+        );
+    }
+
+    /// Dropping every handle of a wrap is the end of the descriptor and
+    /// nothing else: the Arc bookkeeping reaches zero with no pool, no
+    /// drop glue and no counter that could free the foreign memory.
+    #[test]
+    fn an_external_drop_has_no_pool_side_effects() {
+        // SAFETY: as above — bookkeeping only.
+        let handle = unsafe { ManagedMemoryHandle::external(0x0000_DEAD_0000_0000, 64) };
+        let binding = handle.clone().binding();
+        assert_eq!(binding.descriptor().external().unwrap().ptr, 0x0000_DEAD_0000_0000);
+        drop(binding);
+        drop(handle);
+        // The Arcs are gone; there is no registry a pool could consult —
+        // the absence of any way to reach the memory is the assertion.
+    }
 
     #[test]
     fn test_memory_id_mutability() {

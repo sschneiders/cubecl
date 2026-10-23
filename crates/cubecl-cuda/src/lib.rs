@@ -3,6 +3,7 @@ extern crate derive_new;
 extern crate alloc;
 
 pub mod compiler;
+pub mod foreign;
 mod compute;
 mod device;
 mod runtime;

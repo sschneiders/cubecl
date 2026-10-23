@@ -160,6 +160,25 @@ impl ComputeStorage for GpuStorage {
         self.mem_alignment
     }
 
+    /// The resource for the foreign allocation `[ptr, ptr + size)`: the
+    /// caller's address carried as-is — no allocation, no copy, no
+    /// ownership. The pointer takes a slot in the bindings ring exactly as
+    /// [`ComputeStorage::get`] gives one to a pooled address, so the launch
+    /// path's param packing (a pointer INTO the ring) is unchanged.
+    ///
+    /// # Safety
+    ///
+    /// As the trait method: `ptr` must be a live device allocation on this
+    /// storage's device, valid while the returned resource can reach work.
+    unsafe fn get_external(&mut self, ptr: u64, size: u64) -> Result<Self::Resource, IoError> {
+        let binding = self.ptr_bindings.register(ptr);
+        Ok(GpuResource::new(
+            *binding,
+            binding as *const cudarc::driver::sys::CUdeviceptr as *mut std::ffi::c_void,
+            size,
+        ))
+    }
+
     fn get(&mut self, handle: &StorageHandle) -> Result<Self::Resource, IoError> {
         let (ptr, _, _) =
             self.memory
@@ -255,6 +274,47 @@ impl ComputeStorage for GpuStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cudarc::driver::DevicePtr as _;
+
+    /// A foreign allocation rides `get_external` with its exact address and
+    /// extent, and the storage's own accounting never sees it: the wrap is
+    /// a dereference, not an allocation.
+    #[test_log::test]
+    fn a_foreign_allocation_resolves_untouched_and_unaccounted() {
+        let context = cudarc::driver::CudaContext::new(0).unwrap();
+        let stream = context.new_stream().unwrap();
+
+        // The foreign allocation: owned by cudarc, not by this storage.
+        let foreign: cudarc::driver::CudaSlice<u32> = stream.alloc_zeros(64).unwrap();
+        let foreign_ptr = foreign.device_ptr(&stream).0 as u64;
+
+        let mut storage = GpuStorage::new(512, stream.cu_stream(), CudaAllocator::Sync);
+        let before = storage.bytes_allocated();
+
+        // SAFETY: `foreign_ptr` is the live allocation `foreign` owns, kept
+        // alive past this call.
+        let resource =
+            unsafe { storage.get_external(foreign_ptr, 64 * 4) }.expect("the wrap resolves");
+        assert_eq!(resource.ptr, foreign_ptr, "the address is the caller's, as-is");
+        assert_eq!(resource.size, 64 * 4);
+        assert!(
+            !resource.binding.is_null(),
+            "the launch path's param slot exists"
+        );
+        assert_eq!(
+            storage.bytes_allocated(),
+            before,
+            "the pools' accounting never saw the foreign memory"
+        );
+
+        // A second wrap of a different address gets its own ring slot.
+        let foreign2: cudarc::driver::CudaSlice<u32> = stream.alloc_zeros(8).unwrap();
+        let foreign2_ptr = foreign2.device_ptr(&stream).0 as u64;
+        // SAFETY: as above.
+        let resource2 = unsafe { storage.get_external(foreign2_ptr, 8 * 4) }.unwrap();
+        assert_eq!(resource2.ptr, foreign2_ptr);
+        assert_ne!(resource.binding, resource2.binding, "distinct param slots");
+    }
 
     #[test]
     fn zero_size_allocations() {

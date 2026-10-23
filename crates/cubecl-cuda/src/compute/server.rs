@@ -37,8 +37,9 @@ use cubecl_server::{
     stream::{ExecuteScope, FailureStore, MultiStream, StreamCapture, WriteScoped, failed_writing},
 };
 use cudarc::driver::sys::{
-    CUstream, CUtensorMap, CUtensorMapDataType, CUtensorMapFloatOOBfill, CUtensorMapInterleave,
-    CUtensorMapL2promotion, CUtensorMapSwizzle, cuTensorMapEncodeIm2col, cuTensorMapEncodeTiled,
+    CUevent_flags, CUevent_wait_flags, CUstream, CUtensorMap, CUtensorMapDataType,
+    CUtensorMapFloatOOBfill, CUtensorMapInterleave, CUtensorMapL2promotion, CUtensorMapSwizzle,
+    cuTensorMapEncodeIm2col, cuTensorMapEncodeTiled,
 };
 use std::{collections::HashMap, convert::Infallible, ffi::c_void, sync::Arc};
 
@@ -1021,6 +1022,68 @@ impl CudaServer {
     /// no-op with no profile open.
     fn profile_failure(&mut self, error: &ServerError) {
         self.ctx.profiler.failure(error);
+    }
+
+    /// Records a fresh event on the stream `stream_id` resolves to, behind
+    /// everything already enqueued there. The handle is the caller's to
+    /// destroy (the `foreign` module's `ForeignEvent` owns it). The other
+    /// half of the foreign-stream ordering pair — see
+    /// [`crate::foreign`].
+    ///
+    /// # Errors
+    ///
+    /// A stream that cannot be created, and the driver's refusal to create
+    /// or record the event.
+    pub(crate) fn foreign_record_event(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Result<u64, ServerError> {
+        self.unsafe_set_current();
+        let mut streams = self.streams.resolve(stream_id, [].into_iter())?;
+        let sys = streams.current().sys;
+
+        // SAFETY: the context is the device's and current (above); `sys` is
+        // a stream this server holds.
+        let event = unsafe {
+            let event = cudarc::driver::result::event::create(CUevent_flags::CU_EVENT_DEFAULT)
+                .map_err(|err| super::events::driver_error("cuEventCreate", err))?;
+            cudarc::driver::result::event::record(event, sys)
+                .map_err(|err| super::events::driver_error("cuEventRecord", err))?;
+            event
+        };
+        Ok(event as usize as u64)
+    }
+
+    /// Makes the stream `stream_id` resolves to wait for `event` before any
+    /// work enqueued on it afterwards. `event` is any event recorded on this
+    /// device's context — including one a foreign allocator's runtime
+    /// recorded (the wrap contract's ordering primitive: a foreign producer
+    /// records, the stream consuming a wrapped buffer waits).
+    ///
+    /// # Errors
+    ///
+    /// A stream that cannot be created, and the driver's refusal to wait.
+    pub(crate) fn foreign_wait_event(
+        &mut self,
+        stream_id: StreamId,
+        event: u64,
+    ) -> Result<(), ServerError> {
+        self.unsafe_set_current();
+        let mut streams = self.streams.resolve(stream_id, [].into_iter())?;
+        let sys = streams.current().sys;
+
+        // SAFETY: `event` is a live event handle on this context — the
+        // record side guarantees it outlives this call — and `sys` a stream
+        // this server holds.
+        unsafe {
+            cudarc::driver::result::stream::wait_event(
+                sys,
+                event as usize as *mut _,
+                CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
+            )
+            .map_err(|err| super::events::driver_error("cuStreamWaitEvent", err))?;
+        }
+        Ok(())
     }
 
     /// Taint what a failure the caller is already being handed left as it was,

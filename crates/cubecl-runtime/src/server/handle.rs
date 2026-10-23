@@ -93,6 +93,30 @@ impl Handle {
             size,
         }
     }
+
+    /// A handle naming FOREIGN device memory: `[ptr, ptr + size)` is a live
+    /// device allocation the caller owns and keeps alive; no pool is asked
+    /// for anything and nothing is copied. Dropping the handle frees
+    /// nothing. See `ComputeClient::create_external` (the wrap entry point)
+    /// for the full safety contract.
+    ///
+    /// # Safety
+    ///
+    /// As [`ManagedMemoryHandle::external`](crate::memory_management::ManagedMemoryHandle::external):
+    /// `ptr` must be a live allocation on this service's device, valid while
+    /// this handle (or any clone/binding of it) can reach work, `size` the
+    /// true extent.
+    pub unsafe fn external(service: ServiceId, stream: StreamId, ptr: u64, size: u64) -> Self {
+        Self {
+            // SAFETY: the caller's contract (see the doc above).
+            memory: unsafe { ManagedMemoryHandle::external(ptr, size) },
+            service,
+            offset_start: None,
+            offset_end: None,
+            stream,
+            size,
+        }
+    }
     /// Checks whether the handle can be mutated in-place without affecting other computation.
     pub fn can_mut(&self) -> bool {
         self.memory.can_mut()

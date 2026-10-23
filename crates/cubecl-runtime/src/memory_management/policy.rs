@@ -68,3 +68,12 @@ pub const PERSISTENT_POOL_POS: u8 = u8::MAX;
 /// a fixed sentinel for the same reason as [`PERSISTENT_POOL_POS`].
 #[doc(hidden)]
 pub const DEDICATED_POOL_POS: u8 = u8::MAX - 1;
+
+/// The pool position stamped on external handles
+/// ([`ManagedMemoryHandle::external`](crate::memory_management::ManagedMemoryHandle::external)):
+/// foreign device memory no pool owns. A fixed sentinel for the same reason
+/// as the two above, and one no pool ever takes: `find` refuses the position
+/// before any pool is asked, so an external can never resolve into pooled
+/// memory — it is never freed, moved, handed out again or accounted by a pool.
+#[doc(hidden)]
+pub const EXTERNAL_POOL_POS: u8 = u8::MAX - 2;

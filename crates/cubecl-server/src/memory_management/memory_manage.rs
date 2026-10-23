@@ -256,7 +256,18 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     }
 
     /// The allocation behind `binding`.
+    ///
+    /// An external handle wraps foreign memory no pool holds; it has no
+    /// slice anywhere, so its lookup answers `NotFound` — the callers that
+    /// map a failed lookup to "no claim" (the failure store, above all)
+    /// pass externals through, and nothing else ever asks a pool for one.
     fn find(&self, binding: &ManagedMemoryBinding) -> Result<&Slice, IoError> {
+        if binding.descriptor().external().is_some() {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: "external memory is not pooled".into(),
+            });
+        }
         let slice = self.pool(allocated(binding.descriptor())?)?.find(binding)?;
         owned_by(slice, binding)?;
         Ok(slice)
@@ -265,6 +276,12 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     /// [`find`](Self::find), mutably — the path [`taint`](Self::taint) and
     /// [`written`](Self::written) take to reach the slice.
     fn find_mut(&mut self, binding: &ManagedMemoryBinding) -> Result<&mut Slice, IoError> {
+        if binding.descriptor().external().is_some() {
+            return Err(IoError::NotFound {
+                backtrace: BackTrace::capture(),
+                reason: "external memory is not pooled".into(),
+            });
+        }
         let slice = self
             .pool_mut(allocated(binding.descriptor())?)?
             .find_mut(binding)?;
@@ -354,6 +371,11 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
         if location.init == 0 {
             return Ok(());
         }
+        // An external's backing is the caller's allocation: there is nothing
+        // to install and no pool to ask (see `find`).
+        if binding.descriptor().external().is_some() {
+            return Ok(());
+        }
         match PoolPosition::new(location.pool) {
             PoolPosition::Persistent => self.persistent.materialize(&mut self.storage, binding),
             PoolPosition::Dedicated => self.dedicated.materialize(&mut self.storage, binding),
@@ -376,12 +398,46 @@ impl<Storage: ComputeStorage> MemoryManagement<Storage> {
     }
 
     /// Returns the resource from the storage at the specified handle
+    ///
+    /// An external handle short-circuits here: its resource is built
+    /// straight from the foreign address the descriptor carries (offsets
+    /// applied), never from a pool slice — the wrapped memory is not this
+    /// manager's to look up, only to dereference.
     pub fn get_resource(
         &mut self,
         binding: ManagedMemoryBinding,
         offset_start: Option<u64>,
         offset_end: Option<u64>,
     ) -> Result<Storage::Resource, IoError> {
+        if let Some(external) = binding.descriptor().external() {
+            let start = offset_start.unwrap_or(0);
+            let end = offset_end.unwrap_or(0);
+            let Some(size) = external
+                .size_bytes
+                .checked_sub(start)
+                .and_then(|size| size.checked_sub(end))
+            else {
+                return Err(IoError::NotFound {
+                    backtrace: BackTrace::capture(),
+                    reason: format!(
+                        "external offsets {start}..-{end} do not fit the wrapped {} B",
+                        external.size_bytes
+                    )
+                    .into(),
+                });
+            };
+            if size == 0 {
+                return Err(IoError::NotFound {
+                    backtrace: BackTrace::capture(),
+                    reason: "external view is empty after offsets".into(),
+                });
+            }
+            // SAFETY: the wrap entry point's contract — `external.ptr` is a
+            // live device allocation the caller keeps alive, `size` its
+            // (offset-adjusted) true extent.
+            return unsafe { self.storage.get_external(external.ptr + start, size) };
+        }
+
         let handle = self.get_storage(binding)?;
 
         let handle = match offset_start {
@@ -730,6 +786,59 @@ mod tests {
             "served by {:?}",
             served.kind
         );
+    }
+
+    /// An external handle is foreign property: its lookup is `NotFound` (the
+    /// pass-through the failure store relies on — no slice, no claim), its
+    /// cursor does not exist, and its resource dereference refuses loudly on
+    /// a storage that cannot alias foreign memory (the default; the CUDA
+    /// storage overrides it).
+    #[test_log::test]
+    #[cfg(not(exclusive_memory_only))]
+    fn an_external_handle_is_outside_every_pool() {
+        use crate::memory_management::EXTERNAL_POOL_POS;
+
+        let mut memory_management = MemoryManagement::from_configuration(
+            BytesStorage::default(),
+            &DUMMY_MEM_PROPS,
+            MemoryConfiguration::Adaptive,
+            Arc::new(ServerLogger::default()),
+            options(),
+        );
+        // A pooled neighbor, so "unchanged" means something.
+        let _pooled = memory_management
+            .reserve(512, PageUpdate::Allow, &mut ErrorGraph::default())
+            .unwrap();
+
+        // SAFETY: the test never dereferences the address; only the
+        // manager's routing of the wrap is under test.
+        let external = unsafe { ManagedMemoryHandle::external(0x0000_FEED_0000_0000, 256) };
+        let binding = external.clone().binding();
+
+        // Allocated (the wrap exists), at the external sentinel, and every
+        // pooled question answers as if the memory did not exist here.
+        assert!(binding.descriptor().is_allocated());
+        assert_eq!(binding.descriptor().location().pool, EXTERNAL_POOL_POS);
+        assert!(memory_management.get_cursor(binding.clone()).is_err());
+        assert!(
+            memory_management
+                .failure(&binding, 0..256)
+                .is_none()
+        );
+        assert!(
+            memory_management
+                .get_resource(binding.clone(), None, None)
+                .is_err()
+        );
+
+        // The pools' accounting never saw it.
+        let report = memory_management.memory_report();
+        assert_eq!(report.usage().bytes_in_use, 512);
+
+        // Dropping the handle changes nothing the pools hold.
+        drop(binding);
+        drop(external);
+        assert_eq!(memory_management.memory_report().usage().bytes_in_use, 512);
     }
 
     // Test pools with slices.

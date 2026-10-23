@@ -1,5 +1,7 @@
 use crate::{memory_management::ManagedMemoryBinding, server::IoError, storage_id_type};
+use alloc::format;
 use core::fmt::Debug;
+use cubecl_environment::backtrace::BackTrace;
 
 // This ID is used to map a handle to its actual data.
 storage_id_type!(StorageId);
@@ -87,6 +89,36 @@ pub trait ComputeStorage: Send {
     /// allocation for the handle's id — a handle that outlived its allocation,
     /// or one whose id a deallocation retired.
     fn get(&mut self, handle: &StorageHandle) -> Result<Self::Resource, IoError>;
+
+    /// The resource for FOREIGN device memory this storage does not own:
+    /// the extent `[ptr, ptr + size)` of a live device allocation the caller
+    /// wrapped (see the wrap entry point's contract). The resource carries
+    /// the caller's address as-is — no allocation, no copy, no ownership.
+    ///
+    /// Default: refuse loudly. Only backends that can alias a foreign
+    /// allocation on their device override this; on every other backend a
+    /// wrapped buffer is a loud error at first use, not silent corruption.
+    ///
+    /// # Errors
+    ///
+    /// The unsupported default, and whatever the overriding backend refuses.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be a live device allocation on this storage's device,
+    /// valid while the returned resource can reach work, and `size` its true
+    /// extent — the wrap entry point's caller guarantees it.
+    unsafe fn get_external(&mut self, ptr: u64, size: u64) -> Result<Self::Resource, IoError> {
+        let _ = size;
+        let _ = ptr;
+        Err(IoError::Unknown {
+            description: format!(
+                "external buffers are not supported on {} storage",
+                core::any::type_name::<Self>()
+            ),
+            backtrace: BackTrace::capture(),
+        })
+    }
 
     /// Allocates `size` units of memory and returns a handle to it
     fn alloc(&mut self, size: u64) -> Result<StorageHandle, IoError>;

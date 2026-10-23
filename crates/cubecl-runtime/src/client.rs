@@ -865,6 +865,98 @@ impl Client {
         self.do_empty(descriptors)
     }
 
+    /// Wraps FOREIGN device memory as a [`Handle`]: `[ptr, ptr + len · size_of::<T>())`
+    /// is a live device allocation on this client's device that the caller
+    /// owns. NO pool allocation, NO copy, NO ownership transfer — the handle
+    /// is an alias the launcher accepts, and every launch that consumes it
+    /// rides the exact same kernel-param path a pool buffer does.
+    ///
+    /// The contract the caller guarantees, in exchange:
+    ///
+    /// - **Ownership stays foreign.** The pools never free, move or hand out
+    ///   the memory; dropping the handle (and every clone) frees nothing and
+    ///   the memory reports exclude it. The caller holds the foreign
+    ///   allocation alive — e.g. the `Arc` inside a cudarc `CudaSlice` —
+    ///   until every launch consuming the handle has COMPLETED.
+    /// - **Same device, same context.** `ptr` must belong to this runtime's
+    ///   device. A foreign allocator using the same primary context (cudarc
+    ///   does) satisfies this; anything else is refused by the driver at
+    ///   best.
+    /// - **Aliasing is the caller's to order.** A wrapped buffer aliases
+    ///   memory the pool cannot see, so the pool's exclusion and
+    ///   write-tracking rules cannot order it against a foreign producer.
+    ///   The wrap carries this client's current stream (the handle's
+    ///   `stream` field); work on that stream that reads the buffer must be
+    ///   ordered against the foreign writes by the caller — a host
+    ///   synchronization of the producer before the first consuming launch,
+    ///   or an explicit event pair. Kernels reading/writing the wrapped
+    ///   buffer through this runtime are ordinary stream work: subsequent
+    ///   launches on the same stream see them in program order.
+    /// - **`len` is in ELEMENTS of `T`** and must be non-zero (a zero-length
+    ///   kernel buffer is rejected loudly here).
+    /// - **Alignment ≥ 16 B** is asserted: vectorized staged-tile loads read
+    ///   16 B pairs, and a mis-aligned foreign slab would fault or corrupt
+    ///   silently.
+    ///
+    /// Backends that cannot alias foreign memory answer a loud error when
+    /// the handle is first dereferenced (`ComputeStorage::get_external`'s
+    /// unsupported default) — the wrap itself is runtime-erased and cannot
+    /// know the backend.
+    ///
+    /// # Safety
+    ///
+    /// See the contract above; every bullet is the caller's obligation. In
+    /// particular the pointer must be a real device address (not a host
+    /// pointer) on this client's device.
+    pub unsafe fn create_external<T>(&self, ptr: *mut core::ffi::c_void, len: usize) -> Handle {
+        let elem = core::mem::size_of::<T>();
+        assert!(len > 0, "create_external: a zero-length wrap is rejected (foreign slabs must be non-empty)");
+        let size = len
+            .checked_mul(elem)
+            .expect("create_external: element count overflows the address space");
+        assert!(
+            (ptr as usize) % 16 == 0,
+            "create_external: foreign pointer {ptr:p} is not 16-byte aligned; a wrapped slab \
+             must be at least 16 B aligned (vectorized loads read 16 B pairs)"
+        );
+        // SAFETY: the caller's contract (see the doc above) — a live device
+        // allocation on this client's device, kept alive past every launch
+        // that consumes the handle.
+        unsafe { Handle::external(self.service_id(), self.stream_id(), ptr as u64, size as u64) }
+    }
+
+    /// Runs `task` on this client's device thread with the server downcast
+    /// to `S`, plus the stream id the client currently targets. The escape
+    /// hatch for backend-specific operations that have no `Server`-trait
+    /// method (a foreign-event record/wait pair, above all): the task
+    /// reaches the concrete server type without the trait growing a method
+    /// every backend must implement.
+    ///
+    /// # Errors
+    ///
+    /// This client's server is not an `S` (the same mismatch
+    /// [`Client::get_resource`] refuses), and whatever the device handle
+    /// reports.
+    pub fn server_task<S: ServerStorage, Re: Send + 'static>(
+        &self,
+        task: impl FnOnce(&mut S, StreamId) -> Re + Send + 'static,
+    ) -> Result<Re, ServerError> {
+        let stream_id = self.stream_id();
+        self.device
+            .submit_blocking(move |server| {
+                let server = (server as &mut dyn Any).downcast_mut::<S>();
+                match server {
+                    Some(server) => Ok(task(server, stream_id)),
+                    None => Err(ServerError::ServiceMismatch {
+                        client: String::from("this client's server"),
+                        requested: String::from(core::any::type_name::<S>()),
+                        backtrace: BackTrace::capture(),
+                    }),
+                }
+            })
+            .unwrap_or_resume()
+    }
+
     /// Marks the given [Bytes] as being a staging buffer, maybe transferring it to pinned memory
     /// for faster data transfer with compute device.
     ///
