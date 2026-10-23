@@ -1,8 +1,9 @@
 use cubecl_core::ir::{
-    attributes::{ATTR_TENSOR_MAP_BINDING, EntrypointInterface, FuncInterface},
+    attributes::{ATTR_BUFFER_IO, ATTR_TENSOR_MAP_BINDING, EntrypointInterface, FuncInterface},
     interfaces::TypedExt,
     settings::Dim3,
 };
+use cubecl_runtime::kernel::BufferIOAttr;
 use itertools::Itertools;
 use pliron::{
     builtin::{
@@ -103,11 +104,21 @@ fn gen_param(ctx: &Context, func: &FuncOp, i: usize, arg: Value) -> String {
     // serves the helper's loads through the read-only cache
     // (ld.global.nc), which the other helper's stores do not invalidate,
     // and (b) reorders loads against those stores — measured corruption
-    // that varies per launch. Entry kernels keep __restrict__: their
-    // params are distinct buffers, and the RO-cache weight-read path
-    // rides on it.
+    // that varies per launch. Entry kernels keep __restrict__ ONLY on
+    // args the visibility analysis proved READ-ONLY for the kernel's
+    // lifetime (the weight path rides on it): a __restrict__ claim on a
+    // ReadWrite arg licenses .nc promotion of its loads while NEIGHBOR
+    // CTAs (2 CTAs/SM share one SM's L1) or the SAME kernel's other
+    // params write the slab mid-kernel — the .nc contract is
+    // read-only-for-the-kernel's-lifetime, not read-only-before-first-
+    // read. When the IO attr is absent (unchecked launches) the old
+    // claim-keep behavior stands.
+    let io_read_only = func
+        .get_arg_attr::<BufferIOAttr>(ctx, i, &ATTR_BUFFER_IO)
+        .is_none_or(|io| *io == BufferIOAttr::ReadOnly);
     if (arg.is_ptr(ctx) || arg.is_uniform_ptr(ctx))
         && func.get_entrypoint_abi(ctx).is_some()
+        && io_read_only
     {
         segments.push("__restrict__".into());
     }
