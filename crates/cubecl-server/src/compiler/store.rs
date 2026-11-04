@@ -21,6 +21,28 @@ static SAID_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 static SAID_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 #[cfg(compilation_cache)]
 static SAID_STORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(compilation_cache)]
+static SAID_OPEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Announces, once per process, the first store opened: which database file
+/// it addresses, under which namespace, for which build. A warm cache that
+/// keeps missing names its cause here — a different working directory (the
+/// default root walks up from cwd to the outermost `Cargo.toml`), a
+/// different environment, or a rebuilt binary (the build id is half the
+/// cache key).
+#[cfg(compilation_cache)]
+fn note_store_open(namespace: &Namespace) {
+    use core::sync::atomic::Ordering;
+
+    if !SAID_OPEN.swap(true, Ordering::Relaxed) {
+        std::eprintln!(
+            "cubecl compilation cache: store live: db={} namespace={} build_id={:016x}",
+            cubecl_environment::environment::path().display(),
+            namespace.as_str(),
+            build_id_hash() as u64,
+        );
+    }
+}
 
 /// Announces, once per process, the first artifact served from the
 /// compilation store.
@@ -83,9 +105,12 @@ pub fn compilation_store<K: StoreKey, V: StoreValue>(
             return None;
         }
 
+        let namespace = Namespace::scoped(backend, fingerprint);
+        note_store_open(&namespace);
+
         Some(Store::new(
             StoreOptions::new()
-                .storage(Namespace::scoped(backend, fingerprint))
+                .storage(namespace)
                 .cache(CacheOption::Lazy),
         ))
     }

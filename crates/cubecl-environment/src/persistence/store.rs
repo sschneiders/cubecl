@@ -685,6 +685,12 @@ pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
         Ok(value) => Some(value),
         Err(err) => {
             log::warn!("Corrupted cache entry, ignoring it: {err}");
+            // To stderr too: this is the silent-swallow class — a read that
+            // returns `None` here reads downstream as a cache miss, and a
+            // warm cache where every read misses must say why. Runs rarely
+            // carry a logger.
+            #[cfg(std_io)]
+            std::eprintln!("cubecl cache: a stored entry failed to decode, ignoring it: {err}");
             None
         }
     }
