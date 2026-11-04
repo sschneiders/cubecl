@@ -174,6 +174,15 @@ impl RuntimeConfig for CubeClRuntimeConfig {
             self.throughput.disable_cache = !enabled;
         }
 
+        // The compilation cache is off by default (`CompilationConfig::cache`
+        // is a plain `#[serde(default)] bool`), and a run without a
+        // `cubecl.toml`/`burn.toml` section has no way to turn it on — the
+        // refusal is invisible, because configuration resolves before any
+        // logger exists. This override is the no-manifest arm switch.
+        if let Some(enabled) = env_bool("CUBECL_COMPILATION_CACHE") {
+            self.compilation.cache = enabled;
+        }
+
         if let Ok(val) = std::env::var("CUBECL_ENVIRONMENT") {
             self.environment.name = val;
         }

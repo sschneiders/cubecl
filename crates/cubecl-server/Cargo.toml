@@ -21,7 +21,19 @@ default = ["std", "storage-bytes", "persistence", "cubecl-runtime/default"]
 exclusive-memory-only = ["cubecl-runtime/exclusive-memory-only"]
 persistence = ["std", "cubecl-runtime/persistence"]
 profile-tracy = ["cubecl-runtime/profile-tracy", "dep:tracy-client"]
-std = ["cubecl-runtime/std", "cubecl-common/std", "cubecl-environment/std", "thiserror/std"]
+# `cubecl-runtime/persistence` rides `std` so the compilation-cache gate's
+# config field (`CompilationConfig::cache`, `#[cfg(persistence)]` there)
+# exists wherever the `compilation_cache` build alias is on — the alias is
+# `std_io`, deliberately decoupled from this crate's own persistence feature
+# (build.rs); a graph that carries the environment's storage must not lose
+# the cache because its feature list didn't mention it.
+std = [
+    "cubecl-runtime/std",
+    "cubecl-runtime/persistence",
+    "cubecl-common/std",
+    "cubecl-environment/std",
+    "thiserror/std",
+]
 storage-bytes = []
 tokio = ["cubecl-runtime/tokio"]
 

@@ -6,6 +6,43 @@ use cubecl_common::hash::{StableHash, StableHasher};
 use cubecl_environment::persistence::{CacheOption, Namespace, StoreOptions};
 use cubecl_environment::persistence::{Store, StoreKey, StoreValue};
 
+/// Whether the once-per-process diagnostics have spoken: the cache being
+/// disabled, the first artifact taken from the store, the first artifact
+/// stored. Refusals (`store_compiled`) speak every time — they should never
+/// happen in a healthy run.
+///
+/// These go to stderr rather than `log` on purpose: configuration resolves on
+/// first use, typically before the application has installed a logger, so a
+/// `log`-only diagnostic is written to nothing at all — which is exactly how
+/// the disabled cache hid as "the store silently refuses" for a campaign.
+#[cfg(compilation_cache)]
+static SAID_DISABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(compilation_cache)]
+static SAID_HIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+#[cfg(compilation_cache)]
+static SAID_STORED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Announces, once per process, the first artifact served from the
+/// compilation store.
+#[cfg(compilation_cache)]
+fn note_hit(name: &str) {
+    use core::sync::atomic::Ordering;
+
+    if !SAID_HIT.swap(true, Ordering::Relaxed) {
+        std::eprintln!("cubecl compilation cache: HIT {name} (loaded from the store)");
+    }
+}
+
+/// Announces, once per process, the first artifact the store accepted.
+#[cfg(compilation_cache)]
+fn note_stored() {
+    use core::sync::atomic::Ordering;
+
+    if !SAID_STORED.swap(true, Ordering::Relaxed) {
+        std::eprintln!("cubecl compilation cache: ARMED (storing compiled artifacts)");
+    }
+}
+
 /// Platform-specific build identifier, changes on rebuild
 pub type BuildId = Option<&'static [u8]>;
 
@@ -31,6 +68,18 @@ pub fn compilation_store<K: StoreKey, V: StoreValue>(
         use crate::config::RuntimeConfig;
 
         if !crate::config::CubeClRuntimeConfig::get().compilation.cache {
+            // Once per process, to stderr: this is the refusal that never
+            // reaches a log (configuration loads before any logger exists)
+            // and reads downstream as `keep` returning `false` for every
+            // kernel with no I/O to show for it.
+            use core::sync::atomic::Ordering;
+            if !SAID_DISABLED.swap(true, Ordering::Relaxed) {
+                std::eprintln!(
+                    "cubecl compilation cache: DISABLED (config [cubecl] compilation.cache = \
+                     false) — every kernel recompiles each run; arm with \
+                     CUBECL_COMPILATION_CACHE=1 or [cubecl] compilation.cache = true"
+                );
+            }
             return None;
         }
 
@@ -62,9 +111,20 @@ pub fn store_compiled<K: StoreKey, V: StoreValue>(
     value: V,
 ) -> bool {
     match store.insert(key, value) {
-        Ok(()) => true,
+        Ok(()) => {
+            #[cfg(compilation_cache)]
+            note_stored();
+            true
+        }
         Err(err) => {
             log::warn!("Unable to cache the compiled kernel: {}", err.reason());
+            // To stderr as well as `log`: a refusal means the artifact
+            // recompiles next run, and runs rarely carry a logger.
+            #[cfg(compilation_cache)]
+            std::eprintln!(
+                "cubecl compilation cache: REFUSED a compiled artifact: {}",
+                err.reason()
+            );
             false
         }
     }
@@ -208,6 +268,8 @@ impl<A: StoreValue> ArtifactStore<A> {
         let key = KernelCacheKey::new(kernel, self.build_id);
         let artifact = self.by_kernel.as_mut()?.remove(&key)?;
         log::trace!("Using the compilation store");
+        #[cfg(compilation_cache)]
+        note_hit(&kernel.short_name());
         Some(artifact)
     }
 
@@ -216,6 +278,8 @@ impl<A: StoreValue> ArtifactStore<A> {
         let key = KernelCacheKey::from_artifact_id(id, self.build_id);
         let artifact = self.by_kernel.as_mut()?.remove(&key)?;
         log::trace!("Using the compilation store for variant");
+        #[cfg(compilation_cache)]
+        note_hit(&id.kernel.short_name());
         Some(artifact)
     }
 
@@ -271,6 +335,8 @@ impl<A: StoreValue> ArtifactStore<A> {
             by_kernel.purge_key(&key)?
         };
         log::trace!("Using the compilation store, by source");
+        #[cfg(compilation_cache)]
+        note_hit("by source");
         Some(artifact)
     }
 
