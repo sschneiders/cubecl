@@ -524,6 +524,44 @@ impl Barrier {
     }
 }
 
+/// Commit every `copy_async` this unit has dispatched so far into one
+/// per-unit async group (`cp.async.commit_group`). sm_80+ (the
+/// `features.copy_async` class). Pairs with
+/// [`wait_copy_async_group`] for the classic block-wide software
+/// pipeline: per slab issue the next slab's chunks, commit the group,
+/// `wait_copy_async_group(1)` (0 at the tail), cube-sync, consume.
+///
+/// Use THIS form for staging shared by all units of a cube.
+/// `Barrier::commit_copy_async` (the `cp.async.mbarrier.arrive` form)
+/// DEADLOCKS under that pattern — measured on sm_86 / CUDA 12.0:
+/// 256 units, one commit each, mbarrier initialized with arrival count
+/// 256, `wait_parity` never observes the phase completion
+/// (standalone PTX repro, 2026-11-05; single-unit elect-and-commit
+/// works, which is why the runtime test misses it).
+#[cube]
+pub fn commit_copy_async_group() {
+    intrinsic!(|scope| {
+        BuildAsmExpand::new(alloc::string::String::from("cp.async.commit_group;"))
+            .explicit_mem()
+            .register(scope);
+    })
+}
+
+/// Wait until at most `pending` of this unit's committed async-copy
+/// groups are still in flight (`cp.async.wait_group {pending}`;
+/// groups complete in commit order). sm_80+ — pairs with
+/// [`commit_copy_async_group`]. The `pending` count must be a compile
+/// time constant. A `sync_cube()` after the wait is still required to
+/// make OTHER units' copies visible before consuming shared memory.
+#[cube]
+pub fn wait_copy_async_group(#[comptime] pending: u32) {
+    intrinsic!(|scope| {
+        BuildAsmExpand::new(alloc::format!("cp.async.wait_group {pending};"))
+            .explicit_mem()
+            .register(scope);
+    })
+}
+
 impl From<SharedExpand<Barrier>> for BarrierExpand {
     fn from(value: SharedExpand<Barrier>) -> Self {
         value.expand.into()

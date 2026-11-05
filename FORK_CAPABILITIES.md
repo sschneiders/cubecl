@@ -150,3 +150,32 @@ the driver calls are the same `cuEventCreate`/`cuEventRecord`/
 `cargo test -p cubecl-llvm --features nvptx sync_storage` asserts the paired
 `fence.acq_rel.gpu` around `barrier.cta` — the megakernel handoff contract.
 Every capability above landed with that pin green and unchanged.
+
+## 6. cp.async commit-group intrinsics (`commit_copy_async_group` / `wait_copy_async_group`)
+
+The minimal intrinsics the mma16 tile's 2-stage software pipeline needs
+(`cp.async.commit_group` / `cp.async.wait_group N`, sm_80+ — same
+`features.copy_async` class the runtime already gates at
+`arch_version >= 80`). `copy_async` itself (the `CopyAsyncOp` →
+`cp.async.{ca,cg}.shared::cta.global` lowering) is upstream cubecl; what
+this fork ADDS is the per-unit group commit/wait pair, as
+`#[cube]` fns in `cubecl-core/src/frontend/barrier.rs` built on the
+fork's own `BuildAsmExpand` inline-asm path (`explicit_mem` = `"memory"`
+clobber, section 3's ordering vocabulary).
+
+Measured reason the mbarrier form is NOT the pipeline's commit:
+`Barrier::commit_copy_async` emits the PLAIN
+`cp.async.mbarrier.arrive.shared::cta.b64`, and under block-wide staging
+it DEADLOCKS — 256 units, one commit each, mbarrier initialized with
+arrival count 256, `wait_parity(phase)` never observes the phase
+completion on sm_86 / CUDA 12.0 / driver 580.173.02 (standalone PTX
+repro, 2026-11-05: variant v1 hangs; the same harness passes with
+commit_group/wait_group — v4 — and passes the FULL 2-stage pipeline with
+every one of 6144 per-thread slab residues nonzero and slab-varied —
+v5). The fork's `async_copy_test` runtime test does not catch this: it
+commits from ONE elected unit only. Until the mbarrier path is fixed,
+block-wide staging must use the commit-group pair.
+
+Tests: the standalone repro (`/tmp/cpasync_diag.cu` in the measuring
+session) + the consumer repo's dm16_shape_probe screen; the
+non-negotiable fence pin below stays green and unchanged.
