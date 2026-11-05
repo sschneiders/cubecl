@@ -136,6 +136,15 @@ pub mod shared {
             align: usize,
             released: &[Value],
         ) -> usize {
+            // 16-B FLOOR (perf-kernel-support): shared slices back
+            // cp.async staging (copy_async) on the CUDA path, which
+            // requires 16 B alignment on both the slice base and every
+            // 16-B chunk. Slices declared as u32/f32 arrays carry only
+            // their element alignment, so a kernel's layout could land a
+            // staging slice at 8-mod-16 and fault MISALIGNED_ADDRESS at
+            // runtime (block-wide kaio staging in the wild). Floor every
+            // shared offset at 16 B — ≤15 B padding per allocation.
+            let align = align.max(16usize);
             let mut live_slices = self
                 .allocations
                 .values()

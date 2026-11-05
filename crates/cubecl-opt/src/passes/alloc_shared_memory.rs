@@ -55,7 +55,15 @@ impl Pass for AllocateSharedMemoryBlockPass {
 
         if !analysis.allocations.is_empty() {
             let size = allocs.iter().map(|it| it.end(ctx)).max().unwrap();
-            let alignment = allocs.iter().map(|it| it.smem.alignment).max().unwrap();
+            // 16-B floor (perf-kernel-support): the BLOCK base must also
+            // be 16-B-aligned so the per-allocation 16-B offsets hold
+            // absolutely; see the liveness pass's allocate_slice note.
+            let alignment = allocs
+                .iter()
+                .map(|it| it.smem.alignment)
+                .max()
+                .unwrap()
+                .max(16usize);
 
             let entry = op.get_entry_block(ctx);
             let alloc = AllocSharedOp::new(ctx, size, alignment);
