@@ -179,6 +179,15 @@ impl ArtifactCompiler for CudaArtifactCompiler {
             // from: it declares its shared memory statically, so the launch
             // reserves none.
             (CudaBackend::Cpp, repr) => {
+                // Diagnostic source dump (CUBECL_DUMP_CPP_DIR=<dir>): write the
+                // exact C++ text NVRTC compiles, keyed by entrypoint (carries the
+                // variant hash), synchronously before the compile so a blowup
+                // still leaves the input on disk. Value-neutral.
+                if let Some(dir) = std::env::var_os("CUBECL_DUMP_CPP_DIR") {
+                    let path = std::path::Path::new(&dir).join(format!("{}.cpp", lowered.entrypoint_name));
+                    let _ = std::fs::write(&path, &lowered.source);
+                    eprintln!("[pass-timing] DUMP-CPP {} bytes={}", path.display(), lowered.source.len());
+                }
                 let (ptx, cubin) = self.compile_to_ptx_and_cubin(&lowered.source, max_registers)?;
                 let smem = repr
                     .as_ref()
@@ -208,6 +217,8 @@ impl ArtifactCompiler for CudaArtifactCompiler {
         // and the loader's fallback for a stale persisted artifact that
         // carries no CUBIN), and still declares the budget where the
         // backend could (`__launch_bounds__`, `.maxnreg_`).
+        let assemble_timer =
+            std::env::var("CUBECL_PASS_TIMING").is_ok_and(|v| v != "0").then(std::time::Instant::now);
         let cubin = match nvrtc_cubin {
             // C++ + budget: NVRTC's own SASS, the budget already binding.
             Some(cubin) => cubin,
@@ -220,6 +231,14 @@ impl ArtifactCompiler for CudaArtifactCompiler {
                 Some(_) => Vec::new(),
             },
         };
+        if let Some(t) = assemble_timer {
+            eprintln!(
+                "[pass-timing] ASSEMBLE-OR-CUBIN ms={} ptx_bytes={} cubin_bytes={}",
+                t.elapsed().as_millis(),
+                ptx.len(),
+                cubin.len()
+            );
+        }
         Ok(CudaArtifact {
             entrypoint_name: lowered.entrypoint_name,
             shared_mem_bytes,
@@ -359,6 +378,22 @@ impl CudaArtifactCompiler {
         // for a capped kernel, the CUBIN) from a program. The `CString`
         // source is null-terminated and outlives the program. On compilation
         // failure, the error log is retrieved and reported before returning.
+        // Diagnostic NVRTC timing (CUBECL_PASS_TIMING=1): separates the host
+        // compiler's time from the cubecl pass pipeline's. Value-neutral.
+        let nvrtc_timing = std::env::var("CUBECL_PASS_TIMING").is_ok_and(|v| v != "0");
+        let nvrtc_t0 = nvrtc_timing.then(std::time::Instant::now);
+        if nvrtc_timing {
+            eprintln!(
+                "[pass-timing] NVRTC-START source_bytes={} max_registers={max_registers:?}",
+                source.len()
+            );
+        }
+        // Large-kernel NVRTC ASLR mitigation (see `aslr_guard`): the megakernel
+        // bwd's ~3.4 MB source intermittently sends NVRTC's LLVM into a >20 min
+        // spin under a randomized address space; a deterministic layout compiles
+        // it in ~75 s. Small kernels (the fence pin, the capability probes) never
+        // take this path, so their codegen is untouched.
+        let _aslr_guard = aslr_guard::enter(source.len());
         unsafe {
             // I'd like to set the name to the kernel name, but keep getting UTF-8 errors so let's
             // leave it `None` for now
@@ -368,7 +403,15 @@ impl CudaArtifactCompiler {
                     reason: format!("{err}"),
                     backtrace: BackTrace::capture(),
                 })?;
-            if cudarc::nvrtc::result::compile_program(program, &options).is_err() {
+            let compile_res = cudarc::nvrtc::result::compile_program(program, &options);
+            if let Some(t) = nvrtc_t0 {
+                eprintln!(
+                    "[pass-timing] NVRTC-COMPILE ms={} ok={}",
+                    t.elapsed().as_millis(),
+                    compile_res.is_ok()
+                );
+            }
+            if compile_res.is_err() {
                 // On newer minor architectures (e.g. B300 sm_103a running on a CUDA 12.8 NVRTC
                 // that only knows sm_100a), retry once with the major architecture target.
                 if self.arch.version > 90 && !self.arch.version.is_multiple_of(10) {
@@ -488,5 +531,75 @@ fn backend_of(lowered: &CompiledKernel<CudaCompiler>) -> CudaBackend {
         Some(CudaRepresentation::Cpp(_)) => CudaBackend::Cpp,
         Some(CudaRepresentation::Llvm(_)) => CudaBackend::Llvm,
         None => CudaBackend::default(),
+    }
+}
+
+/// ASLR mitigation for large-kernel NVRTC compiles.
+///
+/// The megakernel inject-fused bwd (~3.4 MB of CUDA C++, ~88k IR ops) sends
+/// NVRTC 12.0's LLVM into an intermittent >20 min spin under a randomized
+/// address space (P42/P43 "DSD blowup"; P46 isolated it to `nvrtcCompileProgram`
+/// — the cubecl pass pipeline finishes in ~10 s). The SAME source compiles in
+/// ~75 s with ASLR disabled (`setarch x86_64 -R`, measured in-vivo on the crown)
+/// and in ~120 s in a fresh standalone NVRTC process: the pathology is a
+/// layout-dependent LLVM hash/allocator path, not the kernel's semantics.
+///
+/// This guard clears `ADDR_NO_RANDOMIZE` for the duration of a large compile so
+/// NVRTC's own allocations land on a deterministic layout. It is scoped to
+/// sources past [`THRESHOLD`] (the fence pin and capability probes are far
+/// smaller and never take it, so their PTX is byte-for-byte unchanged) and
+/// serialized process-wide so concurrent compiler threads cannot race the
+/// personality word. The compile is value-neutral: same source, same options,
+/// same NVRTC — only the address layout differs, so the emitted code computes
+/// the identical result.
+mod aslr_guard {
+    /// Sources at least this large take the deterministic-layout path. The
+    /// crown bwd is ~3.4 MB; every pin/probe kernel is <100 KB.
+    const THRESHOLD: usize = 1_000_000;
+
+    pub struct Guard {
+        #[cfg(target_os = "linux")]
+        prev: Option<std::os::raw::c_int>,
+        #[cfg(target_os = "linux")]
+        _lock: Option<std::sync::MutexGuard<'static, ()>>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            #[cfg(target_os = "linux")]
+            if let Some(prev) = self.prev.take() {
+                // SAFETY: restoring the personality word this process held before
+                // the guard; no memory is touched, only the kernel's per-process
+                // execution-domain flags.
+                unsafe {
+                    libc::personality(prev as std::os::raw::c_ulong);
+                }
+            }
+        }
+    }
+
+    static LARGE_COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub fn enter(source_len: usize) -> Guard {
+        #[cfg(target_os = "linux")]
+        {
+            if source_len >= THRESHOLD {
+                let lock = LARGE_COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: `personality` reads/sets the calling process's execution
+                // domain. `ADDR_NO_RANDOMIZE` only disables address-space
+                // randomization for subsequent mappings; it cannot invalidate any
+                // existing pointer. The previous value is restored on drop.
+                let prev = unsafe { libc::personality(libc::ADDR_NO_RANDOMIZE as std::os::raw::c_ulong) };
+                if prev >= 0 {
+                    return Guard { prev: Some(prev), _lock: Some(lock) };
+                }
+            }
+            Guard { prev: None, _lock: None }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = source_len;
+            Guard {}
+        }
     }
 }

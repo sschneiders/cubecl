@@ -58,6 +58,8 @@ use pliron::{
 };
 use std::fmt::Debug;
 
+use self::pass_timing::AddTimed as _;
+
 pub(crate) fn closure_inference_hack<T, R>(
     val: &T,
     ctx: &Context,
@@ -235,32 +237,39 @@ where
         let mut passes = OpPass::<ModuleOp, Passes>::default();
         let mut func_passes = OpPass::<FuncOp, Passes>::default();
 
-        func_passes.add_pass(LowerInfoPass);
-        func_passes.add_pass(SROAPass);
-        func_passes.add_pass(ResolvePendingPass);
-        func_passes.add_pass(CheckedIoPass::new(CheckedIo::new(
+        if pass_timing::enabled() {
+            eprintln!(
+                "[pass-timing] KERNEL {} cube_dim={:?}",
+                kernel.settings.kernel_name, kernel.settings.cube_dim
+            );
+        }
+
+        func_passes.add_timed(LowerInfoPass);
+        func_passes.add_timed(SROAPass);
+        func_passes.add_timed(ResolvePendingPass);
+        func_passes.add_timed(CheckedIoPass::new(CheckedIo::new(
             kernel.settings.execution_mode,
             kernel.settings.kernel_name,
         )));
-        func_passes.add_pass(AllocateSharedMemoryBlockPass);
+        func_passes.add_timed(AllocateSharedMemoryBlockPass);
 
         // The targets convert between `f32` and `bf16` natively, but HIP rounds twice from a
         // source wider than `f32`. CUDA's scalar constructors (`__int2bfloat16_rn`,
         // `__double2bfloat16`) round once, but its vector casts are unverified on hardware, so
         // CUDA keeps the pass too: it only adds work to the rare cast from a wide source.
-        func_passes.add_pass(LowerWideBf16CastPass::default());
+        func_passes.add_timed(LowerWideBf16CastPass::default());
         // CUDA converts fp8 with cuda_fp8.h, which carries its own software path below sm_89.
         let native_fp8 = match T::target() {
             Target::Cuda => EnumSet::all(),
             Target::Hip | Target::Metal => EnumSet::empty(),
         };
-        func_passes.add_pass(LowerMinifloatCastPass::new(LowerMinifloatCast::new(
+        func_passes.add_timed(LowerMinifloatCastPass::new(LowerMinifloatCast::new(
             native_fp8,
             Fp8Container::Bytes,
         )));
         // CUDA converts fp4 with cuda_fp4.h. Metal decodes it through `f16` pairs.
         if T::target() == Target::Metal {
-            func_passes.add_pass(LowerFp4CastPass::new(LowerFp4Cast::new(
+            func_passes.add_timed(LowerFp4CastPass::new(LowerFp4Cast::new(
                 true,
                 Fp8Container::Bytes,
             )));
@@ -268,57 +277,65 @@ where
 
         // Shared lowerings can create ops that need target-specific lowerings, but target-specific
         // lowerings should take priority. So we just run the target-specific lowerings twice.
-        func_passes.add_pass(LowerOpsCppPass::<T>::default());
-        func_passes.add_pass(LowerOpsCppPass::<Shared>::default());
-        func_passes.add_pass(LowerOpsCppPass::<T>::default());
+        func_passes.add_timed(LowerOpsCppPass::<T>::default());
+        func_passes.add_timed(LowerOpsCppPass::<Shared>::default());
+        func_passes.add_timed(LowerOpsCppPass::<T>::default());
 
         // MSL has `addsat` and `subsat` for every integer width, so Metal keeps the saturating
         // ops and prints them as builtins.
         if T::target() != Target::Metal {
-            func_passes.add_pass(LowerSaturatingArithmeticPass::default());
+            func_passes.add_timed(LowerSaturatingArithmeticPass::default());
         }
 
         if T::target() == Target::Cuda {
-            func_passes.add_pass(PackOpsPass::default());
+            func_passes.add_timed(PackOpsPass::default());
         }
 
-        func_passes.add_pass(CppUnrollPass::default());
-        func_passes.add_pass(LowerBuiltinsPass::<T>::default());
-        func_passes.add_pass(LowerOpsAfterUnrollCppPass::<T>::default());
+        func_passes.add_timed(CppUnrollPass::default());
+        func_passes.add_timed(LowerBuiltinsPass::<T>::default());
+        func_passes.add_timed(LowerOpsAfterUnrollCppPass::<T>::default());
 
-        func_passes.add_pass(SCCPPass);
-        func_passes.add_pass(InstCombinePass::default());
-        func_passes.add_pass(SimpleCSEPass::without_memory());
-        func_passes.add_pass(SimplifyOpsPass::default());
-        func_passes.add_pass(DCEPass);
-        func_passes.add_pass(SROAPass);
+        func_passes.add_timed(SCCPPass);
+        func_passes.add_timed(InstCombinePass::default());
+        func_passes.add_timed(SimpleCSEPass::without_memory());
+        func_passes.add_timed(SimplifyOpsPass::default());
+        func_passes.add_timed(DCEPass);
+        func_passes.add_timed(SROAPass);
 
         // SCCP/DCE may unlock more mem2reg opportunities, and vice versa. So we do a sandwich.
-        func_passes.add_pass(Mem2RegPass);
+        func_passes.add_timed(Mem2RegPass);
 
-        func_passes.add_pass(SROAPass);
-        func_passes.add_pass(SCCPPass);
-        func_passes.add_pass(SimpleCSEPass::with_memory());
-        func_passes.add_pass(SimplifyOpsPass::default());
-        func_passes.add_pass(CanonicalizePass::default());
-        func_passes.add_pass(DCEPass);
+        func_passes.add_timed(SROAPass);
+        func_passes.add_timed(SCCPPass);
+        func_passes.add_timed(SimpleCSEPass::with_memory());
+        func_passes.add_timed(SimplifyOpsPass::default());
+        func_passes.add_timed(CanonicalizePass::default());
+        func_passes.add_timed(DCEPass);
 
-        func_passes.add_pass(PromoteBitwisePass);
-        func_passes.add_pass(PromoteUnsupportedTypesPass::default());
+        func_passes.add_timed(PromoteBitwisePass);
+        func_passes.add_timed(PromoteUnsupportedTypesPass::default());
 
-        passes.add_pass(NestedOpsPass::new(func_passes));
-        passes.add_pass(AnnotateGlobalVisibilityPass);
-        passes.add_pass(DeclareVectorTypesPass);
-        passes.add_pass(CollectIncludesPass::<T>::default());
+        passes.add_timed(NestedOpsPass::new(func_passes));
+        passes.add_timed(AnnotateGlobalVisibilityPass);
+        passes.add_timed(DeclareVectorTypesPass);
+        passes.add_timed(CollectIncludesPass::<T>::default());
 
+        let pipeline_timer = pass_timing::enabled().then(std::time::Instant::now);
         passes.run(module_op, &mut ctx, &mut analyses)?;
+        if let Some(t) = pipeline_timer {
+            eprintln!("[pass-timing] PIPELINE total ms={}", t.elapsed().as_millis());
+        }
 
         #[cfg(feature = "metal")]
         if T::target() == Target::Metal {
             crate::metal::builtin::append_msl_builtins(&mut ctx, entry_func);
         }
 
+        let verify_timer = pass_timing::enabled().then(std::time::Instant::now);
         verify_operation(module.get_operation(), &ctx)?;
+        if let Some(t) = verify_timer {
+            eprintln!("[pass-timing] VERIFY-FINAL ms={}", t.elapsed().as_millis());
+        }
 
         let shared_memory_size = shared_memory_size(&ctx, module_op);
         let buffers = buffers(&ctx, entry_func);
@@ -327,7 +344,11 @@ where
         // Emit here rather than lazily from `Display`, so an op that survives lowering with no
         // `OpToCPP` impl fails the compilation instead of panicking on the compiler thread.
         ctx.set_aux_ty(EmissionErrors::default());
+        let emit_timer = pass_timing::enabled().then(std::time::Instant::now);
         let source = module.get_operation().to_cpp(&ctx);
+        if let Some(t) = emit_timer {
+            eprintln!("[pass-timing] EMIT-CPP ms={}", t.elapsed().as_millis());
+        }
         let mut errors = ctx.aux_ty::<EmissionErrors>().take();
         let source = match source {
             Ok(source) => source,
@@ -551,5 +572,86 @@ mod shared_memory_tests {
     #[test]
     fn a_free_releases_only_past_a_barrier() {
         assert_eq!(shared_bytes(Freed::Unsynced), 2048);
+    }
+}
+
+/// Diagnostic pass timing, enabled by `CUBECL_PASS_TIMING=1`.
+///
+/// Prints a START/END line per pass (wall ms + op counts) to stderr so a
+/// cold-JIT blowup on a large kernel can be attributed to the exact pass:
+/// the last START without an END is the pass that spins. Value-neutral —
+/// the wrapper only measures and delegates; with the env unset the only
+/// cost is one cached bool check per pass.
+pub(crate) mod pass_timing {
+    use pliron::{
+        context::{Context, Ptr},
+        graph::walkers::{IRNode, WalkConfig, uninterruptible::immutable::walk_op},
+        operation::Operation,
+        pass::{AnalysisManager, Pass, PassManager, PassResult, Passes},
+        result::Result,
+    };
+    use std::sync::OnceLock;
+
+    pub fn enabled() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var("CUBECL_PASS_TIMING").is_ok_and(|v| v != "0"))
+    }
+
+    fn count_ops(ctx: &Context, op: Ptr<Operation>) -> usize {
+        let mut count = 0usize;
+        walk_op(
+            ctx,
+            &mut count,
+            &WalkConfig::default(),
+            op,
+            |_ctx, count, node| {
+                if matches!(node, IRNode::Operation(_)) {
+                    *count += 1;
+                }
+            },
+        );
+        count
+    }
+
+    pub struct Timed<P: Pass>(pub P);
+
+    impl<P: Pass> Pass for Timed<P> {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        fn run(
+            &mut self,
+            op: Ptr<Operation>,
+            ctx: &mut Context,
+            analyses: &mut AnalysisManager,
+        ) -> Result<PassResult> {
+            if !enabled() {
+                return self.0.run(op, ctx, analyses);
+            }
+            let before = count_ops(ctx, op);
+            eprintln!("[pass-timing] START {} ops={before}", self.name());
+            let t = std::time::Instant::now();
+            let res = self.0.run(op, ctx, analyses);
+            let after = count_ops(ctx, op);
+            eprintln!(
+                "[pass-timing] END {} ms={} ops={before}->{after} ok={}",
+                self.name(),
+                t.elapsed().as_millis(),
+                res.is_ok()
+            );
+            res
+        }
+        fn as_pass_manager(&mut self) -> Option<&mut dyn PassManager> {
+            self.0.as_pass_manager()
+        }
+    }
+
+    pub trait AddTimed {
+        fn add_timed(&mut self, pass: impl Pass + 'static);
+    }
+    impl AddTimed for Passes {
+        fn add_timed(&mut self, pass: impl Pass + 'static) {
+            self.add_pass(Timed(pass));
+        }
     }
 }

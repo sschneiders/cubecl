@@ -87,6 +87,9 @@ derive-new = { workspace = true }
 half = { workspace = true }
 serde = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 
 [dev-dependencies]
 cubecl-core = { workspace = true, default-features = true, features = [

@@ -89,9 +89,38 @@ impl<C: Compiler> CompiledKernel<C> {
         recording: &mut CompilationRecording,
         compile: impl FnOnce(KernelDefinition) -> Result<Self, CompilationError>,
     ) -> Result<Self, CompilationError> {
+        // Diagnostic stage timing (CUBECL_PASS_TIMING=1): separates the
+        // frontend expansion from the backend lowering, so a cold-JIT blowup
+        // lands on the right side of the boundary. Value-neutral.
+        #[cfg(feature = "std")]
+        let timing = std::env::var("CUBECL_PASS_TIMING").is_ok_and(|v| v != "0");
+        #[cfg(feature = "std")]
+        let t_expand = timing.then(std::time::Instant::now);
+        #[cfg(feature = "std")]
+        if timing {
+            std::eprintln!("[pass-timing] EXPAND-START kernel={}", kernel.name());
+        }
         let definition = define_kernel(kernel)?;
+        #[cfg(feature = "std")]
+        if let Some(t) = t_expand {
+            std::eprintln!(
+                "[pass-timing] EXPAND-END kernel={} ms={}",
+                kernel.name(),
+                t.elapsed().as_millis()
+            );
+        }
         recording.defined(&definition);
+        #[cfg(feature = "std")]
+        let t_lower = timing.then(std::time::Instant::now);
         let compiled = compile(definition)?;
+        #[cfg(feature = "std")]
+        if let Some(t) = t_lower {
+            std::eprintln!(
+                "[pass-timing] LOWER-END kernel={} ms={}",
+                kernel.name(),
+                t.elapsed().as_millis()
+            );
+        }
         recording.source(&compiled.source);
         Ok(compiled)
     }
